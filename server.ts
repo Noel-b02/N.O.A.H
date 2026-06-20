@@ -19,6 +19,8 @@ const MEMORY_FILE = "memory.json";
 // State to track if we have a draft on a feature branch
 let pendingFiles: string[] = [];
 let activeDraftBranch: string | null = null;
+let conversationHistory: string[] = [];
+
 
 function loadFile(filepath: string): string {
   try { return fs.readFileSync(filepath, 'utf8'); } catch { return ""; }
@@ -58,6 +60,7 @@ setupGit();
 // API: Send chat prompt to the assistant
 app.post('/api/chat', async (req, res) => {
   const { message } = req.body;
+  conversationHistory.push(`User: ${message}`);
   if (!message) {
     return res.status(400).json({ error: "Message is required." });
   }
@@ -89,21 +92,35 @@ app.post('/api/chat', async (req, res) => {
       controller.abort();
     }, 60000);
 
+    const recentHistory = conversationHistory
+      .slice(-20)
+      .join("\n");
+
     const response = await fetch(OLLAMA_URL, {      
       method: "POST",
       signal: controller.signal,
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         model: MODEL_NAME,
-        prompt: `System Instruction:\n${metaSystemInstruction}\n\nUser Request:\n${message}`,
-        stream: false
+        prompt: `System Instruction:\n${metaSystemInstruction}\n\n` +
+          `Conversation History:\n${recentHistory}\n\n` +
+          `User Request:\n${message}`,        
+          stream: false
       })
     });
 
     if (!response.ok) throw new Error("Ollama connection failed");
     const data = await response.json() as { response: string };
+    
     clearTimeout(timeout);
+    
     const aiResponse = data.response;
+    
+    conversationHistory.push(`Assistant: ${aiResponse}`);
+    if (conversationHistory.length > 40) {
+      conversationHistory =
+      conversationHistory.slice(-40);
+  }
 
     // Parse out potential updates
     const pattern = /\[UPDATE:\s*([\w\.-]+)\]\s*```[\w]*\n([\s\S]*?)```/g;
