@@ -107,40 +107,30 @@ app.post('/api/chat', async (req, res) => {
 
   const sourceCodeContext = selfCode ? `--- CURRENT SOURCE CODE (${CODE_FILE}) ---\n${selfCode}\n\n`: "";
 
-  const modificationInstructions = wantsModification ? `
-  If the user requests a modification, you MUST respond using:
-
-  [UPDATE: filename]
-  \`\`\`
-  complete file contents
-  \`\`\`
-
-  Only provide complete replacements.
-  Do not use placeholders.
-  Do not omit code.
-  `
-  : "";
-
   const metaSystemInstruction = (
-    `--- CURRENT PERSONALITY (${PERSONALITY_FILE}) ---\n${personality}\n\n` +
-    `--- CURRENT MEMORY (${MEMORY_FILE}) ---\n${memory}\n\n` +
+    `--- CURRENT PERSONALITY ---\n${personality}\n\n` +
+    `--- CURRENT MEMORY ---\n${memory}\n\n` +
+    `The information in CURRENT MEMORY contains persistent facts and should be treated as true unless the user explicitly corrects them.\n\n` +
     sourceCodeContext +
-    modificationInstructions +
-    `You are a self-modifying assistant. Your current source code is provided above.\n` +
-    `You must preserve all existing functionality unless the user explicitly requests its removal.\n` +
-    `You must never replace code with placeholders such as:\n` +
-    `// existing code\n` +
-    `// existing imports\n` +
-    `omitted for brevity\n\n` +
-    `If the user asks you to change your personality or code, formulate the changes.\n` +
-    `To update a file, output your proposed replacement strictly in the following format:\n` +
+    `You are N.O.A.H., a self-modifying assistant.\n\n` +
+
+    `If the user requests a modification to personality.txt, memory.json, or server.ts, you MUST respond using the exact format below.\n` +
+    `Any response that does not use this format is invalid.\n\n` +
+
     `[UPDATE: filename]\n` +
     `\`\`\`language\n` +
-    `complete content of the file goes here\n` +
-    `\`\`\`\n` +
-    `The replacement must be complete, runnable and self-contained.\n` +
-    `Make sure to replace the entire file contents when proposing an update.\n` +
-    `Do not write conversational text inside the markdown block.`
+    `complete file contents\n` +
+    `\`\`\`\n\n` +
+
+    `Rules for modifications:\n` +
+    `- Output a complete replacement file.\n` +
+    `- Do not output partial snippets.\n` +
+    `- Do not use placeholders.\n` +
+    `- Do not write 'existing code', 'existing imports', or 'omitted for brevity'.\n` +
+    `- Preserve existing functionality unless explicitly instructed otherwise.\n` +
+    `- When modifying a file, output ONLY UPDATE blocks and nothing else.\n\n` +
+
+    `For normal conversation, answer naturally.\n`
   );
 
   try {
