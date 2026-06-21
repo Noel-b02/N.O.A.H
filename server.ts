@@ -119,31 +119,34 @@ app.post('/api/chat', async (req, res) => {
 
   const sourceCodeContext = selfCode ? `--- CURRENT SOURCE CODE (${CODE_FILE}) ---\n${selfCode}\n\n`: "";
 
+  const modificationInstructions = wantsModification ? 
+  `
+    You are N.O.A.H., a self-modifying assistant.
+
+    The user's requested modification target is: ${modificationTarget}
+
+    If the user requests a modification to personality.txt, memory.json, or server.ts, you MUST respond using this format:
+
+    [UPDATE: filename]
+    \`\`\`text
+    complete file contents
+    \`\`\`
+
+    Rules:
+    - Output a complete replacement file
+    - Do NOT output UPDATE blocks for normal chat
+    - Do NOT modify files unless explicitly requested
+    `
+      : "";
+
   const metaSystemInstruction = (
+    
     `--- CURRENT PERSONALITY ---\n${personality}\n\n` +
 
     `--- CURRENT MEMORY ---\n${memory}\n\n` +
     `The information in CURRENT MEMORY contains persistent facts and should be treated as true unless the user explicitly corrects them.\n\n` +
     sourceCodeContext +
-
-    `You are N.O.A.H., a self-modifying assistant.\n\n` +
-    `The user's requested modification target is: ${modificationTarget}\n\n` +
-    `If the user requests a modification to personality.txt, memory.json, or server.ts, you MUST respond using the exact format below.\n` +
-    `Any response that does not use this format is invalid.\n\n` +
-
-    `[UPDATE: filename]\n` +
-    `\`\`\`language\n` +
-    `complete file contents\n` +
-    `\`\`\`\n\n` +
-
-    `Rules for modifications:\n` +
-    `- Output a complete replacement file.\n` +
-    `- Do not output partial snippets.\n` +
-    `- Do not use placeholders.\n` +
-    `- Do not write 'existing code', 'existing imports', or 'omitted for brevity'.\n` +
-    `- Preserve existing functionality unless explicitly instructed otherwise.\n` +
-    `- When modifying a file, preserve all existing lines unless the user explicitly requests their removal.\n` +
-    `- When modifying a file, output ONLY UPDATE blocks and nothing else.\n\n`
+    modificationInstructions 
   
   );
 
