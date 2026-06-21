@@ -167,9 +167,13 @@ app.post('/api/chat', async (req, res) => {
     
     const aiResponse = data.response;
     
-    if (!aiResponse.includes("I cannot execute") &&
-        !aiResponse.includes("I am an AI model")) {
-      conversationHistory.push(`Assistant: ${aiResponse}`);
+    if (!aiResponse.includes("I cannot execute") && !aiResponse.includes("I am an AI model")) {
+      
+      const isRefusal = aiResponse.includes("cannot execute") || aiResponse.includes("cannot modify") || aiResponse.includes("I am an AI model");
+
+      if (!isRefusal) {
+        conversationHistory.push(`Assistant: ${aiResponse}`);
+      }
     }
 
     if (conversationHistory.length > 40) {
