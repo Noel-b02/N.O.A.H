@@ -115,6 +115,8 @@ const lowerMessage = message.toLowerCase();
 
   const metaSystemInstruction = (
     `--- CURRENT PERSONALITY ---\n${personality}\n\n` +
+    `The text above is the complete contents of personality.txt.\n` +
+    `When modifying personality.txt, preserve all existing instructions unless the user explicitly asks to remove them.\n\n` +
     `--- CURRENT MEMORY ---\n${memory}\n\n` +
     `The information in CURRENT MEMORY contains persistent facts and should be treated as true unless the user explicitly corrects them.\n\n` +
     sourceCodeContext +
@@ -135,6 +137,10 @@ const lowerMessage = message.toLowerCase();
     `- Do not use placeholders.\n` +
     `- Do not write 'existing code', 'existing imports', or 'omitted for brevity'.\n` +
     `- Preserve existing functionality unless explicitly instructed otherwise.\n` +
+    `- Start from the CURRENT file contents shown above.\n` +
+    `- Make the smallest possible change needed to satisfy the user's request.\n` +
+    `- Do not remove existing content unless the user explicitly asks.\n` +
+    `- For personality.txt, preserve all existing instructions and only add or modify the requested behaviour.\n` +
     `- When modifying a file, output ONLY UPDATE blocks and nothing else.\n\n` +
 
     `For normal conversation, answer naturally.\n`
