@@ -111,7 +111,7 @@ app.post('/api/chat', async (req, res) => {
 
   const lowerMessage = message.toLowerCase();
 
-  const modificationTarget = lowerMessage.includes("memory") ? "memory.json": lowerMessage.includes("server") || lowerMessage.includes("source code") || lowerMessage.includes("implementation") ? "server.ts": "personality.txt";
+ const modificationTarget = /(remember|memory|memorise|memorize|store this|save this)/i.test(message) ? "memory.json": lowerMessage.includes("server") ? "server.ts": "personality.txt";
   
   const wantsCodeModification = modificationTarget === "server.ts";
 
@@ -140,11 +140,15 @@ app.post('/api/chat', async (req, res) => {
       : "";
 
   const metaSystemInstruction = (
-    
+
     `--- CURRENT PERSONALITY ---\n${personality}\n\n` +
 
-    `--- CURRENT MEMORY ---\n${memory}\n\n` +
+    `--- READ ONLY MEMORY CONTEXT ---\n${memory}\n\n` +
+    `CURRENT MEMORY is provided for reference.\n` +
+    `Do not copy it into personality.txt or server.ts.\n` +
+    `Only modify memory.json when the user's requested modification target is memory.json.\n\n`+
     `The information in CURRENT MEMORY contains persistent facts and should be treated as true unless the user explicitly corrects them.\n\n` +
+
     sourceCodeContext +
     modificationInstructions 
   
