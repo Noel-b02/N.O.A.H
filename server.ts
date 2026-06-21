@@ -2,6 +2,9 @@ import express from 'express';
 import * as fs from 'fs';
 import { execSync } from 'child_process';
 import path from 'path';
+import dotenv from 'dotenv';
+
+dotenv.config();
 
 const app = express();
 const PORT = 3000;
@@ -15,12 +18,30 @@ const MODEL_NAME = process.env.OLLAMA_MODEL ?? "qwen3.5:4b";
 const PERSONALITY_FILE = "personality.txt";
 const CODE_FILE = "server.ts"; // The assistant can modify this file (itself)
 const MEMORY_FILE = "memory.json";
+const HISTORY_FILE = "history.json";
 
 // State to track if we have a draft on a feature branch
 let pendingFiles: string[] = [];
 let activeDraftBranch: string | null = null;
-let conversationHistory: string[] = [];
+let conversationHistory: string[] = loadHistory();
 
+
+function loadHistory(): string[] {
+  try {
+    return JSON.parse(
+      fs.readFileSync(HISTORY_FILE, "utf8")
+    );
+  } catch {
+    return [];
+  }
+}
+
+function saveHistory(): void {
+  fs.writeFileSync(
+    HISTORY_FILE,
+    JSON.stringify(conversationHistory, null, 2)
+  );
+}
 
 function loadFile(filepath: string): string {
   try { return fs.readFileSync(filepath, 'utf8'); } catch { return ""; }
@@ -57,20 +78,29 @@ const setupGit = () => {
 };
 setupGit();
 
+app.get('/api/status', (_, res) => {
+  res.json({
+    activeDraftBranch,
+    pendingFiles,
+    historySize: conversationHistory.length
+  });
+});
+
 // API: Send chat prompt to the assistant
 app.post('/api/chat', async (req, res) => {
-  const { message } = req.body;
-  conversationHistory.push(`User: ${message}`);
+ const { message } = req.body;
+
   if (!message) {
     return res.status(400).json({ error: "Message is required." });
   }
 
+  conversationHistory.push(`User: ${message}`);
+  saveHistory();
+
   const personality = loadFile(PERSONALITY_FILE);
   const memory = loadMemory();
 
-  const wantsModification =
-    /(modify|change|rewrite|update|edit|improve|refactor)/i
-      .test(message);
+  const wantsModification = /(modify|change|rewrite|update|edit|improve|refactor)/i.test(message);
 
  const selfCode = wantsModification ? loadFile(CODE_FILE): "";
 
@@ -107,20 +137,9 @@ app.post('/api/chat', async (req, res) => {
       controller.abort();
     }, 60000);
 
-    const recentHistory = conversationHistory
-      .slice(-20)
-      .join("\n");
+    const recentHistory = conversationHistory.slice(-20).join("\n");
 
-    const fullPrompt = `System Instruction:\n${metaSystemInstruction}\n\nUser Request:\n${message}`;
-
-    console.log(
-      "Prompt length:",
-      fullPrompt.length
-    );
-
-    const start = Date.now();
-
-    console.log("Model:", MODEL_NAME);
+    const fullPrompt = `System Instruction:\n${metaSystemInstruction}\n\n` + `Conversation History:\n${recentHistory}\n\n` + `User Request:\n${message}`;
 
     const response = await fetch(OLLAMA_URL, {
       method: "POST",
@@ -146,6 +165,8 @@ app.post('/api/chat', async (req, res) => {
     const aiResponse = data.response;
     
     conversationHistory.push(`Assistant: ${aiResponse}`);
+    saveHistory();
+
     if (conversationHistory.length > 40) {
       conversationHistory =
       conversationHistory.slice(-40);
@@ -188,7 +209,10 @@ app.post('/api/chat', async (req, res) => {
 
       // 3. Write drafts to disk
       for (const update of updates) {
-        if ([PERSONALITY_FILE, CODE_FILE].includes(update.filepath)) {
+        if (
+          [PERSONALITY_FILE, CODE_FILE, MEMORY_FILE]
+            .includes(update.filepath)
+        ) {
           writeFile(update.filepath, update.content);
           pendingFiles.push(update.filepath);
         }
