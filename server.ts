@@ -115,8 +115,7 @@ const lowerMessage = message.toLowerCase();
 
   const metaSystemInstruction = (
     `--- CURRENT PERSONALITY ---\n${personality}\n\n` +
-    `The text above is the complete contents of personality.txt.\n` +
-    `When modifying personality.txt, preserve all existing instructions unless the user explicitly asks to remove them.\n\n` +
+
     `--- CURRENT MEMORY ---\n${memory}\n\n` +
     `The information in CURRENT MEMORY contains persistent facts and should be treated as true unless the user explicitly corrects them.\n\n` +
     sourceCodeContext +
