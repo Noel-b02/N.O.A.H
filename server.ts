@@ -14,7 +14,7 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 const OLLAMA_URL = process.env.OLLAMA_URL ?? "http://localhost:11434/api/generate";
 
-const MODEL_NAME = process.env.OLLAMA_MODEL ?? "qwen3.5:9b";
+const MODEL_NAME = process.env.OLLAMA_MODEL ?? "qwen3.5:4b";
 const PERSONALITY_FILE = "personality.txt";
 const CODE_FILE = "server.ts"; // The assistant can modify this file (itself)
 const MEMORY_FILE = "memories/memory.json";
