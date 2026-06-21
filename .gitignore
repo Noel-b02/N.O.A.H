@@ -3,3 +3,4 @@
 .env
 memories/history/
 memories/memory.json
+memories/active.json
