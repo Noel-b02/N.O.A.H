@@ -123,8 +123,6 @@ const lowerMessage = message.toLowerCase();
 
     `You are N.O.A.H., a self-modifying assistant.\n\n` +
     `The user's requested modification target is: ${modificationTarget}\n\n` +
-    `When modifying personality.txt, the output file should contain ONLY the contents of personality.txt.\n` +
-    `Do NOT copy prompt sections into the file.\n\n` +
     `If the user requests a modification to personality.txt, memory.json, or server.ts, you MUST respond using the exact format below.\n` +
     `Any response that does not use this format is invalid.\n\n` +
 
@@ -139,13 +137,8 @@ const lowerMessage = message.toLowerCase();
     `- Do not use placeholders.\n` +
     `- Do not write 'existing code', 'existing imports', or 'omitted for brevity'.\n` +
     `- Preserve existing functionality unless explicitly instructed otherwise.\n` +
-    `- Start from the CURRENT file contents shown above.\n` +
-    `- Make the smallest possible change needed to satisfy the user's request.\n` +
-    `- Do not remove existing content unless the user explicitly asks.\n` +
-    `- For personality.txt, preserve all existing instructions and only add or modify the requested behaviour.\n` +
-    `- When modifying a file, output ONLY UPDATE blocks and nothing else.\n\n` +
-
-    `For normal conversation, answer naturally.\n`
+    `- When modifying a file, output ONLY UPDATE blocks and nothing else.\n\n`
+  
   );
 
   try {
