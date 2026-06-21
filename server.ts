@@ -142,7 +142,7 @@ app.post('/api/chat', async (req, res) => {
 
     const recentHistory = conversationHistory.slice(-20).join("\n");
 
-    const fullPrompt = `System Instruction:\n${metaSystemInstruction}\n\n` + `Conversation History:\n${recentHistory}\n\n` + `User Request:\n${message}`;
+    const fullPrompt = wantsModification ? `System Instruction:\n${metaSystemInstruction}\n\n` + `User Request:\n${message}`: `System Instruction:\n${metaSystemInstruction}\n\n` + `Conversation History:\n${recentHistory}\n\n` + `User Request:\n${message}`;
 
     console.log("========== PROMPT ==========");
     console.log(fullPrompt);
