@@ -11,7 +11,7 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 const OLLAMA_URL = process.env.OLLAMA_URL ?? "http://localhost:11434/api/generate";
 
-const MODEL_NAME = process.env.OLLAMA_MODEL ?? "qwen3.5:9b";
+const MODEL_NAME = process.env.OLLAMA_MODEL ?? "qwen3.5:4b";
 const PERSONALITY_FILE = "personality.txt";
 const CODE_FILE = "server.ts"; // The assistant can modify this file (itself)
 const MEMORY_FILE = "memory.json";
@@ -66,22 +66,37 @@ app.post('/api/chat', async (req, res) => {
   }
 
   const personality = loadFile(PERSONALITY_FILE);
-  const selfCode = loadFile(CODE_FILE);
   const memory = loadMemory();
 
+  const wantsModification =
+    /(modify|change|rewrite|update|edit|improve|refactor)/i
+      .test(message);
+
+ const selfCode = wantsModification ? loadFile(CODE_FILE): "";
+
+ const sourceCodeContext = selfCode ? `--- CURRENT SOURCE CODE (${CODE_FILE}) ---\n${selfCode}\n\n`: "";
+
+ const modificationInstructions = wantsModification ? `If the user asks you to change your personality or code...[UPDATE: filename]...`: "";
+
   const metaSystemInstruction = (
-    `${personality}\n\n` +
     `--- CURRENT PERSONALITY (${PERSONALITY_FILE}) ---\n${personality}\n\n` +
     `--- CURRENT MEMORY (${MEMORY_FILE}) ---\n${memory}\n\n` +
-    `--- CURRENT SOURCE CODE (${CODE_FILE}) ---\n${selfCode}\n\n` +
+    sourceCodeContext +
+    modificationInstructions +
     `You are a self-modifying assistant. Your current source code is provided above.\n` +
-    `If the user asks you to change your personality or code, formulate the changes. ` +
+    `You must preserve all existing functionality unless the user explicitly requests its removal.\n` +
+    `You must never replace code with placeholders such as:\n` +
+    `// existing code\n` +
+    `// existing imports\n` +
+    `omitted for brevity\n\n` +
+    `If the user asks you to change your personality or code, formulate the changes.\n` +
     `To update a file, output your proposed replacement strictly in the following format:\n` +
     `[UPDATE: filename]\n` +
     `\`\`\`language\n` +
     `complete content of the file goes here\n` +
     `\`\`\`\n` +
-    `Make sure to replace the entire file contents when proposing an update. ` +
+    `The replacement must be complete, runnable and self-contained.\n` +
+    `Make sure to replace the entire file contents when proposing an update.\n` +
     `Do not write conversational text inside the markdown block.`
   );
 
@@ -96,16 +111,30 @@ app.post('/api/chat', async (req, res) => {
       .slice(-20)
       .join("\n");
 
-    const response = await fetch(OLLAMA_URL, {      
+    const fullPrompt = `System Instruction:\n${metaSystemInstruction}\n\nUser Request:\n${message}`;
+
+    console.log(
+      "Prompt length:",
+      fullPrompt.length
+    );
+
+    const start = Date.now();
+
+    console.log("Model:", MODEL_NAME);
+
+    const response = await fetch(OLLAMA_URL, {
       method: "POST",
       signal: controller.signal,
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         model: MODEL_NAME,
-        prompt: `System Instruction:\n${metaSystemInstruction}\n\n` +
-          `Conversation History:\n${recentHistory}\n\n` +
-          `User Request:\n${message}`,        
-          stream: false
+        prompt: fullPrompt,
+        stream: false,
+        think: false,
+        options: {
+          num_predict: 150,
+          temperature: 0.3
+        }
       })
     });
 

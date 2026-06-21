@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>J.A.R.V.I.S. Neural Matrix HUD</title>
+  <title>N.O.A.H. Neural Matrix HUD</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <!-- Sci-Fi Google Fonts -->
   <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;600;900&family=Rajdhani:wght@500;600;700&family=Share+Tech+Mono&display=swap" rel="stylesheet">
@@ -91,12 +91,12 @@
         <!-- Plasma aura -->
         <div id="plasma-aura" class="absolute inset-5 rounded-full bg-cyan-500/10 blur-md transition-all duration-300 animate-pulse"></div>
         <!-- Core Node -->
-        <div id="jarvis-core" class="w-5 h-5 rounded-full bg-cyan-400 shadow-[0_0_20px_#00f0ff] transition-all duration-300 animate-pulse"></div>
+        <div id="noah-core" class="w-5 h-5 rounded-full bg-cyan-400 shadow-[0_0_20px_#00f0ff] transition-all duration-300 animate-pulse"></div>
       </div>
 
       <div>
         <div class="flex items-center space-x-3">
-          <h1 class="text-lg font-black tracking-widest text-cyan-400 uppercase">J.A.R.V.I.S. Core</h1>
+          <h1 class="text-lg font-black tracking-widest text-cyan-400 uppercase">N.O.A.H. Core</h1>
           <div class="h-2 w-2 rounded-full bg-emerald-400 animate-ping"></div>
           <span class="text-[10px] font-mono tracking-widest text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded border border-emerald-500/30">ONLINE</span>
         </div>
@@ -270,7 +270,7 @@
 
     // Shifts the visual state of the Concentric Holographic Core
     function setCoreState(state) {
-      const core = document.getElementById('jarvis-core');
+      const core = document.getElementById('noah-core');
       const plasma = document.getElementById('plasma-aura');
       const inner = document.getElementById('core-inner');
       const mid = document.getElementById('core-mid');
@@ -360,7 +360,7 @@
         div.className += " border-cyan-500/20 shadow-[0_0_15px_rgba(0,240,255,0.01)]";
         div.innerHTML = `
           <div class="absolute top-0 left-0 w-2 h-2 border-t border-l border-cyan-400"></div>
-          <p class="text-[9px] font-mono tracking-widest text-cyan-400 font-extrabold mb-2">JARVIS CORE OUTPUT</p>
+          <p class="text-[9px] font-mono tracking-widest text-cyan-400 font-extrabold mb-2">N.O.A.H. CORE OUTPUT</p>
           <p class="text-sm text-slate-300 leading-relaxed">${text.replace(/\n/g, '<br>')}</p>
         `;
       } else {
