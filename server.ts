@@ -14,7 +14,9 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 const OLLAMA_URL = process.env.OLLAMA_URL ?? "http://localhost:11434/api/generate";
 
-const MODEL_NAME = process.env.OLLAMA_MODEL ?? "qwen3.5:9b";
+const CHAT_MODEL = process.env.OLLAMA_CHAT_MODEL ?? "qwen3.5:4b";
+const CODE_MODEL = process.env.OLLAMA_CODE_MODEL ?? "qwen3.5:9b";
+
 const PERSONALITY_FILE = "personality.txt";
 const CODE_FILE = "server.ts"; // The assistant can modify this file (itself)
 const MEMORY_FILE = "memories/memory.json";
@@ -103,7 +105,11 @@ app.post('/api/chat', async (req, res) => {
 
   const wantsModification =/(modify|change|rewrite|update|edit|improve|refactor)/i.test(message);
 
-const lowerMessage = message.toLowerCase();
+  const isComplex = wantsModification || /(code|typescript|javascript|debug|server|memory|git|branch|refactor)/i.test(message);
+
+  const selectedModel = isComplex? CODE_MODEL: CHAT_MODEL;
+
+  const lowerMessage = message.toLowerCase();
 
   const modificationTarget = lowerMessage.includes("memory") ? "memory.json": lowerMessage.includes("server") || lowerMessage.includes("source code") || lowerMessage.includes("implementation") ? "server.ts": "personality.txt";
   
@@ -151,19 +157,21 @@ const lowerMessage = message.toLowerCase();
     const recentHistory = conversationHistory.slice(-20).join("\n");
 
     const fullPrompt = wantsModification ? `System Instruction:\n${metaSystemInstruction}\n\n` + `User Request:\n${message}`: `System Instruction:\n${metaSystemInstruction}\n\n` + `Conversation History:\n${recentHistory}\n\n` + `User Request:\n${message}`;
+    
+    console.log(`[MODEL] ${selectedModel} | complex=${isComplex}`);
 
     const response = await fetch(OLLAMA_URL, {
       method: "POST",
       signal: controller.signal,
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
-        model: MODEL_NAME,
+        model: selectedModel,
         prompt: fullPrompt,
         stream: false,
         think: false,
         options: {
-          num_predict: 150,
-          temperature: 0.3
+        num_predict: isComplex ? 500 : 80,
+        temperature: 0.3
         }
       })
     });
