@@ -74,7 +74,7 @@ const setupGit = () => {
   if (!currentBranch) {
     runGitCommand(["add", "."]);
     runGitCommand(["commit", "-m", "Initial web commit"]);
-    runGitCommand(["branch", "-M", "develop"]);
+    runGitCommand(["branch", "-M", "master"]);
   }
 };
 setupGit();
@@ -260,7 +260,7 @@ app.post('/api/approve', (req, res) => {
       execSync("npx tsc --noEmit", { stdio: "pipe" });
     } catch (e: any) {
       // Revert branch upon compilation failure
-      runGitCommand(["checkout", "develop"]);
+      runGitCommand(["checkout", "master"]);
       runGitCommand(["branch", "-D", "feature/ai-web-modification"]);
       pendingFiles = [];
       return res.status(422).json({ error: "TypeScript type checking failed. Merging was aborted for safety." });
@@ -270,7 +270,7 @@ app.post('/api/approve', (req, res) => {
   // Commit and merge sequence
   runGitCommand(["add", ...pendingFiles]);
   runGitCommand(["commit", "-m", "AI self-modification merge"]);
-  runGitCommand(["checkout", "develop"]);
+  runGitCommand(["checkout", "master"]);
 
   if (activeDraftBranch) {
     runGitCommand([
@@ -287,23 +287,35 @@ app.post('/api/approve', (req, res) => {
 
   activeDraftBranch = null;
   pendingFiles = [];
-  res.json({ success: true, message: "Changes successfully merged to 'develop'!" });
+  res.json({ success: true, message: "Changes successfully merged to 'master'!" });
 });
 
 // API: Reject and Discard
 app.post('/api/reject', (req, res) => {
 
-  runGitCommand(["checkout", "develop"]);
   if (activeDraftBranch) {
-  runGitCommand([
-    "branch",
-    "-D",
-    activeDraftBranch
-  ]);
-  } 
+
+    // Throw away any uncommitted changes
+    runGitCommand(["reset", "--hard"]);
+
+    // Go back to master
+    runGitCommand(["checkout", "master"]);
+
+    // Delete the draft branch
+    runGitCommand([
+      "branch",
+      "-D",
+      activeDraftBranch
+    ]);
+  }
+
   activeDraftBranch = null;
   pendingFiles = [];
-  res.json({ success: true, message: "Changes discarded successfully." });
+
+  res.json({
+    success: true,
+    message: "Changes discarded successfully."
+  });
 });
 
 app.listen(PORT, () => {
