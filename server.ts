@@ -103,11 +103,23 @@ app.post('/api/chat', async (req, res) => {
 
   const wantsModification = /(modify|change|rewrite|update|edit|improve|refactor)/i.test(message);
 
- const selfCode = wantsModification ? loadFile(CODE_FILE): "";
+  const selfCode = wantsModification ? loadFile(CODE_FILE): "";
 
- const sourceCodeContext = selfCode ? `--- CURRENT SOURCE CODE (${CODE_FILE}) ---\n${selfCode}\n\n`: "";
+  const sourceCodeContext = selfCode ? `--- CURRENT SOURCE CODE (${CODE_FILE}) ---\n${selfCode}\n\n`: "";
 
- const modificationInstructions = wantsModification ? `If the user asks you to change your personality or code...[UPDATE: filename]...`: "";
+  const modificationInstructions = wantsModification ? `
+  If the user requests a modification, you MUST respond using:
+
+  [UPDATE: filename]
+  \`\`\`
+  complete file contents
+  \`\`\`
+
+  Only provide complete replacements.
+  Do not use placeholders.
+  Do not omit code.
+  `
+  : "";
 
   const metaSystemInstruction = (
     `--- CURRENT PERSONALITY (${PERSONALITY_FILE}) ---\n${personality}\n\n` +
