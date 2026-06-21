@@ -144,6 +144,10 @@ app.post('/api/chat', async (req, res) => {
 
     const fullPrompt = `System Instruction:\n${metaSystemInstruction}\n\n` + `Conversation History:\n${recentHistory}\n\n` + `User Request:\n${message}`;
 
+    console.log("========== PROMPT ==========");
+    console.log(fullPrompt);
+    console.log("============================");
+
     const response = await fetch(OLLAMA_URL, {
       method: "POST",
       signal: controller.signal,
@@ -168,7 +172,7 @@ app.post('/api/chat', async (req, res) => {
     const aiResponse = data.response;
     
     if (!aiResponse.includes("I cannot execute") && !aiResponse.includes("I am an AI model")) {
-      
+
       const isRefusal = aiResponse.includes("cannot execute") || aiResponse.includes("cannot modify") || aiResponse.includes("I am an AI model");
 
       if (!isRefusal) {
