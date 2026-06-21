@@ -360,5 +360,5 @@ app.post('/api/reject', (req, res) => {
 });
 
 app.listen(PORT, () => {
-  console.log(`🚀 Assistant server running at http://localhost:${PORT}`);
+  console.log(`N.O.A.H. server running at http://localhost:${PORT}`);
 });
