@@ -101,9 +101,15 @@ app.post('/api/chat', async (req, res) => {
   const personality = loadFile(PERSONALITY_FILE);
   const memory = loadMemory();
 
-  const wantsModification = /(modify|change|rewrite|update|edit|improve|refactor)/i.test(message);
+  const wantsModification =/(modify|change|rewrite|update|edit|improve|refactor)/i.test(message);
 
-  const selfCode = wantsModification ? loadFile(CODE_FILE): "";
+const lowerMessage = message.toLowerCase();
+
+  const modificationTarget = lowerMessage.includes("memory") ? "memory.json": lowerMessage.includes("server") || lowerMessage.includes("source code") || lowerMessage.includes("implementation") ? "server.ts": "personality.txt";
+  
+  const wantsCodeModification = modificationTarget === "server.ts";
+
+  const selfCode = wantsCodeModification ? loadFile(CODE_FILE): "";
 
   const sourceCodeContext = selfCode ? `--- CURRENT SOURCE CODE (${CODE_FILE}) ---\n${selfCode}\n\n`: "";
 
@@ -112,8 +118,9 @@ app.post('/api/chat', async (req, res) => {
     `--- CURRENT MEMORY ---\n${memory}\n\n` +
     `The information in CURRENT MEMORY contains persistent facts and should be treated as true unless the user explicitly corrects them.\n\n` +
     sourceCodeContext +
-    `You are N.O.A.H., a self-modifying assistant.\n\n` +
 
+    `You are N.O.A.H., a self-modifying assistant.\n\n` +
+    `The user's requested modification target is: ${modificationTarget}\n\n` +
     `If the user requests a modification to personality.txt, memory.json, or server.ts, you MUST respond using the exact format below.\n` +
     `Any response that does not use this format is invalid.\n\n` +
 
