@@ -176,7 +176,14 @@ app.post('/api/chat', async (req, res) => {
       const isRefusal = aiResponse.includes("cannot execute") || aiResponse.includes("cannot modify") || aiResponse.includes("I am an AI model");
 
       if (!isRefusal) {
-        conversationHistory.push(`Assistant: ${aiResponse}`);
+        const historySafeResponse = aiResponse.replace(
+          /\[UPDATE:.*?\]\s*```[\s\S]*?```/g,
+          "[UPDATE GENERATED]"
+        );
+
+        conversationHistory.push(
+          `Assistant: ${historySafeResponse}`
+        );      
       }
     }
 
