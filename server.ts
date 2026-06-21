@@ -167,8 +167,10 @@ app.post('/api/chat', async (req, res) => {
     
     const aiResponse = data.response;
     
-    conversationHistory.push(`Assistant: ${aiResponse}`);
-    saveHistory();
+    if (!aiResponse.includes("I cannot execute") &&
+        !aiResponse.includes("I am an AI model")) {
+      conversationHistory.push(`Assistant: ${aiResponse}`);
+    }
 
     if (conversationHistory.length > 40) {
       conversationHistory =
