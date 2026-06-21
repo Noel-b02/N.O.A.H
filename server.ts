@@ -151,10 +151,6 @@ const lowerMessage = message.toLowerCase();
 
     const fullPrompt = wantsModification ? `System Instruction:\n${metaSystemInstruction}\n\n` + `User Request:\n${message}`: `System Instruction:\n${metaSystemInstruction}\n\n` + `Conversation History:\n${recentHistory}\n\n` + `User Request:\n${message}`;
 
-    console.log("========== PROMPT ==========");
-    console.log(fullPrompt);
-    console.log("============================");
-
     const response = await fetch(OLLAMA_URL, {
       method: "POST",
       signal: controller.signal,
@@ -208,17 +204,6 @@ const lowerMessage = message.toLowerCase();
         filepath: match[1].trim(),
         content: match[2].trim()
       });
-    }
-
-    console.log("RAW AI RESPONSE:");
-    console.log(aiResponse);
-
-    console.log("UPDATES FOUND:", updates.length);
-
-    if (updates.length > 0) {
-      console.log("FILE:", updates[0].filepath);
-      console.log("CONTENT:");
-      console.log(updates[0].content);
     }
 
     let hasProposedChanges = false;
