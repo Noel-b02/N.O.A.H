@@ -136,14 +136,17 @@ app.post('/api/chat', async (req, res) => {
     - Output a complete replacement file
     - Do NOT output UPDATE blocks for normal chat
     - Do NOT modify files unless explicitly requested
+    - When modifying personality.txt, ONLY replace the contents of personality.txt.
+    - Do NOT include System Instruction, CURRENT MEMORY, READ ONLY MEMORY CONTEXT, User Request, or any prompt text in the file.
     `
       : "";
 
   const metaSystemInstruction = (
 
-    `--- CURRENT PERSONALITY ---\n${personality}\n\n` +
+    `The complete contents of personality.txt are:\n\n` + `${personality}\n\n` + `End of personality.txt.\n\n` +
 
-    `--- READ ONLY MEMORY CONTEXT ---\n${memory}\n\n` +
+    `READ ONLY MEMORY CONTEXT (not part of personality.txt):\n\n` + 
+    `${memory}\n\n`   + 
     `CURRENT MEMORY is provided for reference.\n` +
     `Do not copy it into personality.txt or server.ts.\n` +
     `Only modify memory.json when the user's requested modification target is memory.json.\n\n`+
