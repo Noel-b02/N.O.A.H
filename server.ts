@@ -136,6 +136,7 @@ const lowerMessage = message.toLowerCase();
     `- Do not use placeholders.\n` +
     `- Do not write 'existing code', 'existing imports', or 'omitted for brevity'.\n` +
     `- Preserve existing functionality unless explicitly instructed otherwise.\n` +
+    `- When modifying a file, preserve all existing lines unless the user explicitly requests their removal.\n` +
     `- When modifying a file, output ONLY UPDATE blocks and nothing else.\n\n`
   
   );
