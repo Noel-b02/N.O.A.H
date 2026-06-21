@@ -125,13 +125,14 @@ app.post('/api/chat', async (req, res) => {
 
     The user's requested modification target is: ${modificationTarget}
 
-    If the user requests a modification to personality.txt, memory.json, or server.ts, you MUST respond using this format:
+    For large changes use:
 
     [UPDATE: filename]
-    \`\`\`text
-    complete file contents
-    \`\`\`
 
+    For small additions use:
+
+    [APPEND: filename]
+    
     Rules:
     - Output a complete replacement file
     - Do NOT output UPDATE blocks for normal chat
