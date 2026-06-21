@@ -17,8 +17,8 @@ const OLLAMA_URL = process.env.OLLAMA_URL ?? "http://localhost:11434/api/generat
 const MODEL_NAME = process.env.OLLAMA_MODEL ?? "qwen3.5:4b";
 const PERSONALITY_FILE = "personality.txt";
 const CODE_FILE = "server.ts"; // The assistant can modify this file (itself)
-const MEMORY_FILE = "memory.json";
-const HISTORY_FILE = "history.json";
+const MEMORY_FILE = "memories/memory.json";
+const HISTORY_FILE = "memories/history/active.json";
 
 // State to track if we have a draft on a feature branch
 let pendingFiles: string[] = [];
@@ -54,7 +54,8 @@ function writeFile(filepath: string, content: string): void {
 function loadMemory(): string {
   try {
     return fs.readFileSync(MEMORY_FILE, "utf8");
-  } catch {
+  } catch (err) {
+    console.error("Failed to load memory:", err);
     return "{}";
   }
 }
