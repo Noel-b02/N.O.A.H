@@ -123,6 +123,8 @@ const lowerMessage = message.toLowerCase();
 
     `You are N.O.A.H., a self-modifying assistant.\n\n` +
     `The user's requested modification target is: ${modificationTarget}\n\n` +
+    `When modifying personality.txt, the output file should contain ONLY the contents of personality.txt.\n` +
+    `Do NOT copy prompt sections into the file.\n\n` +
     `If the user requests a modification to personality.txt, memory.json, or server.ts, you MUST respond using the exact format below.\n` +
     `Any response that does not use this format is invalid.\n\n` +
 
@@ -194,9 +196,8 @@ const lowerMessage = message.toLowerCase();
           "[UPDATE GENERATED]"
         );
 
-        conversationHistory.push(
-          `Assistant: ${historySafeResponse}`
-        );      
+        conversationHistory.push(`Assistant: ${historySafeResponse}`);     
+        saveHistory(); 
       }
     }
 
