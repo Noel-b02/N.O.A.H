@@ -212,7 +212,21 @@ const lowerMessage = message.toLowerCase();
     let match;
 
     while ((match = pattern.exec(aiResponse)) !== null) {
-      updates.push({ filepath: match[1].trim(), content: match[2].trim() });
+      updates.push({
+        filepath: match[1].trim(),
+        content: match[2].trim()
+      });
+    }
+
+    console.log("RAW AI RESPONSE:");
+    console.log(aiResponse);
+
+    console.log("UPDATES FOUND:", updates.length);
+
+    if (updates.length > 0) {
+      console.log("FILE:", updates[0].filepath);
+      console.log("CONTENT:");
+      console.log(updates[0].content);
     }
 
     let hasProposedChanges = false;
