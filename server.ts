@@ -190,10 +190,19 @@ app.post('/api/chat', async (req, res) => {
     if (updates.length > 0) {
       // 1. Ensure clean workspace status before starting a draft branch
       const status = runGitCommand(["status", "--porcelain"]);
-      if (status) {
-        return res.json({ 
+
+      const meaningfulChanges = status
+        .split("\n")
+        .filter(line =>
+          line.trim() &&
+          !line.includes("memories/history/active.json") &&
+          !line.includes("memories/memory.json")
+        );
+
+      if (meaningfulChanges.length > 0) {
+        return res.json({
           response: "I attempted to draft changes, but the local workspace has uncommitted files. Please resolve them first.",
-          hasProposedChanges: false 
+          hasProposedChanges: false
         });
       }
 
