@@ -1,3 +1,5 @@
 .venv/
 .vscode/
 .env
+memories/history/
+memories/memory.json
