@@ -235,7 +235,7 @@ app.post('/api/chat', async (req, res) => {
   }
 
     // Parse out potential updates
-    const pattern = /\[UPDATE:\s*([\w\.-]+)\]\s*```[\w]*\n([\s\S]*?)```/g;
+    const pattern =  /\[UPDATE:\s*([^\]]+)\]\s*\n*\s*```[\w]*\n([\s\S]*?)```/g;
     const updates: { filepath: string; content: string }[] = [];
     let match;
 
@@ -246,7 +246,7 @@ app.post('/api/chat', async (req, res) => {
       });
     }
   console.log("UPDATES FOUND:", updates.length);
-  
+
     let hasProposedChanges = false;
     let gitDiff = "";
 
