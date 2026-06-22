@@ -205,12 +205,6 @@ app.post('/api/chat', async (req, res) => {
     
     const aiResponse = data.response;
 
-    console.log("RESPONSE LENGTH:", aiResponse.length);
-
-    console.log("RAW AI RESPONSE:");
-    console.log(aiResponse);
-    console.log("END RAW AI RESPONSE");
-
     let jsonModifications: any = null;
 
     try {
@@ -251,7 +245,6 @@ app.post('/api/chat', async (req, res) => {
         content: match[2].trim()
       });
     }
-  console.log("UPDATES FOUND:", updates.length);
 
     let hasProposedChanges = false;
     let gitDiff = "";
