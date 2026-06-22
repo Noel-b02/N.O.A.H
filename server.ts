@@ -29,6 +29,24 @@ const ALLOWED_FILES = new Set([
   "public/index.html"
 ]);
 
+type Modification =
+  | {
+      action: "replace_file";
+      file: string;
+      content: string;
+    }
+  | {
+      action: "replace_text";
+      file: string;
+      match: string;
+      replace: string;
+    }
+  | {
+      action: "append_file";
+      file: string;
+      content: string;
+    };
+
 // State to track if we have a draft on a feature branch
 let pendingFiles: string[] = [];
 let activeDraftBranch: string | null = null;
