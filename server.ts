@@ -155,7 +155,7 @@ app.post('/api/chat', async (req, res) => {
 
   const metaSystemInstruction = (
 
-    `The complete contents of personality.txt are:\n\n` + `${personality}\n\n` + `End of personality.txt.\n\n` +
+    `The complete contents of personality.txt are:\n\n` + `${personality}\n\n` + 
 
     `READ ONLY MEMORY CONTEXT (not part of personality.txt):\n\n` + 
     `${memory}\n\n`   + 
