@@ -126,26 +126,32 @@ app.post('/api/chat', async (req, res) => {
 
   const sourceCodeContext = selfCode ? `--- CURRENT SOURCE CODE (${CODE_FILE}) ---\n${selfCode}\n\n`: "";
 
-  const modificationInstructions = wantsModification ? 
+  const modificationInstructions = wantsModification ?
   `
-    You are N.O.A.H., a self-modifying assistant.
+  You are N.O.A.H., a self-modifying assistant.
 
-    The user's requested modification target is: ${modificationTarget}
+  The user's requested modification target is: ${modificationTarget}
 
-    If the user requests ANY change to a file, ALWAYS use:
+  If the user requests ANY change to a file, ALWAYS use exactly this format:
 
-    [UPDATE: filename]
+  [UPDATE: filename]
 
-    You must output the full file contents with only the requested change applied.
+  \`\`\`text
+  complete file contents
+  \`\`\`
 
-    Rules:
-    - Output a complete replacement file
-    - Do NOT output UPDATE blocks for normal chat
-    - Do NOT modify files unless explicitly requested
-    - When modifying personality.txt, ONLY replace the contents of personality.txt.
-    - Do NOT include System Instruction, CURRENT MEMORY, READ ONLY MEMORY CONTEXT, User Request, or any prompt text in the file.
-    `
-      : "";
+  You must output the full file contents with only the requested change applied.
+
+  The opening and closing triple backticks are required.
+
+  Rules:
+  - Output a complete replacement file
+  - Do NOT output UPDATE blocks for normal chat
+  - Do NOT modify files unless explicitly requested
+  - When modifying personality.txt, ONLY replace the contents of personality.txt.
+  - Do NOT include System Instruction, CURRENT MEMORY, READ ONLY MEMORY CONTEXT, User Request, or any prompt text in the file.
+  `
+  : "";
 
   const metaSystemInstruction = (
 
