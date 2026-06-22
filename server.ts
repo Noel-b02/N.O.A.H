@@ -192,7 +192,7 @@ app.post('/api/chat', async (req, res) => {
         stream: false,
         think: false,
         options: {
-        num_predict: isComplex ? 500 : 80,
+        num_predict: isComplex ? 3000 : 80,
         temperature: 0.3
         }
       })
