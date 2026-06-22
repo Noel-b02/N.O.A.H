@@ -309,9 +309,14 @@ app.post('/api/approve', (req, res) => {
     try {
       execSync("npx tsc --noEmit", { stdio: "pipe" });
     } catch (e: any) {
+      
       // Revert branch upon compilation failure
       runGitCommand(["checkout", "master"]);
-      runGitCommand(["branch", "-D", "feature/ai-web-modification"]);
+
+        if (activeDraftBranch) {
+          runGitCommand([ "branch", "-D", activeDraftBranch ]);
+        }      
+
       pendingFiles = [];
       return res.status(422).json({ error: "TypeScript type checking failed. Merging was aborted for safety." });
     }
