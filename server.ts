@@ -205,6 +205,10 @@ app.post('/api/chat', async (req, res) => {
     
     const aiResponse = data.response;
 
+    console.log("RAW AI RESPONSE:");
+    console.log(aiResponse);
+    console.log("END RAW AI RESPONSE");
+
     let jsonModifications: any = null;
 
     try {
