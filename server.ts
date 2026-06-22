@@ -125,14 +125,12 @@ app.post('/api/chat', async (req, res) => {
 
     The user's requested modification target is: ${modificationTarget}
 
-    For large changes use:
+    If the user requests ANY change to a file, ALWAYS use:
 
     [UPDATE: filename]
 
-    For small additions use:
+    You must output the full file contents with only the requested change applied.
 
-    [APPEND: filename]
-    
     Rules:
     - Output a complete replacement file
     - Do NOT output UPDATE blocks for normal chat
