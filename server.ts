@@ -223,11 +223,23 @@ app.post('/api/chat', async (req, res) => {
     
     const aiResponse = data.response;
 
-    let jsonModifications: any = null;
+    let jsonModifications: Modification[] = [];
 
     try {
-      jsonModifications = JSON.parse(aiResponse);
-      console.log("[JSON MODIFICATIONS DETECTED]", jsonModifications);
+      const parsed = JSON.parse(aiResponse);
+
+      if (
+        parsed &&
+        Array.isArray(parsed.modifications)
+      ) {
+        jsonModifications =
+          parsed.modifications as Modification[];
+
+        console.log(
+          "JSON MODIFICATIONS FOUND:",
+          jsonModifications.length
+        );
+      }
     } catch {
       // Not JSON, continue normally
     }
