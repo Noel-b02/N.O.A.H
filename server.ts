@@ -245,7 +245,8 @@ app.post('/api/chat', async (req, res) => {
         content: match[2].trim()
       });
     }
-
+  console.log("UPDATES FOUND:", updates.length);
+  
     let hasProposedChanges = false;
     let gitDiff = "";
 
