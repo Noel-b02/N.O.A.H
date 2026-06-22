@@ -198,6 +198,15 @@ app.post('/api/chat', async (req, res) => {
     clearTimeout(timeout);
     
     const aiResponse = data.response;
+
+    let jsonModifications: any = null;
+
+    try {
+      jsonModifications = JSON.parse(aiResponse);
+      console.log("[JSON MODIFICATIONS DETECTED]", jsonModifications);
+    } catch {
+      // Not JSON, continue normally
+    }
     
     if (!aiResponse.includes("I cannot execute") && !aiResponse.includes("I am an AI model")) {
 
@@ -306,10 +315,11 @@ app.post('/api/approve', (req, res) => {
 
   // Type-check safety step if the server script was modified
   if (pendingFiles.includes(CODE_FILE)) {
+
     try {
       execSync("npx tsc --noEmit", { stdio: "pipe" });
     } catch (e: any) {
-      
+
       // Revert branch upon compilation failure
       runGitCommand(["checkout", "master"]);
 
