@@ -22,6 +22,13 @@ const CODE_FILE = "server.ts"; // The assistant can modify this file (itself)
 const MEMORY_FILE = "memories/memory.json";
 const HISTORY_FILE = "memories/history/active.json";
 
+const ALLOWED_FILES = new Set([
+  "personality.txt",
+  "server.ts",
+  "memories/memory.json",
+  "public/index.html"
+]);
+
 // State to track if we have a draft on a feature branch
 let pendingFiles: string[] = [];
 let activeDraftBranch: string | null = null;
@@ -261,13 +268,16 @@ app.post('/api/chat', async (req, res) => {
 
       // 3. Write drafts to disk
       for (const update of updates) {
-        if (
-          [PERSONALITY_FILE, CODE_FILE, MEMORY_FILE]
-            .includes(update.filepath)
-        ) {
-          writeFile(update.filepath, update.content);
-          pendingFiles.push(update.filepath);
+
+        if (!ALLOWED_FILES.has(update.filepath)) {
+          console.warn(
+            `Blocked modification attempt: ${update.filepath}`
+          );
+          continue;
         }
+
+        writeFile(update.filepath, update.content);
+        pendingFiles.push(update.filepath);
       }
 
       hasProposedChanges = true;
