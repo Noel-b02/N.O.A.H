@@ -505,9 +505,30 @@ app.post('/api/approve', (req, res) => {
   }
 
   // Commit and merge sequence
-  runGitCommand(["add", ...pendingFiles]);
-  runGitCommand(["commit", "-m", "AI self-modification merge"]);
-  runGitCommand(["checkout", "master"]);
+console.log("ADDING:", pendingFiles);
+console.log(runGitCommand(["add", ...pendingFiles]));
+
+console.log("COMMITTING...");
+console.log(
+  runGitCommand([
+    "commit",
+    "-m",
+    "AI self-modification merge"
+  ])
+);
+
+console.log("CHECKOUT MASTER...");
+console.log(
+  runGitCommand(["checkout", "master"])
+);
+
+console.log("MERGING...");
+console.log(
+  runGitCommand([
+    "merge",
+    activeDraftBranch!
+  ])
+);
 
   if (activeDraftBranch) {
     runGitCommand([
