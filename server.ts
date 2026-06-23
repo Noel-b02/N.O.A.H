@@ -177,6 +177,29 @@ app.post('/api/chat', async (req, res) => {
     ]
   }
 
+  Example:
+
+  {
+    "modifications": [
+      {
+        "action": "replace_text",
+        "file": "server.ts",
+        "match": "dotenv.config();",
+        "replace": "dotenv.config();\nconsole.log(\"NOAH SERVER STARTING\");"
+      }
+    ]
+  }
+
+  The same modification formats apply to:
+  - personality.txt
+  - server.ts
+  - public/index.html
+  - memories/memory.json
+
+  For server.ts modifications:
+  - Prefer replace_text over full-file rewrites.
+  - Only use [UPDATE: server.ts] when the change cannot reasonably be expressed with replace_text.
+
   For large structural rewrites, you may still use:
 
   [UPDATE: filename]
