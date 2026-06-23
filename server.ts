@@ -165,6 +165,18 @@ app.post('/api/chat', async (req, res) => {
     ]
   }
 
+  Example:
+  
+  {
+    "modifications": [
+      {
+        "action": "append_file",
+        "file": "personality.txt",
+        "content": "Keep things casual with the user."
+      }
+    ]
+  }
+
   For large structural rewrites, you may still use:
 
   [UPDATE: filename]
