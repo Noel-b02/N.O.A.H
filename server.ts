@@ -130,6 +130,8 @@ app.post('/api/chat', async (req, res) => {
 
   const wantsModification =/(modify|change|rewrite|update|edit|improve|refactor)/i.test(message);
 
+  console.log( "WANTS MODIFICATION:", wantsModification );
+
   const isComplex = wantsModification || /(code|typescript|javascript|debug|server|memory|git|branch|refactor)/i.test(message);
 
   const selectedModel = isComplex? CODE_MODEL: CHAT_MODEL;
