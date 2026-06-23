@@ -142,6 +142,8 @@ app.post('/api/chat', async (req, res) => {
 
   const selfCode = wantsCodeModification ? loadFile(CODE_FILE): "";
 
+  console.log("SERVER SIZE:", selfCode.length);
+
   const sourceCodeContext = selfCode ? `--- CURRENT SOURCE CODE (${CODE_FILE}) ---\n${selfCode}\n\n`: "";
 
   const modificationInstructions = wantsModification ?
