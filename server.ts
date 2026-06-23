@@ -128,7 +128,7 @@ app.post('/api/chat', async (req, res) => {
   const personality = loadFile(PERSONALITY_FILE);
   const memory = loadMemory();
 
-  const wantsModification =/(modify|change|rewrite|update|edit|improve|refactor)/i.test(message);
+  const wantsModification =/(modify|change|rewrite|update|edit|improve|refactor|remember|memorize|store|save)/i.test(message);
 
   console.log( "WANTS MODIFICATION:", wantsModification );
 
