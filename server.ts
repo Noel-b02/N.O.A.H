@@ -243,6 +243,10 @@ app.post('/api/chat', async (req, res) => {
 
     const fullPrompt = wantsModification ? `System Instruction:\n${metaSystemInstruction}\n\n` + `User Request:\n${message}`: `System Instruction:\n${metaSystemInstruction}\n\n` + `Conversation History:\n${recentHistory}\n\n` + `User Request:\n${message}`;
     
+    console.log("WANTS MODIFICATION:", wantsModification);
+  console.log("PROMPT SENT TO MODEL:");
+  console.log(fullPrompt);
+
     console.log(`[MODEL] ${selectedModel} | complex=${isComplex}`);
 
     const response = await fetch(OLLAMA_URL, {
