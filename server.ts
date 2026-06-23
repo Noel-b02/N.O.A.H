@@ -150,32 +150,15 @@ app.post('/api/chat', async (req, res) => {
 
   The user's requested modification target is: ${modificationTarget}
 
-  If the requested change is small, prefer JSON modifications.
+  Use JSON modifications whenever possible.
+  
+  The following files may be modified:
 
-  Example:
+  ${Array.from(ALLOWED_FILES).map(f => `- ${f}`).join("\n")}
 
-  {
-    "modifications": [
-      {
-        "action": "replace_text",
-        "file": "personality.txt",
-        "match": "For greetings, respond briefly and naturally.",
-        "replace": "For greetings, respond briefly and naturally with \"howdy\"."
-      }
-    ]
-  }
+  The modification actions work for ANY allowed file.
 
-  Example:
-
-  {
-    "modifications": [
-      {
-        "action": "append_file",
-        "file": "personality.txt",
-        "content": "Keep things casual with the user."
-      }
-    ]
-  }
+  Use replace_text when changing existing content.
 
   Example:
 
@@ -190,11 +173,21 @@ app.post('/api/chat', async (req, res) => {
     ]
   }
 
-  The same modification formats apply to:
-  - personality.txt
-  - server.ts
-  - public/index.html
-  - memories/memory.json
+  Use append_file when adding new content without changing existing content.
+
+  Example:
+
+  {
+    "modifications": [
+      {
+        "action": "append_file",
+        "file": "personality.txt",
+        "content": "Keep things casual with the user."
+      }
+    ]
+  }
+
+  Prefer JSON modifications whenever possible.
 
   For server.ts modifications:
   - Prefer replace_text over full-file rewrites.
