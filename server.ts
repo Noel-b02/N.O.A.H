@@ -311,19 +311,43 @@ app.post('/api/chat', async (req, res) => {
       }
 
       // 2. Checkout new draft branch
-    const branchName =
-      `feature/ai-${Date.now()}`;
+      const branchName = `feature/ai-${Date.now()}`;
 
-    runGitCommand([
-      "checkout",
-      "-b",
-      branchName
-    ]);
+      runGitCommand([ "checkout", "-b", branchName]);
 
-    activeDraftBranch = branchName;      
-    pendingFiles = [];
+      activeDraftBranch = branchName;      
+      pendingFiles = [];
 
       // 3. Write drafts to disk
+      for (const mod of jsonModifications) {
+
+        if (!ALLOWED_FILES.has(mod.file)) {
+          console.warn(
+            `Blocked modification attempt: ${mod.file}`
+          );
+          continue;
+        }
+
+        if (mod.action === "replace_text") {
+
+          const currentContent =
+            loadFile(mod.file);
+
+          const updatedContent =
+            currentContent.replace(
+              mod.match,
+              mod.replace
+            );
+
+          writeFile(
+            mod.file,
+            updatedContent
+          );
+
+          pendingFiles.push(mod.file);
+        }
+      }
+
       for (const update of updates) {
 
         if (!ALLOWED_FILES.has(update.filepath)) {
