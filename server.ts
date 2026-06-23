@@ -330,19 +330,22 @@ app.post('/api/chat', async (req, res) => {
 
         if (mod.action === "replace_text") {
 
-          const currentContent =
-            loadFile(mod.file);
+          const currentContent = loadFile(mod.file);
 
-          const updatedContent =
-            currentContent.replace(
-              mod.match,
-              mod.replace
-            );
+          const updatedContent = currentContent.replace( mod.match, mod.replace);
 
-          writeFile(
-            mod.file,
-            updatedContent
-          );
+          writeFile( mod.file, updatedContent );
+
+          pendingFiles.push(mod.file);
+        }
+
+        if (mod.action === "append_file") {
+
+          const currentContent = loadFile(mod.file);
+
+          const updatedContent = currentContent + "\n" + mod.content;
+
+          writeFile( mod.file, updatedContent);
 
           pendingFiles.push(mod.file);
         }
