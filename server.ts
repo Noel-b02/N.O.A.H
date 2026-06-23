@@ -150,17 +150,28 @@ app.post('/api/chat', async (req, res) => {
 
   The user's requested modification target is: ${modificationTarget}
 
-  If the user requests ANY change to a file, ALWAYS use exactly this format:
+  If the requested change is small, prefer JSON modifications.
+
+  Example:
+
+  {
+    "modifications": [
+      {
+        "action": "replace_text",
+        "file": "personality.txt",
+        "match": "For greetings, respond briefly and naturally.",
+        "replace": "For greetings, respond briefly and naturally with \"howdy\"."
+      }
+    ]
+  }
+
+  For large structural rewrites, you may still use:
 
   [UPDATE: filename]
 
   \`\`\`text
   complete file contents
   \`\`\`
-
-  You must output the full file contents with only the requested change applied.
-
-  The opening and closing triple backticks are required.
 
   Rules:
   - Output a complete replacement file
