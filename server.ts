@@ -290,7 +290,8 @@ app.post('/api/chat', async (req, res) => {
     let hasProposedChanges = false;
     let gitDiff = "";
 
-    if (updates.length > 0) {
+    if ( updates.length > 0 || jsonModifications.length > 0 ) {      
+      
       // 1. Ensure clean workspace status before starting a draft branch
       const status = runGitCommand(["status", "--porcelain"]);
 
