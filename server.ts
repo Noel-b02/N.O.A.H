@@ -166,7 +166,7 @@ app.post('/api/chat', async (req, res) => {
   }
 
   Example:
-  
+
   {
     "modifications": [
       {
@@ -191,6 +191,8 @@ app.post('/api/chat', async (req, res) => {
   - Do NOT modify files unless explicitly requested
   - When modifying personality.txt, ONLY replace the contents of personality.txt.
   - Do NOT include System Instruction, CURRENT MEMORY, READ ONLY MEMORY CONTEXT, User Request, or any prompt text in the file.
+  -  Do not modify existing instructions unless the user explicitly asks to change them.
+  - Use append_file when adding a new instruction.
   `
   : "";
 
