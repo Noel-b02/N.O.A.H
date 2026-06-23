@@ -357,9 +357,18 @@ app.post('/api/chat', async (req, res) => {
 
           const currentContent = loadFile(mod.file);
 
+          console.log("BEFORE:");
+          console.log(currentContent);
+
           const updatedContent = currentContent + "\n" + mod.content;
 
-          writeFile( mod.file, updatedContent);
+          console.log("AFTER:");
+          console.log(updatedContent);
+
+          writeFile(
+            mod.file,
+            updatedContent
+          );
 
           pendingFiles.push(mod.file);
         }
