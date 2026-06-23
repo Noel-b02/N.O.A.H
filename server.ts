@@ -140,7 +140,7 @@ app.post('/api/chat', async (req, res) => {
   
   const wantsCodeModification = modificationTarget === "server.ts";
 
-  const selfCode = wantsCodeModification ? loadFile(CODE_FILE): "";
+  const selfCode = wantsCodeModification ? loadFile(CODE_FILE).slice(0, 4000): "";
 
   console.log("SERVER SIZE:", selfCode.length);
 
