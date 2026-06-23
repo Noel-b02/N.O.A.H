@@ -510,10 +510,7 @@ console.log(runGitCommand(["add", ...pendingFiles]));
 
 console.log("COMMITTING...");
 console.log(
-  runGitCommand([
-    "commit",
-    "-m",
-    "AI self-modification merge"
+  runGitCommand([ "commit", "-m", "\"AI self-modification merge\""
   ])
 );
 
