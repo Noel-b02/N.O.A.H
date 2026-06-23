@@ -264,6 +264,10 @@ app.post('/api/chat', async (req, res) => {
     
     const aiResponse = data.response;
 
+    console.log("RAW AI RESPONSE:");
+    console.log(aiResponse);
+    console.log("RESPONSE LENGTH:", aiResponse?.length ?? 0);
+
     let jsonModifications: Modification[] = [];
 
     try {
