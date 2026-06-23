@@ -45,6 +45,12 @@ type Modification =
       action: "append_file";
       file: string;
       content: string;
+    }
+  | {
+      action: "set_json_value";
+      file: string;
+      path: string;
+      value: any;
     };
 
 // State to track if we have a draft on a feature branch
@@ -153,14 +159,17 @@ app.post('/api/chat', async (req, res) => {
   You are N.O.A.H., a self-modifying assistant.
 
   The user's requested modification target is: ${modificationTarget}
-
-  Use JSON modifications whenever possible.
   
   The following files may be modified:
 
   ${Array.from(ALLOWED_FILES).map(f => `- ${f}`).join("\n")}
 
   The modification actions work for ANY allowed file.
+
+  Available actions:
+  - replace_text
+  - append_file
+  - set_json_value
 
   Use replace_text when changing existing content.
 
@@ -193,9 +202,20 @@ app.post('/api/chat', async (req, res) => {
 
   Prefer JSON modifications whenever possible.
 
-  For server.ts modifications:
-  - Prefer replace_text over full-file rewrites.
-  - Only use [UPDATE: server.ts] when the change cannot reasonably be expressed with replace_text.
+  For JSON files, prefer set_json_value.
+
+  Example:
+
+  {
+    "modifications": [
+      {
+        "action": "set_json_value",
+        "file": "memories/memory.json",
+        "path": "facts.birthday",
+        "value": "January 3rd"
+      }
+    ]
+  }
 
   For large structural rewrites, you may still use:
 
@@ -400,7 +420,33 @@ app.post('/api/chat', async (req, res) => {
 
           pendingFiles.push(mod.file);
         }
+      
+        if (mod.action === "set_json_value") {
+
+          const json = JSON.parse( loadFile(mod.file) );
+
+          const keys = mod.path.split(".");
+
+          let current = json;
+
+          for (let i = 0; i < keys.length - 1; i++) {
+
+            if (!current[keys[i]]) {
+              current[keys[i]] = {};
+            }
+
+            current = current[keys[i]];
+          }
+
+          current[keys[keys.length - 1]] =  mod.value;
+
+          writeFile(  mod.file, JSON.stringify(json, null, 2));
+
+          pendingFiles.push(mod.file);
+        }
       }
+
+      
 
       for (const update of updates) {
 
