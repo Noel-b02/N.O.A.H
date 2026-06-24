@@ -199,6 +199,11 @@ app.post('/api/chat', async (req, res) => {
       }
     ]
   }
+  When using append_file:
+  - content must contain ONLY the new text being added.
+  - Do NOT include existing file contents.
+  - Do NOT rewrite the file.
+  - Do NOT repeat existing instructions.
 
   Prefer JSON modifications whenever possible.
 
@@ -264,8 +269,8 @@ app.post('/api/chat', async (req, res) => {
     const fullPrompt = wantsModification ? `System Instruction:\n${metaSystemInstruction}\n\n` + `User Request:\n${message}`: `System Instruction:\n${metaSystemInstruction}\n\n` + `Conversation History:\n${recentHistory}\n\n` + `User Request:\n${message}`;
     
     console.log("WANTS MODIFICATION:", wantsModification);
-  console.log("PROMPT SENT TO MODEL:");
-  console.log(fullPrompt);
+    console.log("PROMPT SENT TO MODEL:");
+    console.log(fullPrompt);
 
     console.log(`[MODEL] ${selectedModel} | complex=${isComplex}`);
 
