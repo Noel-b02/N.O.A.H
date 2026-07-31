@@ -18,13 +18,11 @@ const CHAT_MODEL = process.env.OLLAMA_CHAT_MODEL ?? "qwen3.5:4b";
 const CODE_MODEL = process.env.OLLAMA_CODE_MODEL ?? "qwen3.5:9b";
 
 const PERSONALITY_FILE = "personality.txt";
-const CODE_FILE = "server.ts"; // The assistant can modify this file (itself)
 const MEMORY_FILE = "memories/memory.json";
 const HISTORY_FILE = "memories/history/active.json";
 
 const ALLOWED_FILES = new Set([
   "personality.txt",
-  "server.ts",
   "memories/memory.json",
   "public/index.html"
 ]);
@@ -57,6 +55,7 @@ type Modification =
 let pendingFiles: string[] = [];
 let activeDraftBranch: string | null = null;
 let conversationHistory: string[] = loadHistory();
+let requestInFlight = false;
 
 
 function loadHistory(): string[] {
@@ -112,6 +111,13 @@ const setupGit = () => {
 };
 setupGit();
 
+// Warm the models so by the time the real request comes in, the model is already loaded and ready to respond quickly
+fetch(OLLAMA_URL, {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({ model: CHAT_MODEL, prompt: "hi", stream: false, options: { num_predict: 1 } })
+}).catch(() => {});
+
 app.get('/api/status', (_, res) => {
   res.json({
     activeDraftBranch,
@@ -128,6 +134,11 @@ app.post('/api/chat', async (req, res) => {
     return res.status(400).json({ error: "Message is required." });
   }
 
+  if (requestInFlight) {
+    return res.status(429).json({ error: "Still processing the previous message — please wait." });
+  }
+  requestInFlight = true;
+
   conversationHistory.push(`User: ${message}`);
   saveHistory();
 
@@ -138,21 +149,19 @@ app.post('/api/chat', async (req, res) => {
 
   console.log( "WANTS MODIFICATION:", wantsModification );
 
-  const isComplex = wantsModification || /(code|typescript|javascript|debug|server|memory|git|branch|refactor)/i.test(message);
+  // Short messages like ("hi", "thanks", "ok") are never complex on keyword grounds alone —
+  // skip straight to the fast model rather than utilize the smart model to decrease latency
+  // Modification requests still go to the smart model regardless of length, since
+  // they need to reliably produce structured JSON output.
+  const wordCount = message.trim().split(/\s+/).length;
+
+  const isComplex = wantsModification || (
+    wordCount > 5 && /(typescript|javascript|debug|refactor|git|branch)/i.test(message)
+  );
 
   const selectedModel = isComplex? CODE_MODEL: CHAT_MODEL;
 
-  const lowerMessage = message.toLowerCase();
-
- const modificationTarget = /(remember|memory|memorise|memorize|store this|save this)/i.test(message) ? "memory.json": lowerMessage.includes("server") ? "server.ts": "personality.txt";
-  
-  const wantsCodeModification = modificationTarget === "server.ts";
-
-  const selfCode = wantsCodeModification ? loadFile(CODE_FILE).slice(0, 4000): "";
-
-  console.log("SERVER SIZE:", selfCode.length);
-
-  const sourceCodeContext = selfCode ? `--- CURRENT SOURCE CODE (${CODE_FILE}) ---\n${selfCode}\n\n`: "";
+  const modificationTarget = /(remember|memory|memorise|memorize|store this|save this)/i.test(message) ? "memory.json": "personality.txt";
 
   const modificationInstructions = wantsModification ?
   `
@@ -179,9 +188,9 @@ app.post('/api/chat', async (req, res) => {
     "modifications": [
       {
         "action": "replace_text",
-        "file": "server.ts",
-        "match": "dotenv.config();",
-        "replace": "dotenv.config();\nconsole.log(\"NOAH SERVER STARTING\");"
+        "file": "personality.txt",
+        "match": "Be concise by default.",
+        "replace": "Be concise by default, but use more detail when asked to explain something."
       }
     ]
   }
@@ -248,11 +257,10 @@ app.post('/api/chat', async (req, res) => {
     `READ ONLY MEMORY CONTEXT (not part of personality.txt):\n\n` + 
     `${memory}\n\n`   + 
     `CURRENT MEMORY is provided for reference.\n` +
-    `Do not copy it into personality.txt or server.ts.\n` +
+    `Do not copy it into personality.txt.\n` +
     `Only modify memory.json when the user's requested modification target is memory.json.\n\n`+
     `The information in CURRENT MEMORY contains persistent facts and should be treated as true unless the user explicitly corrects them.\n\n` +
 
-    sourceCodeContext +
     modificationInstructions 
   
   );
@@ -481,6 +489,8 @@ app.post('/api/chat', async (req, res) => {
 
   } catch (err: any) {
     res.status(500).json({ error: err.message });
+  } finally {
+    requestInFlight = false;
   }
 });
 
@@ -488,25 +498,6 @@ app.post('/api/chat', async (req, res) => {
 app.post('/api/approve', (req, res) => {
   if (pendingFiles.length === 0) {
     return res.status(400).json({ error: "No pending modifications to approve." });
-  }
-
-  // Type-check safety step if the server script was modified
-  if (pendingFiles.includes(CODE_FILE)) {
-
-    try {
-      execSync("npx tsc --noEmit", { stdio: "pipe" });
-    } catch (e: any) {
-
-      // Revert branch upon compilation failure
-      runGitCommand(["checkout", "master"]);
-
-        if (activeDraftBranch) {
-          runGitCommand([ "branch", "-D", activeDraftBranch ]);
-        }      
-
-      pendingFiles = [];
-      return res.status(422).json({ error: "TypeScript type checking failed. Merging was aborted for safety." });
-    }
   }
 
   // Commit and merge sequence
@@ -533,11 +524,6 @@ console.log(
 );
 
   if (activeDraftBranch) {
-    runGitCommand([
-      "merge",
-      activeDraftBranch
-    ]);
-
     runGitCommand([
       "branch",
       "-D",
