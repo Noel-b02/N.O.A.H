@@ -60,7 +60,6 @@ type Modification =
 interface CommitInfo {
   title: string;
   body?: string;
-  author?: string;
 }
 
 interface ArchivedSession {
