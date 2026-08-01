@@ -340,16 +340,13 @@ app.post('/api/chat', async (req, res) => {
     console.log("RESPONSE LENGTH:", aiResponse?.length ?? 0);
 
     let jsonModifications: Modification[] = [];
+    let isPureJsonResponse = false;
 
     try {
       const parsed = JSON.parse(aiResponse);
+      isPureJsonResponse = true;
 
       pendingCommit = parsed.commit ?? null;
-
-      if (Array.isArray(parsed.modifications)) {
-          jsonModifications =
-              parsed.modifications as Modification[];
-      }
 
       if (Array.isArray(parsed.modifications)) {
           jsonModifications =
@@ -369,10 +366,12 @@ app.post('/api/chat', async (req, res) => {
       const isRefusal = aiResponse.includes("cannot execute") || aiResponse.includes("cannot modify") || aiResponse.includes("I am an AI model");
 
       if (!isRefusal) {
-        const historySafeResponse = aiResponse.replace(
-          /\[UPDATE:.*?\]\s*```[\s\S]*?```/g,
-          "[UPDATE GENERATED]"
-        );
+        const historySafeResponse = isPureJsonResponse
+          ? `[Proposed modification: ${pendingCommit?.title ?? "changes drafted"}]`
+          : aiResponse.replace(
+              /\[UPDATE:.*?\]\s*```[\s\S]*?```/g,
+              "[UPDATE GENERATED]"
+            );
 
         conversationHistory.push(`Assistant: ${historySafeResponse}`);     
         saveHistory(); 
@@ -513,7 +512,9 @@ app.post('/api/chat', async (req, res) => {
     }
 
     // Strip update tags out of conversational response text
-    const cleanText = aiResponse.replace(/\[UPDATE:.*?\]\s*```[\s\S]*?```/g, "").trim();
+    const cleanText = isPureJsonResponse
+      ? ""
+      : aiResponse.replace(/\[UPDATE:.*?\]\s*```[\s\S]*?```/g, "").trim();
 
     res.json({
       response: cleanText || (hasProposedChanges ? "I have drafted the requested changes for your review." : ""),
@@ -555,6 +556,10 @@ console.log(
   ])
 );
 
+// VS Code's Git extension reads .git/COMMIT_EDITMSG and shows it in the
+// Source Control input box whenever that box is empty. Git already writes
+// this file as part of `git commit -m`, but we write it explicitly here too
+// so the exact title/body formatting is guaranteed regardless of git version.
 try {
   fs.writeFileSync(
     path.join(".git", "COMMIT_EDITMSG"),
