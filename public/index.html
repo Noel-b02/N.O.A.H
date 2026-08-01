@@ -211,6 +211,22 @@
         </div>
       </div>
 
+      <!-- Proposed Commit Message -->
+      <div id="commit-info" class="px-6 py-4 border-b border-cyan-500/10 bg-slate-950/30 hidden">
+        <div class="flex items-center justify-between mb-2">
+          <p class="text-[9px] font-mono tracking-widest text-cyan-500 uppercase">Proposed Commit Message</p>
+          <button
+            onclick="copyCommitMessage()"
+            id="copy-commit-btn"
+            class="text-[9px] font-mono tracking-widest text-cyan-400 border border-cyan-500/30 px-2 py-0.5 rounded hover:bg-cyan-500/10 uppercase"
+          >
+            Copy
+          </button>
+        </div>
+        <p id="commit-title" class="text-sm text-cyan-200 font-mono"></p>
+        <p id="commit-body" class="text-xs text-slate-400 font-mono mt-1 leading-relaxed"></p>
+      </div>
+
       <!-- Diff File Line-By-Line Visualizer -->
       <div class="flex-1 overflow-auto p-6 font-mono text-[10px] leading-relaxed bg-slate-950/20 relative" id="diff-container">
         <!-- Populated via JS -->
@@ -241,6 +257,9 @@
     const chatMessages = document.getElementById('chat-messages');
     const diffPanel = document.getElementById('diff-panel');
     const diffContainer = document.getElementById('diff-container');
+    const commitInfo = document.getElementById('commit-info');
+    const commitTitleEl = document.getElementById('commit-title');
+    const commitBodyEl = document.getElementById('commit-body');
     const equalizer = document.getElementById('equalizer-container');
 
     // Simulate active system telemetry fluctuations
@@ -332,7 +351,7 @@
 
         if (data.hasProposedChanges) {
           setCoreState('alert');
-          showDiff(data.diff);
+          showDiff(data.diff, data.commit);
         } else {
           setCoreState('idle');
         }
@@ -381,9 +400,19 @@
       if (el) el.remove();
     }
 
-    function showDiff(diffString) {
+    function showDiff(diffString, commit) {
       diffContainer.innerHTML = '';
       diffPanel.classList.remove('hidden');
+
+      if (commit && commit.title) {
+        commitInfo.classList.remove('hidden');
+        commitTitleEl.textContent = commit.title;
+        commitBodyEl.textContent = commit.body || '';
+      } else {
+        commitInfo.classList.add('hidden');
+        commitTitleEl.textContent = '';
+        commitBodyEl.textContent = '';
+      }
 
       if (!diffString) {
         diffContainer.innerHTML = '<div class="text-slate-600 font-mono text-center mt-12 tracking-widest">ZERO ALIGNMENT DEVIATION RECORDED.</div>';
@@ -409,6 +438,21 @@
       });
     }
 
+    function copyCommitMessage() {
+      const title = commitTitleEl.textContent || '';
+      const body = commitBodyEl.textContent || '';
+      const fullMessage = body ? `${title}\n\n${body}` : title;
+
+      navigator.clipboard.writeText(fullMessage).then(() => {
+        const btn = document.getElementById('copy-commit-btn');
+        const original = btn.textContent;
+        btn.textContent = 'Copied';
+        setTimeout(() => { btn.textContent = original; }, 1500);
+      }).catch(() => {
+        alert('Clipboard access denied by browser. Select and copy the text manually.');
+      });
+    }
+
     async function handleAction(endpoint) {
       try {
         const response = await fetch(`/api/${endpoint}`, { method: 'POST' });
@@ -421,6 +465,7 @@
         }
 
         diffPanel.classList.add('hidden');
+        commitInfo.classList.add('hidden');
         setCoreState('idle');
         
         if (endpoint === 'approve') {
