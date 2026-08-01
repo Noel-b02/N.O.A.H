@@ -20,6 +20,12 @@ const CODE_MODEL = process.env.OLLAMA_CODE_MODEL ?? "qwen3.5:9b";
 const PERSONALITY_FILE = "personality.txt";
 const MEMORY_FILE = "memories/memory.json";
 const HISTORY_FILE = "memories/history/active.json";
+const ARCHIVE_DIR = "memories/history/archive";
+
+const MONTH_NAMES = [
+  "january", "february", "march", "april", "may", "june",
+  "july", "august", "september", "october", "november", "december"
+];
 
 const ALLOWED_FILES = new Set([
   "personality.txt",
@@ -57,10 +63,30 @@ interface CommitInfo {
   author?: string;
 }
 
+interface ArchivedSession {
+  archivedAt: string; // ISO timestamp of when this session was archived
+  reason: "startup" | "manual";
+  messages: string[];
+}
+
 // State to track if we have a draft on a feature branch
 let pendingFiles: string[] = [];
 let activeDraftBranch: string | null = null;
+
+// Capture active.json's last-modified time BEFORE loading it, so a leftover
+// session from a previous run gets archived under the date it actually
+// happened on, not today's date.
+const previousSessionEndedAt = (() => {
+  try {
+    return fs.statSync(HISTORY_FILE).mtime;
+  } catch {
+    return new Date();
+  }
+})();
+
 let conversationHistory: string[] = loadHistory();
+archiveSession("startup", previousSessionEndedAt);
+
 let requestInFlight = false;
 let pendingCommit: CommitInfo | null = null;
 
@@ -80,6 +106,138 @@ function saveHistory(): void {
     HISTORY_FILE,
     JSON.stringify(conversationHistory, null, 2)
   );
+}
+
+// Finds the next available session number for a given YYYY-MM-DD, so multiple
+// sessions on the same day get date_1.json, date_2.json, etc.
+function nextSessionNumberForDate(dateStr: string): number {
+  const pattern = new RegExp(`^${dateStr}_(\\d+)\\.json$`);
+  let max = 0;
+  for (const file of listArchiveFiles()) {
+    const match = path.basename(file).match(pattern);
+    if (match) {
+      const n = parseInt(match[1], 10);
+      if (n > max) max = n;
+    }
+  }
+  return max + 1;
+}
+
+// Archives whatever is currently in conversationHistory to its own dated
+// file under ARCHIVE_DIR, then clears active.json for a fresh session.
+// `archivedAt` lets the caller attribute the session to when it actually
+// happened (e.g. active.json's last-modified time) rather than "now".
+function archiveSession(reason: "startup" | "manual", archivedAt: Date = new Date()): string | null {
+  if (conversationHistory.length === 0) return null;
+
+  fs.mkdirSync(ARCHIVE_DIR, { recursive: true });
+
+  const dateStr = archivedAt.toISOString().slice(0, 10); // YYYY-MM-DD
+  const sessionNumber = nextSessionNumberForDate(dateStr);
+  const archivePath = path.join(ARCHIVE_DIR, `${dateStr}_${sessionNumber}.json`);
+
+  const session: ArchivedSession = {
+    archivedAt: archivedAt.toISOString(),
+    reason,
+    messages: conversationHistory
+  };
+
+  fs.writeFileSync(archivePath, JSON.stringify(session, null, 2));
+
+  conversationHistory = [];
+  saveHistory();
+
+  console.log(`Archived session (${reason}) -> ${archivePath}`);
+  return archivePath;
+}
+
+function listArchiveFiles(): string[] {
+  try {
+    return fs.readdirSync(ARCHIVE_DIR)
+      .filter(f => f.endsWith(".json"))
+      .map(f => path.join(ARCHIVE_DIR, f));
+  } catch {
+    return [];
+  }
+}
+
+function loadArchive(filePath: string): ArchivedSession | null {
+  try {
+    return JSON.parse(fs.readFileSync(filePath, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function findArchivesByDate(targetDate: Date): ArchivedSession[] {
+  const matches: ArchivedSession[] = [];
+  for (const file of listArchiveFiles()) {
+    const session = loadArchive(file);
+    if (!session) continue;
+    const sessionDate = new Date(session.archivedAt);
+    if (
+      sessionDate.getFullYear() === targetDate.getFullYear() &&
+      sessionDate.getMonth() === targetDate.getMonth() &&
+      sessionDate.getDate() === targetDate.getDate()
+    ) {
+      matches.push(session);
+    }
+  }
+  return matches;
+}
+
+function searchArchivesByKeyword(keyword: string): { date: string; line: string }[] {
+  const results: { date: string; line: string }[] = [];
+  const lowerKeyword = keyword.toLowerCase();
+  for (const file of listArchiveFiles()) {
+    const session = loadArchive(file);
+    if (!session) continue;
+    for (const line of session.messages) {
+      if (line.toLowerCase().includes(lowerKeyword)) {
+        results.push({ date: session.archivedAt, line });
+      }
+    }
+  }
+  return results;
+}
+
+// Looks for a DD/MM(/YYYY) numeric date or a "Month Day(, Year)" style date
+// in a message. Numeric dates are parsed as DD/MM to match UK date order;
+// year defaults to the current year when omitted.
+function extractDateFromMessage(message: string): Date | null {
+  const numeric = message.match(/\b(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?\b/);
+  if (numeric) {
+    const [, dayStr, monthStr, yearStr] = numeric;
+    const day = parseInt(dayStr, 10);
+    const month = parseInt(monthStr, 10) - 1;
+    let year = yearStr ? parseInt(yearStr, 10) : new Date().getFullYear();
+    if (yearStr && yearStr.length === 2) year += 2000;
+    const d = new Date(year, month, day);
+    if (!isNaN(d.getTime()) && month >= 0 && month <= 11) return d;
+  }
+
+  const monthPattern = new RegExp(
+    `\\b(${MONTH_NAMES.join("|")})\\s+(\\d{1,2})(?:st|nd|rd|th)?(?:,?\\s+(\\d{4}))?\\b`,
+    "i"
+  );
+  const monthMatch = message.match(monthPattern);
+  if (monthMatch) {
+    const monthIndex = MONTH_NAMES.indexOf(monthMatch[1].toLowerCase());
+    const day = parseInt(monthMatch[2], 10);
+    const year = monthMatch[3] ? parseInt(monthMatch[3], 10) : new Date().getFullYear();
+    const d = new Date(year, monthIndex, day);
+    if (!isNaN(d.getTime())) return d;
+  }
+
+  return null;
+}
+
+const RECALL_TRIGGER_PATTERN = /(what did (we|i) (talk|speak) about|what did (i|we) (say|discuss|mention)|do you remember (when|talking about|us talking about)|did we (talk|speak) about|have we (talked|spoken) about|what were we discussing)/i;
+
+function extractTopicKeyword(message: string): string {
+  const aboutMatch = message.match(/about\s+(.+?)[\?\.!]?$/i);
+  if (aboutMatch) return aboutMatch[1].trim();
+  return message.replace(RECALL_TRIGGER_PATTERN, "").trim();
 }
 
 function loadFile(filepath: string): string {
@@ -146,6 +304,18 @@ app.post('/api/chat', async (req, res) => {
   }
   requestInFlight = true;
 
+  const endSessionPattern = /^(end session|new session|clear session|archive session)\.?$/i;
+  if (endSessionPattern.test(message.trim())) {
+    const archivePath = archiveSession("manual");
+    requestInFlight = false;
+    return res.json({
+      response: archivePath
+        ? "Session archived. Starting fresh."
+        : "Nothing to archive — this session is already empty.",
+      hasProposedChanges: false
+    });
+  }
+
   conversationHistory.push(`User: ${message}`);
   saveHistory();
 
@@ -156,13 +326,21 @@ app.post('/api/chat', async (req, res) => {
 
   console.log( "WANTS MODIFICATION:", wantsModification );
 
+  const recallDate = extractDateFromMessage(message);
+  const mentionsRecall = RECALL_TRIGGER_PATTERN.test(message);
+  const isRecallQuery = !wantsModification && (
+    mentionsRecall || (recallDate !== null && /what|talk|discuss|speak|say/i.test(message))
+  );
+
+  console.log("IS RECALL QUERY:", isRecallQuery);
+
   // Short messages like ("hi", "thanks", "ok") are never complex on keyword grounds alone —
   // skip straight to the fast model rather than utilize the smart model to decrease latency
   // Modification requests still go to the smart model regardless of length, since
   // they need to reliably produce structured JSON output.
   const wordCount = message.trim().split(/\s+/).length;
 
-  const isComplex = wantsModification || (
+  const isComplex = wantsModification || isRecallQuery || (
     wordCount > 5 && /(typescript|javascript|debug|refactor|git|branch)/i.test(message)
   );
 
@@ -304,7 +482,30 @@ app.post('/api/chat', async (req, res) => {
 
     const recentHistory = conversationHistory.slice(-20).join("\n");
 
-    const fullPrompt = wantsModification ? `System Instruction:\n${metaSystemInstruction}\n\n` + `User Request:\n${message}`: `System Instruction:\n${metaSystemInstruction}\n\n` + `Conversation History:\n${recentHistory}\n\n` + `User Request:\n${message}`;
+    let recallContext = "";
+    if (isRecallQuery) {
+      if (recallDate) {
+        const sessions = findArchivesByDate(recallDate);
+        const dateLabel = recallDate.toDateString();
+        recallContext = sessions.length > 0
+          ? `--- ARCHIVED CONVERSATION FROM ${dateLabel} ---\n` +
+            sessions.map(s => s.messages.join("\n")).join("\n---\n") +
+            `\n--- END ARCHIVED CONVERSATION ---\nAnswer the user's question using the archived conversation above.\n\n`
+          : `--- NOTE: No archived conversation was found for ${dateLabel}. Tell the user you have no record of that day. ---\n\n`;
+      } else {
+        const topic = extractTopicKeyword(message);
+        const hits = topic.length >= 3 ? searchArchivesByKeyword(topic).slice(0, 30) : [];
+        recallContext = hits.length > 0
+          ? `--- ARCHIVED MENTIONS OF "${topic}" ---\n` +
+            hits.map(h => `[${new Date(h.date).toDateString()}] ${h.line}`).join("\n") +
+            `\n--- END ARCHIVED MENTIONS ---\nAnswer the user's question using the archived mentions above.\n\n`
+          : `--- NOTE: No archived mentions of "${topic}" were found. Tell the user you have no record of discussing that. ---\n\n`;
+      }
+      console.log("RECALL CONTEXT:");
+      console.log(recallContext);
+    }
+
+    const fullPrompt = wantsModification ? `System Instruction:\n${metaSystemInstruction}\n\n` + `User Request:\n${message}`: `System Instruction:\n${metaSystemInstruction}\n\n` + recallContext + `Conversation History:\n${recentHistory}\n\n` + `User Request:\n${message}`;
     
     console.log("WANTS MODIFICATION:", wantsModification);
     console.log("PROMPT SENT TO MODEL:");
@@ -628,3 +829,15 @@ app.post('/api/reject', (req, res) => {
 app.listen(PORT, () => {
   console.log(`N.O.A.H. server running at http://localhost:${PORT}`);
 });
+
+// Archive whatever's in the active session before the process actually exits,
+// so Ctrl+C behaves the same as typing "end session" instead of leaving
+// active.json sitting there until the next startup archives it late.
+function shutdown(signal: string) {
+  console.log(`\nReceived ${signal}, archiving session before exit...`);
+  archiveSession("manual");
+  process.exit(0);
+}
+
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));
