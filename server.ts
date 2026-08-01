@@ -90,6 +90,14 @@ archiveSession("startup", previousSessionEndedAt);
 let requestInFlight = false;
 let pendingCommit: CommitInfo | null = null;
 
+// Keeps the last retrieved archive context available for a few follow-up
+// turns (e.g. "give me specifics", "quote it") so the model doesn't have to
+// improvise from its own prior summary once the original recall query has
+// scrolled out of isRecallQuery detection.
+let stickyRecallContext = "";
+let stickyRecallTurnsRemaining = 0;
+const STICKY_RECALL_FOLLOWUP_TURNS = 3;
+
 
 function loadHistory(): string[] {
   try {
@@ -146,6 +154,9 @@ function archiveSession(reason: "startup" | "manual", archivedAt: Date = new Dat
 
   conversationHistory = [];
   saveHistory();
+
+  stickyRecallContext = "";
+  stickyRecallTurnsRemaining = 0;
 
   console.log(`Archived session (${reason}) -> ${archivePath}`);
   return archivePath;
@@ -332,7 +343,13 @@ app.post('/api/chat', async (req, res) => {
     mentionsRecall || (recallDate !== null && /what|talk|discuss|speak|say/i.test(message))
   );
 
+  // A follow-up on an already-answered recall query (e.g. "give me specifics",
+  // "quote it") — doesn't re-trigger isRecallQuery on its own, but should still
+  // get the archived context and the smarter model.
+  const isStickyRecallFollowup = !wantsModification && !isRecallQuery && stickyRecallTurnsRemaining > 0;
+
   console.log("IS RECALL QUERY:", isRecallQuery);
+  console.log("IS STICKY RECALL FOLLOWUP:", isStickyRecallFollowup, "| turns remaining:", stickyRecallTurnsRemaining);
 
   // Short messages like ("hi", "thanks", "ok") are never complex on keyword grounds alone —
   // skip straight to the fast model rather than utilize the smart model to decrease latency
@@ -340,7 +357,7 @@ app.post('/api/chat', async (req, res) => {
   // they need to reliably produce structured JSON output.
   const wordCount = message.trim().split(/\s+/).length;
 
-  const isComplex = wantsModification || isRecallQuery || (
+  const isComplex = wantsModification || isRecallQuery || isStickyRecallFollowup || (
     wordCount > 5 && /(typescript|javascript|debug|refactor|git|branch)/i.test(message)
   );
 
@@ -501,8 +518,24 @@ app.post('/api/chat', async (req, res) => {
             `\n--- END ARCHIVED MENTIONS ---\nAnswer the user's question using the archived mentions above.\n\n`
           : `--- NOTE: No archived mentions of "${topic}" were found. Tell the user you have no record of discussing that. ---\n\n`;
       }
+
+      // Keep this context available for a few follow-up turns.
+      stickyRecallContext = recallContext;
+      stickyRecallTurnsRemaining = STICKY_RECALL_FOLLOWUP_TURNS;
+
       console.log("RECALL CONTEXT:");
       console.log(recallContext);
+    } else if (isStickyRecallFollowup) {
+      recallContext = stickyRecallContext.replace(
+        "Answer the user's question using the archived conversation above.",
+        "This is the same archived conversation retrieved for the user's earlier question — use it to answer this follow-up too. Do not invent details that aren't in it."
+      ).replace(
+        "Answer the user's question using the archived mentions above.",
+        "These are the same archived mentions retrieved for the user's earlier question — use them to answer this follow-up too. Do not invent details that aren't in them."
+      );
+      stickyRecallTurnsRemaining--;
+
+      console.log("USING STICKY RECALL CONTEXT, turns left after this:", stickyRecallTurnsRemaining);
     }
 
     const fullPrompt = wantsModification ? `System Instruction:\n${metaSystemInstruction}\n\n` + `User Request:\n${message}`: `System Instruction:\n${metaSystemInstruction}\n\n` + recallContext + `Conversation History:\n${recentHistory}\n\n` + `User Request:\n${message}`;
