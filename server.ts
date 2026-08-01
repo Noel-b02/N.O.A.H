@@ -1,6 +1,6 @@
 import express from 'express';
 import * as fs from 'fs';
-import { execSync } from 'child_process';
+import { execFileSync } from 'child_process';
 import path from 'path';
 import dotenv from 'dotenv';
 
@@ -51,11 +51,18 @@ type Modification =
       value: any;
     };
 
+interface CommitInfo {
+  title: string;
+  body?: string;
+  author?: string;
+}
+
 // State to track if we have a draft on a feature branch
 let pendingFiles: string[] = [];
 let activeDraftBranch: string | null = null;
 let conversationHistory: string[] = loadHistory();
 let requestInFlight = false;
+let pendingCommit: CommitInfo | null = null;
 
 
 function loadHistory(): string[] {
@@ -94,7 +101,7 @@ function loadMemory(): string {
 
 function runGitCommand(args: string[]): string {
   try {
-    return execSync(`git ${args.join(' ')}`, { stdio: 'pipe' }).toString().trim();
+    return execFileSync('git', args, { stdio: 'pipe' }).toString().trim();
   } catch (error: any) {
     return error.stderr?.toString().trim() || error.message;
   }
@@ -110,6 +117,13 @@ const setupGit = () => {
   }
 };
 setupGit();
+
+// Warm the models so by the time the real request comes in, the model is already loaded and ready to respond quickly
+fetch(OLLAMA_URL, {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({ model: CHAT_MODEL, prompt: "hi", stream: false, options: { num_predict: 1 } })
+}).catch(() => {});
 
 app.get('/api/status', (_, res) => {
   res.json({
@@ -142,9 +156,9 @@ app.post('/api/chat', async (req, res) => {
 
   console.log( "WANTS MODIFICATION:", wantsModification );
 
-  // Short messages ("hi", "thanks", "ok") are never complex on keyword grounds alone —
-  // skip straight to the fast model rather than pay the big-model tax on small talk.
-  // Modification requests still go to the capable model regardless of length, since
+  // Short messages like ("hi", "thanks", "ok") are never complex on keyword grounds alone —
+  // skip straight to the fast model rather than utilize the smart model to decrease latency
+  // Modification requests still go to the smart model regardless of length, since
   // they need to reliably produce structured JSON output.
   const wordCount = message.trim().split(/\s+/).length;
 
@@ -161,7 +175,17 @@ app.post('/api/chat', async (req, res) => {
   You are N.O.A.H., a self-modifying assistant.
 
   The user's requested modification target is: ${modificationTarget}
-  
+
+  CRITICAL: every response that includes "modifications" MUST also include a "commit" object at the top level, alongside "modifications" — not inside it. This applies to every single modification example below, with no exceptions.
+
+  {
+    "commit": {
+      "title": "concise Conventional Commit title, e.g. feat(personality): ...",
+      "body": "one sentence on why the change was made"
+    },
+    "modifications": [ ... ]
+  }
+
   The following files may be modified:
 
   ${Array.from(ALLOWED_FILES).map(f => `- ${f}`).join("\n")}
@@ -175,9 +199,13 @@ app.post('/api/chat', async (req, res) => {
 
   Use replace_text when changing existing content.
 
-  Example:
+  Example (note the required "commit" object):
 
   {
+    "commit": {
+      "title": "feat(personality): expand default detail level",
+      "body": "User asked for more detail by default."
+    },
     "modifications": [
       {
         "action": "replace_text",
@@ -190,9 +218,13 @@ app.post('/api/chat', async (req, res) => {
 
   Use append_file when adding new content without changing existing content.
 
-  Example:
+  Example (note the required "commit" object):
 
   {
+    "commit": {
+      "title": "feat(personality): add casual tone instruction",
+      "body": "User asked for a more casual tone."
+    },
     "modifications": [
       {
         "action": "append_file",
@@ -211,9 +243,13 @@ app.post('/api/chat', async (req, res) => {
 
   For JSON files, prefer set_json_value.
 
-  Example:
+  Example (note the required "commit" object):
 
   {
+    "commit": {
+      "title": "chore(memory): update birthday fact",
+      "body": "User corrected their stored birthday."
+    },
     "modifications": [
       {
         "action": "set_json_value",
@@ -240,6 +276,7 @@ app.post('/api/chat', async (req, res) => {
   - Do NOT include System Instruction, CURRENT MEMORY, READ ONLY MEMORY CONTEXT, User Request, or any prompt text in the file.
   -  Do not modify existing instructions unless the user explicitly asks to change them.
   - Use append_file when adding a new instruction.
+  - REMINDER: include the top-level "commit" object every time "modifications" is present, as shown in every example above.
   `
   : "";
 
@@ -307,17 +344,21 @@ app.post('/api/chat', async (req, res) => {
     try {
       const parsed = JSON.parse(aiResponse);
 
-      if (
-        parsed &&
-        Array.isArray(parsed.modifications)
-      ) {
-        jsonModifications =
-          parsed.modifications as Modification[];
+      pendingCommit = parsed.commit ?? null;
 
-        console.log(
-          "JSON MODIFICATIONS FOUND:",
-          jsonModifications.length
-        );
+      if (Array.isArray(parsed.modifications)) {
+          jsonModifications =
+              parsed.modifications as Modification[];
+      }
+
+      if (Array.isArray(parsed.modifications)) {
+          jsonModifications =
+              parsed.modifications as Modification[];
+
+          console.log(
+              "JSON MODIFICATIONS FOUND:",
+              jsonModifications.length
+          );
       }
     } catch {
       // Not JSON, continue normally
@@ -476,6 +517,7 @@ app.post('/api/chat', async (req, res) => {
 
     res.json({
       response: cleanText || (hasProposedChanges ? "I have drafted the requested changes for your review." : ""),
+      commit: pendingCommit,
       hasProposedChanges,
       diff: gitDiff
     });
@@ -498,8 +540,18 @@ console.log("ADDING:", pendingFiles);
 console.log(runGitCommand(["add", ...pendingFiles]));
 
 console.log("COMMITTING...");
+
+const commitTitle = pendingCommit?.title ?? "chore(ai): self modification";
+
+const commitBody = pendingCommit?.body ?? "No additional description provided.";
+
 console.log(
-  runGitCommand([ "commit", "-m", "\"AI self-modification merge\""
+  runGitCommand([
+    "commit",
+    "-m",
+    commitTitle,
+    "-m",
+    `${commitBody}\n\nGenerated by N.O.A.H.`
   ])
 );
 
@@ -526,6 +578,7 @@ console.log(
 
   activeDraftBranch = null;
   pendingFiles = [];
+  pendingCommit = null;
   res.json({ success: true, message: "Changes successfully merged to 'master'!" });
 });
 
@@ -550,6 +603,7 @@ app.post('/api/reject', (req, res) => {
 
   activeDraftBranch = null;
   pendingFiles = [];
+  pendingCommit = null;
 
   res.json({
     success: true,
