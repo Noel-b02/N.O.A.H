@@ -213,9 +213,35 @@ function searchArchivesByKeyword(keyword: string): { date: string; line: string 
   return results;
 }
 
-// Looks for a DD/MM(/YYYY) numeric date or a "Month Day(, Year)" style date
-// in a message. Numeric dates are parsed as DD/MM to match UK date order;
-// year defaults to the current year when omitted.
+// Spelled-out ordinals ("the first of August") alongside numeric ones
+// ("1st of August" / "August 1st"). Longest names first so "twenty first"
+// matches before the plain "first" inside it.
+const ORDINAL_WORDS: Record<string, number> = {
+  first: 1, second: 2, third: 3, fourth: 4, fifth: 5, sixth: 6, seventh: 7,
+  eighth: 8, ninth: 9, tenth: 10, eleventh: 11, twelfth: 12, thirteenth: 13,
+  fourteenth: 14, fifteenth: 15, sixteenth: 16, seventeenth: 17, eighteenth: 18,
+  nineteenth: 19, twentieth: 20, "twenty first": 21, "twenty second": 22,
+  "twenty third": 23, "twenty fourth": 24, "twenty fifth": 25, "twenty sixth": 26,
+  "twenty seventh": 27, "twenty eighth": 28, "twenty ninth": 29, thirtieth: 30,
+  "thirty first": 31
+};
+
+const ORDINAL_WORD_PATTERN = Object.keys(ORDINAL_WORDS)
+  .sort((a, b) => b.length - a.length)
+  .map(w => w.replace(" ", "[\\s-]"))
+  .join("|");
+
+const DAY_TOKEN_PATTERN = `\\d{1,2}(?:st|nd|rd|th)?|${ORDINAL_WORD_PATTERN}`;
+
+function parseDayToken(token: string): number | null {
+  const numeric = token.match(/^(\d{1,2})(?:st|nd|rd|th)?$/i);
+  if (numeric) return parseInt(numeric[1], 10);
+  const normalized = token.toLowerCase().replace(/[\s-]+/g, " ").trim();
+  return ORDINAL_WORDS[normalized] ?? null;
+}
+
+// Looks for a DD/MM(/YYYY) numeric date, a "Month Day(, Year)" style date, or a "Day (of) Month(, Year)" style date (digits or spelled-out ordinals) in a message. 
+// Numeric dates are parsed as DD/MM to match UK date order; year defaults to the current year when omitted.
 function extractDateFromMessage(message: string): Date | null {
   const numeric = message.match(/\b(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?\b/);
   if (numeric) {
@@ -228,23 +254,44 @@ function extractDateFromMessage(message: string): Date | null {
     if (!isNaN(d.getTime()) && month >= 0 && month <= 11) return d;
   }
 
-  const monthPattern = new RegExp(
-    `\\b(${MONTH_NAMES.join("|")})\\s+(\\d{1,2})(?:st|nd|rd|th)?(?:,?\\s+(\\d{4}))?\\b`,
+  const monthDayPattern = new RegExp(
+    `\\b(${MONTH_NAMES.join("|")})\\s+(${DAY_TOKEN_PATTERN})(?:,?\\s+(\\d{4}))?\\b`,
     "i"
   );
-  const monthMatch = message.match(monthPattern);
-  if (monthMatch) {
-    const monthIndex = MONTH_NAMES.indexOf(monthMatch[1].toLowerCase());
-    const day = parseInt(monthMatch[2], 10);
-    const year = monthMatch[3] ? parseInt(monthMatch[3], 10) : new Date().getFullYear();
-    const d = new Date(year, monthIndex, day);
-    if (!isNaN(d.getTime())) return d;
+  const monthDayMatch = message.match(monthDayPattern);
+  if (monthDayMatch) {
+    const monthIndex = MONTH_NAMES.indexOf(monthDayMatch[1].toLowerCase());
+    const day = parseDayToken(monthDayMatch[2]);
+    const year = monthDayMatch[3] ? parseInt(monthDayMatch[3], 10) : new Date().getFullYear();
+    if (day !== null) {
+      const d = new Date(year, monthIndex, day);
+      if (!isNaN(d.getTime())) return d;
+    }
+  }
+
+  const dayMonthPattern = new RegExp(
+    `\\b(?:the\\s+)?(${DAY_TOKEN_PATTERN})\\s+(?:of\\s+)?(${MONTH_NAMES.join("|")})(?:,?\\s+(\\d{4}))?\\b`,
+    "i"
+  );
+  const dayMonthMatch = message.match(dayMonthPattern);
+  if (dayMonthMatch) {
+    const day = parseDayToken(dayMonthMatch[1]);
+    const monthIndex = MONTH_NAMES.indexOf(dayMonthMatch[2].toLowerCase());
+    const year = dayMonthMatch[3] ? parseInt(dayMonthMatch[3], 10) : new Date().getFullYear();
+    if (day !== null) {
+      const d = new Date(year, monthIndex, day);
+      if (!isNaN(d.getTime())) return d;
+    }
   }
 
   return null;
 }
 
-const RECALL_TRIGGER_PATTERN = /(what did (we|i) (talk|speak) about|what did (i|we) (say|discuss|mention)|do you remember (when|talking about|us talking about)|did we (talk|speak) about|have we (talked|spoken) about|what were we discussing)/i;
+const RECALL_TRIGGER_PATTERN = /(what did (we|i) (talk|speak) about|what did (i|we) (say|discuss|mention)|do you remember (when|talking about|us talking about)|(do|does|did) (you|we) remember (what|when|where|who|how)|did we (talk|speak) about|have we (talked|spoken) about|what were we discussing)/i;
+
+// "Do/did you remember ...?" is someone asking us to recall something, not an
+// instruction to store a new memory — unlike an imperative "remember that X".
+const REMEMBER_QUESTION_PATTERN = /\b(do|does|did)\s+(you|we)\s+remember\b/i;
 
 function extractTopicKeyword(message: string): string {
   const aboutMatch = message.match(/about\s+(.+?)[\?\.!]?$/i);
@@ -470,7 +517,9 @@ app.post('/api/chat', async (req, res) => {
   const personality = loadFile(PERSONALITY_FILE);
   const memory = loadMemory();
 
-  const wantsModification =/(modify|change|rewrite|update|edit|improve|refactor|remember|memorize|store|save)/i.test(message);
+  const wantsModification = REMEMBER_QUESTION_PATTERN.test(message)
+    ? /(modify|change|rewrite|update|edit|improve|refactor|memorize|store|save)/i.test(message)
+    : /(modify|change|rewrite|update|edit|improve|refactor|remember|memorize|store|save)/i.test(message);
 
   console.log( "WANTS MODIFICATION:", wantsModification );
 
