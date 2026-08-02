@@ -559,8 +559,10 @@
     micBtn.addEventListener('touchstart', (e) => { e.preventDefault(); startRecording(); });
     micBtn.addEventListener('touchend', (e) => { e.preventDefault(); stopRecording(); });
 
+    let messageIdCounter = 0;
+
     function appendMessage(sender, text) {
-      const msgId = 'msg-' + Date.now();
+      const msgId = 'msg-' + (++messageIdCounter);
       const div = document.createElement('div');
       div.id = msgId;
       div.className = "relative p-6 rounded transition duration-300 max-w-3xl glass-hud shadow-[0_0_15px_rgba(0,240,255,0.01)]";
