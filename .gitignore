@@ -4,3 +4,7 @@
 memories/history/
 memories/memory.json
 memories/active.json
+node_modules/
+speech/venv/
+speech/__pycache__/
+speech/voices/

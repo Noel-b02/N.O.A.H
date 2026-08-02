@@ -1,0 +1,8 @@
+fastapi
+uvicorn[standard]
+python-multipart
+python-dotenv
+faster-whisper
+kokoro>=0.9.4
+soundfile
+torch

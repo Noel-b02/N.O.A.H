@@ -1,6 +1,6 @@
 import express from 'express';
 import * as fs from 'fs';
-import { execFileSync } from 'child_process';
+import { execFileSync, spawn, ChildProcess } from 'child_process';
 import path from 'path';
 import dotenv from 'dotenv';
 
@@ -13,6 +13,7 @@ app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
 const OLLAMA_URL = process.env.OLLAMA_URL ?? "http://localhost:11434/api/generate";
+const SPEECH_SERVICE_URL = process.env.SPEECH_SERVICE_URL ?? "http://localhost:5001";
 
 const CHAT_MODEL = process.env.OLLAMA_CHAT_MODEL ?? "qwen3.5:4b";
 const CODE_MODEL = process.env.OLLAMA_CODE_MODEL ?? "qwen3.5:9b";
@@ -60,6 +61,7 @@ type Modification =
 interface CommitInfo {
   title: string;
   body?: string;
+  author?: string;
 }
 
 interface ArchivedSession {
@@ -293,12 +295,148 @@ fetch(OLLAMA_URL, {
   body: JSON.stringify({ model: CHAT_MODEL, prompt: "hi", stream: false, options: { num_predict: 1 } })
 }).catch(() => {});
 
+// --- Speech service (Whisper + Kokoro) auto-start ---
+const SPEECH_SERVICE_DIR = process.env.SPEECH_SERVICE_DIR ?? path.join(process.cwd(), "speech");
+const SPEECH_SERVICE_PORT = process.env.SPEECH_SERVICE_PORT ?? "5001";
+const SPEECH_SERVICE_AUTOSTART = (process.env.SPEECH_SERVICE_AUTOSTART ?? "true").toLowerCase() !== "false";
+
+let speechServiceProcess: ChildProcess | null = null;
+
+function getVenvPythonPath(): string {
+  const isWindows = process.platform === "win32";
+  return path.join(
+    SPEECH_SERVICE_DIR,
+    "venv",
+    isWindows ? "Scripts" : "bin",
+    isWindows ? "python.exe" : "python"
+  );
+}
+
+async function isSpeechServiceRunning(): Promise<boolean> {
+  try {
+    const res = await fetch(`${SPEECH_SERVICE_URL}/health`, { signal: AbortSignal.timeout(1500) });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+async function startSpeechService(): Promise<void> {
+  if (!SPEECH_SERVICE_AUTOSTART) {
+    console.log("[speech] Auto-start disabled (SPEECH_SERVICE_AUTOSTART=false).");
+    return;
+  }
+
+  if (await isSpeechServiceRunning()) {
+    console.log("[speech] Speech service already running on its own — skipping auto-start.");
+    return;
+  }
+
+  const pythonPath = getVenvPythonPath();
+
+  if (!fs.existsSync(pythonPath)) {
+    console.warn(
+      `[speech] No venv Python found at ${pythonPath} — voice features will be unavailable ` +
+      `until the speech service venv is set up (see speech/requirements.txt) or started manually.`
+    );
+    return;
+  }
+
+  console.log(`[speech] Starting speech service (${pythonPath})...`);
+
+  speechServiceProcess = spawn(
+    pythonPath,
+    ["-m", "uvicorn", "server:app", "--host", "0.0.0.0", "--port", SPEECH_SERVICE_PORT],
+    { cwd: SPEECH_SERVICE_DIR, stdio: "inherit" }
+  );
+
+  speechServiceProcess.on("error", (err) => {
+    console.warn(`[speech] Failed to start speech service: ${err.message}`);
+    speechServiceProcess = null;
+  });
+
+  speechServiceProcess.on("exit", (code, signal) => {
+    console.log(`[speech] Speech service process exited (code=${code}, signal=${signal})`);
+    speechServiceProcess = null;
+  });
+}
+
+function stopSpeechService(): void {
+  if (speechServiceProcess && !speechServiceProcess.killed) {
+    console.log("[speech] Stopping speech service...");
+    speechServiceProcess.kill();
+  }
+}
+
+startSpeechService();
+
 app.get('/api/status', (_, res) => {
   res.json({
     activeDraftBranch,
     pendingFiles,
     historySize: conversationHistory.length
   });
+});
+
+// API: Speech-to-text — forwards recorded audio to the local Whisper service
+// and returns the transcribed text. Uses express.raw() scoped to just this
+// route since the body here is binary audio, not JSON.
+app.post('/api/transcribe', express.raw({ type: '*/*', limit: '25mb' }), async (req, res) => {
+  if (!req.body || req.body.length === 0) {
+    return res.status(400).json({ error: "No audio data received." });
+  }
+
+  try {
+    const contentType = req.headers['content-type'] || 'audio/webm';
+    const blob = new Blob([req.body], { type: contentType });
+    const formData = new FormData();
+    formData.append('file', blob, 'audio.webm');
+
+    const response = await fetch(`${SPEECH_SERVICE_URL}/transcribe`, {
+      method: 'POST',
+      body: formData
+    });
+
+    if (!response.ok) {
+      const detail = await response.text().catch(() => "");
+      throw new Error(`Speech service returned ${response.status}: ${detail}`);
+    }
+
+    const data = await response.json() as { text: string; language?: string };
+    res.json({ text: data.text });
+  } catch (err: any) {
+    console.error("Transcription failed:", err.message);
+    res.status(500).json({ error: `Transcription failed: ${err.message}` });
+  }
+});
+
+// API: Text-to-speech — forwards text to the local Piper service and streams
+// back the resulting WAV audio.
+app.post('/api/speak', async (req, res) => {
+  const { text } = req.body;
+  if (!text || !text.trim()) {
+    return res.status(400).json({ error: "text is required." });
+  }
+
+  try {
+    const response = await fetch(`${SPEECH_SERVICE_URL}/speak`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ text })
+    });
+
+    if (!response.ok) {
+      const detail = await response.text().catch(() => "");
+      throw new Error(`Speech service returned ${response.status}: ${detail}`);
+    }
+
+    const audioBuffer = Buffer.from(await response.arrayBuffer());
+    res.set('Content-Type', 'audio/wav');
+    res.send(audioBuffer);
+  } catch (err: any) {
+    console.error("Speech synthesis failed:", err.message);
+    res.status(500).json({ error: `Speech synthesis failed: ${err.message}` });
+  }
 });
 
 // API: Send chat prompt to the assistant
@@ -868,6 +1006,7 @@ app.listen(PORT, () => {
 function shutdown(signal: string) {
   console.log(`\nReceived ${signal}, archiving session before exit...`);
   archiveSession("manual");
+  stopSpeechService();
   process.exit(0);
 }
 

@@ -1,0 +1,167 @@
+"""
+N.O.A.H. Speech Service
+------------------------
+Local-only STT (faster-whisper) + TTS (Kokoro-82M) behind a tiny FastAPI app.
+Node's server.ts calls this over HTTP the same way it calls Ollama — nothing
+here ever leaves the machine.
+
+Run with:
+    uvicorn server:app --host 0.0.0.0 --port 5001
+
+Config is via environment variables (mirrors how server.ts reads OLLAMA_URL etc):
+    WHISPER_MODEL          tiny | base | small | medium | large-v3   (default: small)
+    WHISPER_DEVICE         cpu | cuda                                 (default: cpu)
+    WHISPER_COMPUTE_TYPE   int8 | float16 | float32 (default depends on device)
+    KOKORO_LANG_CODE       a (American English) | b (British English)  (default: b)
+    KOKORO_VOICE            e.g. bm_george, bm_lewis, bf_emma, bf_isabella,
+                             af_heart, am_adam, ...                    (default: bm_george)
+    KOKORO_SPEED            0.5 - 2.0, 1.0 = normal pace               (default: 1.0)
+    KOKORO_USE_GPU          true | false                                (default: false)
+
+Why Whisper AND Kokoro default to CPU: your GPU is already doing double duty
+running CHAT_MODEL/CODE_MODEL in Ollama. Loading either of these into the
+same 8GB of VRAM risks the same model-swap-latency problem you already fixed
+on the LLM side (see keep_alive / warmup in server.ts). A 9800X3D handles
+both comfortably on CPU for short voice commands and short replies. Set
+KOKORO_USE_GPU=true / WHISPER_DEVICE=cuda if you want to try GPU anyway,
+accepting that VRAM tradeoff.
+
+One-time system setup beyond `pip install -r requirements.txt`:
+    Kokoro needs espeak-ng installed as a SYSTEM package (not pip-installable).
+    On Windows: download the installer from the espeak-ng GitHub releases page
+    and run it, or `choco install espeak-ng` if you use Chocolatey.
+"""
+
+import io
+import os
+import tempfile
+
+from dotenv import load_dotenv
+from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.responses import Response
+from pydantic import BaseModel
+
+import numpy as np
+import soundfile as sf
+from faster_whisper import WhisperModel
+from kokoro import KPipeline
+
+load_dotenv()
+
+WHISPER_MODEL_SIZE = os.environ.get("WHISPER_MODEL", "small")
+WHISPER_DEVICE = os.environ.get("WHISPER_DEVICE", "cpu")
+WHISPER_COMPUTE_TYPE = os.environ.get(
+    "WHISPER_COMPUTE_TYPE",
+    "int8" if WHISPER_DEVICE == "cpu" else "float16",
+)
+
+KOKORO_LANG_CODE = os.environ.get("KOKORO_LANG_CODE", "b")
+KOKORO_VOICE = os.environ.get("KOKORO_VOICE", "bm_george")
+KOKORO_SPEED = float(os.environ.get("KOKORO_SPEED", "1.0"))
+KOKORO_USE_GPU = os.environ.get("KOKORO_USE_GPU", "false").lower() == "true"
+KOKORO_SAMPLE_RATE = 24000
+
+# Kokoro/torch pick up a GPU automatically if one is visible. Hiding it via
+# CUDA_VISIBLE_DEVICES is a blunt but reliable way to force CPU regardless of
+# which internal API Kokoro uses to pick its device.
+if not KOKORO_USE_GPU:
+    os.environ.setdefault("CUDA_VISIBLE_DEVICES", "")
+
+app = FastAPI(title="N.O.A.H. Speech Service")
+
+print(f"[speech] Loading Whisper '{WHISPER_MODEL_SIZE}' on {WHISPER_DEVICE} ({WHISPER_COMPUTE_TYPE})...")
+whisper_model = WhisperModel(
+    WHISPER_MODEL_SIZE,
+    device=WHISPER_DEVICE,
+    compute_type=WHISPER_COMPUTE_TYPE,
+)
+print("[speech] Whisper model loaded.")
+
+print(f"[speech] Loading Kokoro (lang_code={KOKORO_LANG_CODE}, voice={KOKORO_VOICE}, gpu={KOKORO_USE_GPU})...")
+kokoro_pipeline = KPipeline(lang_code=KOKORO_LANG_CODE)
+print("[speech] Kokoro pipeline loaded.")
+
+print("[speech] Warming up Kokoro...")
+try:
+    _warmup_generator = kokoro_pipeline("hi", voice=KOKORO_VOICE, speed=KOKORO_SPEED)
+    for _ in _warmup_generator:
+        pass
+    print("[speech] Kokoro warmup complete.")
+except Exception as e:
+    print(f"[speech] Kokoro warmup failed (non-fatal, first real request will be slower): {e}")
+
+
+class SpeakRequest(BaseModel):
+    text: str
+
+
+@app.post("/transcribe")
+async def transcribe(file: UploadFile = File(...)):
+    suffix = os.path.splitext(file.filename or "audio.webm")[1] or ".webm"
+
+    audio_bytes = await file.read()
+
+    # A valid webm/opus recording of real speech is never this small — this
+    # usually means the mic button was tapped rather than held, producing an
+    # empty or header-only file that ffmpeg can't decode. Fail clearly here
+    # instead of letting Whisper throw an "End of file" decoder error.
+    if len(audio_bytes) < 1000:
+        raise HTTPException(
+            status_code=400,
+            detail="Recording too short or empty — hold the mic button longer while speaking."
+        )
+
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        tmp.write(audio_bytes)
+        tmp_path = tmp.name
+
+    try:
+        segments, info = whisper_model.transcribe(tmp_path, beam_size=5)
+        text = " ".join(segment.text.strip() for segment in segments).strip()
+        return {"text": text, "language": info.language}
+    except Exception as e:
+        # Decoder failures (corrupt/empty audio) land here too, as a fallback
+        # for anything the size check above didn't catch.
+        raise HTTPException(
+            status_code=400,
+            detail="Could not decode the recorded audio. Try recording again."
+        ) from e
+    finally:
+        os.remove(tmp_path)
+
+
+@app.post("/speak")
+async def speak(req: SpeakRequest):
+    text = req.text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="text is required")
+
+    try:
+        # Kokoro splits long text into chunks and yields (graphemes, phonemes,
+        # audio) per chunk — concatenate them into one continuous clip.
+        generator = kokoro_pipeline(text, voice=KOKORO_VOICE, speed=KOKORO_SPEED)
+        audio_chunks = [audio for _, _, audio in generator]
+
+        if not audio_chunks:
+            raise HTTPException(status_code=500, detail="Kokoro produced no audio for this text.")
+
+        full_audio = np.concatenate(audio_chunks)
+
+        buffer = io.BytesIO()
+        sf.write(buffer, full_audio, KOKORO_SAMPLE_RATE, format="WAV")
+        return Response(content=buffer.getvalue(), media_type="audio/wav")
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
+@app.get("/health")
+async def health():
+    return {
+        "status": "ok",
+        "whisper_model": WHISPER_MODEL_SIZE,
+        "whisper_device": WHISPER_DEVICE,
+        "kokoro_lang_code": KOKORO_LANG_CODE,
+        "kokoro_voice": KOKORO_VOICE,
+    }

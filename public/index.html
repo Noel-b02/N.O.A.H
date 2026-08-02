@@ -184,6 +184,22 @@
               required
               autocomplete="off"
             />
+            <button
+              type="button"
+              id="mic-btn"
+              title="Hold to speak"
+              class="bg-cyan-950/40 hover:bg-cyan-500/15 border border-cyan-500/40 text-cyan-400 font-bold tracking-widest text-[10px] px-4 py-3 rounded uppercase transition duration-300 mr-2"
+            >
+              🎤
+            </button>
+            <button
+              type="button"
+              id="voice-toggle-btn"
+              title="Toggle spoken replies"
+              class="bg-cyan-950/40 border border-cyan-500/40 text-slate-600 font-bold tracking-widest text-[10px] px-4 py-3 rounded uppercase transition duration-300 mr-2 whitespace-nowrap min-w-[104px]"
+            >
+              🔇 VOICE OFF
+            </button>
             <button 
               type="submit" 
               class="bg-cyan-950/40 hover:bg-cyan-500/15 border border-cyan-500/40 text-cyan-400 font-bold tracking-widest text-[10px] px-8 py-3 rounded uppercase transition duration-300"
@@ -261,6 +277,8 @@
     const commitTitleEl = document.getElementById('commit-title');
     const commitBodyEl = document.getElementById('commit-body');
     const equalizer = document.getElementById('equalizer-container');
+    const micBtn = document.getElementById('mic-btn');
+    const voiceToggleBtn = document.getElementById('voice-toggle-btn');
 
     // Simulate active system telemetry fluctuations
     setInterval(() => {
@@ -322,9 +340,12 @@
       e.preventDefault();
       const message = userInput.value.trim();
       if (!message) return;
-
-      appendMessage('user', message);
       userInput.value = '';
+      sendMessage(message);
+    });
+
+    async function sendMessage(message) {
+      appendMessage('user', message);
 
       setCoreState('thinking');
       const loadingId = appendMessage('system', 'COMPILING LOGICAL MATRIX MODEL PATHWAYS...');
@@ -347,6 +368,7 @@
 
         if (data.response) {
           appendMessage('assistant', data.response);
+          speakReply(data.response);
         }
 
         if (data.hasProposedChanges) {
@@ -360,7 +382,182 @@
         setCoreState('idle');
         appendMessage('system', 'COMMUNICATIONS FAILURE: Matrix stream dropped by local host.');
       }
-    });
+    }
+
+    // --- Voice output (TTS) ---
+    let voiceOutputEnabled = false;
+    let currentAudio = null;
+
+    function setVoiceOutput(enabled) {
+      voiceOutputEnabled = enabled;
+
+      if (enabled) {
+        voiceToggleBtn.innerHTML = '🔊 VOICE ON';
+        voiceToggleBtn.title = 'Spoken replies are ON — click to mute';
+        voiceToggleBtn.classList.add('text-cyan-400', 'border-cyan-500/60', 'bg-cyan-500/10', 'shadow-[0_0_12px_rgba(0,240,255,0.15)]');
+        voiceToggleBtn.classList.remove('text-slate-600', 'border-cyan-500/40');
+      } else {
+        voiceToggleBtn.innerHTML = '🔇 VOICE OFF';
+        voiceToggleBtn.title = 'Spoken replies are OFF — click to enable';
+        voiceToggleBtn.classList.remove('text-cyan-400', 'border-cyan-500/60', 'bg-cyan-500/10', 'shadow-[0_0_12px_rgba(0,240,255,0.15)]');
+        voiceToggleBtn.classList.add('text-slate-600', 'border-cyan-500/40');
+
+        if (currentAudio) {
+          currentAudio.pause();
+          currentAudio = null;
+        }
+      }
+    }
+
+    // Initialize the button to match voiceOutputEnabled's starting value
+    setVoiceOutput(voiceOutputEnabled);
+
+    voiceToggleBtn.addEventListener('click', () => setVoiceOutput(!voiceOutputEnabled));
+
+    async function speakReply(text) {
+      if (!voiceOutputEnabled || !text) return;
+
+      try {
+        const response = await fetch('/api/speak', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text })
+        });
+
+        if (!response.ok) {
+          console.error('TTS request failed:', await response.text().catch(() => response.status));
+          return;
+        }
+
+        const audioBlob = await response.blob();
+        const audioUrl = URL.createObjectURL(audioBlob);
+
+        if (currentAudio) currentAudio.pause();
+        currentAudio = new Audio(audioUrl);
+        currentAudio.play().catch(err => console.error('Audio playback blocked:', err));
+        currentAudio.addEventListener('ended', () => URL.revokeObjectURL(audioUrl));
+      } catch (err) {
+        console.error('TTS error:', err);
+      }
+    }
+
+    // --- Voice input (STT) ---
+    // Hold the mic button to record, release to stop and transcribe.
+    let mediaRecorder = null;
+    let recordedChunks = [];
+    let isRecording = false;
+    let isStarting = false;      // true while getUserMedia is still resolving
+    let stopRequested = false;   // true if the button was released before recording actually started
+    let recordingStartedAt = 0;
+    const MIN_RECORDING_MS = 300; // recordings shorter than this are almost never real speech
+
+    async function startRecording() {
+      if (isRecording || isStarting) return;
+      isStarting = true;
+      stopRequested = false;
+
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+        // The button may have already been released while we were waiting on
+        // permission/stream setup — honor that instead of recording forever.
+        if (stopRequested) {
+          stream.getTracks().forEach(track => track.stop());
+          isStarting = false;
+          return;
+        }
+
+        recordedChunks = [];
+        mediaRecorder = new MediaRecorder(stream);
+
+        mediaRecorder.ondataavailable = (e) => {
+          if (e.data.size > 0) recordedChunks.push(e.data);
+        };
+
+        mediaRecorder.onstop = async () => {
+          stream.getTracks().forEach(track => track.stop());
+          const durationMs = Date.now() - recordingStartedAt;
+
+          if (durationMs < MIN_RECORDING_MS) {
+            appendMessage('system', 'HOLD THE MIC BUTTON LONGER TO SPEAK.');
+            return;
+          }
+
+          const audioBlob = new Blob(recordedChunks, { type: 'audio/webm' });
+          await transcribeAndSend(audioBlob);
+        };
+
+        mediaRecorder.start();
+        recordingStartedAt = Date.now();
+        isRecording = true;
+        isStarting = false;
+        micBtn.classList.add('bg-rose-500/20', 'border-rose-500/60', 'text-rose-400');
+      } catch (err) {
+        console.error('Microphone access denied or unavailable:', err);
+        appendMessage('system', 'MICROPHONE ACCESS DENIED OR UNAVAILABLE.');
+        isStarting = false;
+      }
+    }
+
+    function stopRecording() {
+      if (isStarting && !isRecording) {
+        // Recording hasn't actually begun yet — flag it so startRecording()
+        // stops immediately once getUserMedia resolves, instead of recording
+        // indefinitely until the next button press.
+        stopRequested = true;
+        return;
+      }
+      if (!isRecording || !mediaRecorder) return;
+      mediaRecorder.stop();
+      isRecording = false;
+      micBtn.classList.remove('bg-rose-500/20', 'border-rose-500/60', 'text-rose-400');
+    }
+
+    async function transcribeAndSend(audioBlob) {
+      if (audioBlob.size < 1000) {
+        appendMessage('system', 'NO AUDIO CAPTURED — TRY HOLDING THE MIC BUTTON LONGER.');
+        return;
+      }
+
+      const loadingId = appendMessage('system', 'DECODING AUDIO WAVEFORM...');
+      try {
+        const response = await fetch('/api/transcribe', {
+          method: 'POST',
+          headers: { 'Content-Type': 'audio/webm' },
+          body: audioBlob
+        });
+
+        removeMessage(loadingId);
+
+        if (!response.ok) {
+          const detail = await response.json().catch(() => ({}));
+          appendMessage('system', `TRANSCRIPTION FAILED: ${detail.error || response.status}`);
+          return;
+        }
+
+        const data = await response.json();
+        const text = (data.text || '').trim();
+
+        if (!text) {
+          appendMessage('system', 'NO SPEECH DETECTED.');
+          return;
+        }
+
+        if (!voiceOutputEnabled) setVoiceOutput(true);
+
+        sendMessage(text);
+      } catch (err) {
+        removeMessage(loadingId);
+        appendMessage('system', 'COMMUNICATIONS FAILURE: Transcription request dropped.');
+      }
+    }
+
+    // Press-and-hold on desktop (mouse) and mobile (touch)
+    micBtn.addEventListener('mousedown', startRecording);
+    micBtn.addEventListener('mouseup', stopRecording);
+    micBtn.addEventListener('mouseleave', () => { if (isRecording) stopRecording(); });
+    micBtn.addEventListener('touchstart', (e) => { e.preventDefault(); startRecording(); });
+    micBtn.addEventListener('touchend', (e) => { e.preventDefault(); stopRecording(); });
 
     function appendMessage(sender, text) {
       const msgId = 'msg-' + Date.now();
