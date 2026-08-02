@@ -18,6 +18,8 @@ const SPEECH_SERVICE_URL = process.env.SPEECH_SERVICE_URL ?? "http://localhost:5
 const CHAT_MODEL = process.env.OLLAMA_CHAT_MODEL ?? "qwen3.5:4b";
 const CODE_MODEL = process.env.OLLAMA_CODE_MODEL ?? "qwen3.5:9b";
 
+const SEARXNG_URL = process.env.SEARXNG_URL ?? "http://localhost:8080";
+
 const PERSONALITY_FILE = "personality.txt";
 const MEMORY_FILE = "memories/memory.json";
 const HISTORY_FILE = "memories/history/active.json";
@@ -132,6 +134,23 @@ function nextSessionNumberForDate(dateStr: string): number {
   return max + 1;
 }
 
+// toISOString() always renders in UTC, which reads an hour off from wall-clock
+// time during BST — this renders the same instant using local date/time parts
+// plus the local UTC offset instead, so timestamps match what the clock said
+// at the time while still round-tripping correctly through `new Date(...)`.
+function toLocalISOString(date: Date): string {
+  const pad = (n: number, len = 2) => String(n).padStart(len, "0");
+  const offsetMin = -date.getTimezoneOffset();
+  const sign = offsetMin >= 0 ? "+" : "-";
+  const offH = pad(Math.floor(Math.abs(offsetMin) / 60));
+  const offM = pad(Math.abs(offsetMin) % 60);
+  return (
+    `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}` +
+    `T${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}.${pad(date.getMilliseconds(), 3)}` +
+    `${sign}${offH}:${offM}`
+  );
+}
+
 // Archives whatever is currently in conversationHistory to its own dated
 // file under ARCHIVE_DIR, then clears active.json for a fresh session.
 // `archivedAt` lets the caller attribute the session to when it actually
@@ -141,12 +160,12 @@ function archiveSession(reason: "startup" | "manual", archivedAt: Date = new Dat
 
   fs.mkdirSync(ARCHIVE_DIR, { recursive: true });
 
-  const dateStr = archivedAt.toISOString().slice(0, 10); // YYYY-MM-DD
+  const dateStr = `${archivedAt.getFullYear()}-${String(archivedAt.getMonth() + 1).padStart(2, "0")}-${String(archivedAt.getDate()).padStart(2, "0")}`; // local YYYY-MM-DD
   const sessionNumber = nextSessionNumberForDate(dateStr);
   const archivePath = path.join(ARCHIVE_DIR, `${dateStr}_${sessionNumber}.json`);
 
   const session: ArchivedSession = {
-    archivedAt: archivedAt.toISOString(),
+    archivedAt: toLocalISOString(archivedAt),
     reason,
     messages: conversationHistory
   };
@@ -181,6 +200,42 @@ function loadArchive(filePath: string): ArchivedSession | null {
   }
 }
 
+interface WebSearchResult {
+  title: string;
+  description: string;
+  url: string;
+}
+
+// Some upstream engines SearXNG aggregates put highlight markup in their
+// snippets — strip it so the model prompt gets plain text.
+function stripHtmlTags(text: string): string {
+  return text.replace(/<\/?[^>]+>/g, "");
+}
+
+async function webSearch(query: string): Promise<WebSearchResult[]> {
+  try {
+    const url = `${SEARXNG_URL}/search?q=${encodeURIComponent(query)}&format=json`;
+    const res = await fetch(url);
+
+    if (!res.ok) {
+      console.error("SearXNG search failed:", res.status, await res.text().catch(() => ""));
+      return [];
+    }
+
+    const data = await res.json() as { results?: any[] };
+    const results = data.results ?? [];
+
+    return results.slice(0, 5).map((r: any) => ({
+      title: stripHtmlTags(r.title ?? ""),
+      description: stripHtmlTags(r.content ?? ""),
+      url: r.url ?? ""
+    }));
+  } catch (err) {
+    console.error("Web search error (is SearXNG running at " + SEARXNG_URL + "?):", err);
+    return [];
+  }
+}
+
 function findArchivesByDate(targetDate: Date): ArchivedSession[] {
   const matches: ArchivedSession[] = [];
   for (const file of listArchiveFiles()) {
@@ -211,6 +266,17 @@ function searchArchivesByKeyword(keyword: string): { date: string; line: string 
     }
   }
   return results;
+}
+
+// Old assistant replies from before the recall feature worked ("I don't have
+// access...", "no record of that day", etc.) are now baked into the archives
+// themselves. Feeding those back to the model as "context" causes it to
+// parrot the same denial instead of answering — strip them out so recall
+// context only contains real conversation, not the bug's own leftovers.
+const STALE_NO_MEMORY_REPLY_PATTERN = /^Assistant:.*\b(don't have access to (our|any|the)|no record of|not in my (immediate )?memory|memory (starts fresh|is limited to|only (goes|holds))|no archived (conversation|mentions))\b/i;
+
+function stripStaleNoMemoryReplies(messages: string[]): string[] {
+  return messages.filter(line => !STALE_NO_MEMORY_REPLY_PATTERN.test(line));
 }
 
 // Spelled-out ordinals ("the first of August") alongside numeric ones
@@ -534,8 +600,19 @@ app.post('/api/chat', async (req, res) => {
   // get the archived context and the smarter model.
   const isStickyRecallFollowup = !wantsModification && !isRecallQuery && stickyRecallTurnsRemaining > 0;
 
+  // Deterministic web-search trigger for common "needs current info" phrasings
+  // — mirrors the recall-trigger approach above rather than relying on the
+  // model to notice it needs to search and correctly emit [SEARCH: ...]. That
+  // depends on smaller local models reliably following instructions, which in
+  // practice they don't: they either wrap the tag in prose or skip it and
+  // hallucinate an excuse instead. Catching the obvious cases here means the
+  // search actually happens instead of being gated on model cooperation.
+  const SEARCH_TRIGGER_PATTERN = /\b(top headlines|headlines today|latest news|breaking news|news today|on the news|what'?s (been )?reported|happening in the world|who won|release date|launch date|premiere date|when('s| is| does| will).{0,30}(come out|coming out|releas(e|ing)|drop(ping)?|launch(ing)?|premier(e|ing))|current (weather|price|score|exchange rate)|how much (is|does|would)|price of|what'?s the weather|weather (today|forecast|right now))\b/i;
+  const looksLikeSearchQuery = !wantsModification && !isRecallQuery && !isStickyRecallFollowup && SEARCH_TRIGGER_PATTERN.test(message);
+
   console.log("IS RECALL QUERY:", isRecallQuery);
   console.log("IS STICKY RECALL FOLLOWUP:", isStickyRecallFollowup, "| turns remaining:", stickyRecallTurnsRemaining);
+  console.log("LOOKS LIKE SEARCH QUERY:", looksLikeSearchQuery);
 
   // Short messages like ("hi", "thanks", "ok") are never complex on keyword grounds alone —
   // skip straight to the fast model rather than utilize the smart model to decrease latency
@@ -543,7 +620,7 @@ app.post('/api/chat', async (req, res) => {
   // they need to reliably produce structured JSON output.
   const wordCount = message.trim().split(/\s+/).length;
 
-  const isComplex = wantsModification || isRecallQuery || isStickyRecallFollowup || (
+  const isComplex = wantsModification || isRecallQuery || isStickyRecallFollowup || looksLikeSearchQuery || (
     wordCount > 5 && /(typescript|javascript|debug|refactor|git|branch)/i.test(message)
   );
 
@@ -661,19 +738,39 @@ app.post('/api/chat', async (req, res) => {
   `
   : "";
 
+  // Not anchored to the whole string: smaller local models routinely ignore
+  // "respond with EXACTLY this and nothing else" and wrap the tag in prose
+  // anyway. Matching anywhere in the response catches it regardless, and the
+  // surrounding prose gets discarded once we detect it (see below).
+  const SEARCH_TAG_PATTERN = /\[SEARCH:\s*([^\]]+)\]/i;
+
+  // Recall queries already have their own dedicated context (archived
+  // conversations); the web-search tag is for outside-world facts the model
+  // doesn't already know, so only offer it outside those two paths.
+  const searchInstructions = (!wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeSearchQuery) ? `
+  If answering requires current or real-world information you don't already know — release dates, sports results, news, prices, "when does X come out", "who won Y" — do not guess or make something up. Instead, respond with EXACTLY this and nothing else, no other words:
+
+  [SEARCH: concise web search query]
+
+  Only use this when you genuinely need up-to-date or factual information you're not confident about. Do not use it for questions about past conversations, your own personality/settings, or anything you already know.
+  ` : "";
+
   const metaSystemInstruction = (
 
-    `The complete contents of personality.txt are:\n\n` + `${personality}\n\n` + 
+    `Today's date is ${new Date().toDateString()}. Use this as "today" for any date-relative reasoning or search queries — do not assume a different year from training data.\n\n` +
 
-    `READ ONLY MEMORY CONTEXT (not part of personality.txt):\n\n` + 
-    `${memory}\n\n`   + 
+    `The complete contents of personality.txt are:\n\n` + `${personality}\n\n` +
+
+    `READ ONLY MEMORY CONTEXT (not part of personality.txt):\n\n` +
+    `${memory}\n\n`   +
     `CURRENT MEMORY is provided for reference.\n` +
     `Do not copy it into personality.txt.\n` +
     `Only modify memory.json when the user's requested modification target is memory.json.\n\n`+
     `The information in CURRENT MEMORY contains persistent facts and should be treated as true unless the user explicitly corrects them.\n\n` +
 
-    modificationInstructions 
-  
+    modificationInstructions +
+    searchInstructions
+
   );
 
   try {
@@ -681,23 +778,56 @@ app.post('/api/chat', async (req, res) => {
 
     const timeout = setTimeout(() => {
       controller.abort();
-    }, 60000);
+    }, 90000);
+
+    async function callOllama(prompt: string, numPredict: number): Promise<string> {
+      const res = await fetch(OLLAMA_URL, {
+        method: "POST",
+        signal: controller.signal,
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          model: selectedModel,
+          prompt,
+          stream: false,
+          think: false,
+          options: {
+            num_predict: numPredict,
+            // Left at Ollama's default (4096) this silently truncates from the
+            // front of the prompt once personality + memory + recall context +
+            // history + num_predict's reserved space exceed it — which drops
+            // exactly the archived conversation recall depends on. Give it
+            // enough headroom for that plus room to grow as archives pile up.
+            num_ctx: 16384,
+            temperature: 0.3
+          }
+        })
+      });
+      if (!res.ok) throw new Error("Ollama connection failed");
+      const data = await res.json() as { response: string };
+      return data.response;
+    }
 
     const recentHistory = conversationHistory.slice(-20).join("\n");
 
     let recallContext = "";
     if (isRecallQuery) {
       if (recallDate) {
-        const sessions = findArchivesByDate(recallDate);
+        const sessions = findArchivesByDate(recallDate)
+          .map(s => ({ ...s, messages: stripStaleNoMemoryReplies(s.messages) }))
+          .filter(s => s.messages.length > 0);
         const dateLabel = recallDate.toDateString();
         recallContext = sessions.length > 0
           ? `--- ARCHIVED CONVERSATION FROM ${dateLabel} ---\n` +
             sessions.map(s => s.messages.join("\n")).join("\n---\n") +
-            `\n--- END ARCHIVED CONVERSATION ---\nAnswer the user's question using the archived conversation above.\n\n`
+            `\n--- END ARCHIVED CONVERSATION ---\n` +
+            `Every message between the markers above happened on ${dateLabel} — that is the true date of this whole block, no matter what other dates get mentioned in the conversation text itself (the user may have been asking about a different day within it). ` +
+            `Answer the user's question about ${dateLabel} by summarizing what these messages show. Do not claim you have no record of ${dateLabel}: you are looking at it right now.\n\n`
           : `--- NOTE: No archived conversation was found for ${dateLabel}. Tell the user you have no record of that day. ---\n\n`;
       } else {
         const topic = extractTopicKeyword(message);
-        const hits = topic.length >= 3 ? searchArchivesByKeyword(topic).slice(0, 30) : [];
+        const hits = (topic.length >= 3 ? searchArchivesByKeyword(topic) : [])
+          .filter(h => !STALE_NO_MEMORY_REPLY_PATTERN.test(h.line))
+          .slice(0, 30);
         recallContext = hits.length > 0
           ? `--- ARCHIVED MENTIONS OF "${topic}" ---\n` +
             hits.map(h => `[${new Date(h.date).toDateString()}] ${h.line}`).join("\n") +
@@ -722,6 +852,22 @@ app.post('/api/chat', async (req, res) => {
       stickyRecallTurnsRemaining--;
 
       console.log("USING STICKY RECALL CONTEXT, turns left after this:", stickyRecallTurnsRemaining);
+    } else if (looksLikeSearchQuery) {
+      // Searching with the raw message tanks result quality — conversational
+      // filler ("Hey Noah, I should have granted you...") dilutes relevance
+      // ranking and returns homepages instead of actual content. Have the
+      // model distill a real search query first.
+      const queryExtractionPrompt = `Extract a short, focused web search query (3-8 words, no quotes or extra punctuation) that would find the answer to this request. Reply with ONLY the query text and nothing else.\n\nRequest: "${message}"`;
+      const rawQuery = await callOllama(queryExtractionPrompt, 30);
+      const searchQuery = rawQuery.replace(/["'\n]+/g, " ").trim() || message;
+
+      console.log("PROACTIVE WEB SEARCH TRIGGERED — extracted query:", searchQuery);
+      const results = await webSearch(searchQuery);
+      recallContext = results.length > 0
+        ? `--- WEB SEARCH RESULTS FOR "${searchQuery}" ---\n` +
+          results.map((r, i) => `${i + 1}. ${r.title}\n${r.description}\n${r.url}`).join("\n\n") +
+          `\n--- END WEB SEARCH RESULTS ---\nAnswer the user's question using these results. If they don't actually answer it, say so honestly instead of guessing.\n\n`
+        : `--- NOTE: The web search for "${searchQuery}" returned no results (or web search isn't configured). Tell the user you couldn't find current information on this. ---\n\n`;
     }
 
     const fullPrompt = wantsModification ? `System Instruction:\n${metaSystemInstruction}\n\n` + `User Request:\n${message}`: `System Instruction:\n${metaSystemInstruction}\n\n` + recallContext + `Conversation History:\n${recentHistory}\n\n` + `User Request:\n${message}`;
@@ -732,31 +878,33 @@ app.post('/api/chat', async (req, res) => {
 
     console.log(`[MODEL] ${selectedModel} | complex=${isComplex}`);
 
-    const response = await fetch(OLLAMA_URL, {
-      method: "POST",
-      signal: controller.signal,
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model: selectedModel,
-        prompt: fullPrompt,
-        stream: false,
-        think: false,
-        options: {
-        num_predict: isComplex ? 3000 : 80,
-        temperature: 0.3
-        }
-      })
-    });
-
-    if (!response.ok) throw new Error("Ollama connection failed");
-    const data = await response.json() as { response: string };
-    
-    clearTimeout(timeout);
-    
-    const aiResponse = data.response;
+    let aiResponse = await callOllama(fullPrompt, isComplex ? 3000 : 80);
 
     console.log("RAW AI RESPONSE:");
     console.log(aiResponse);
+
+    const searchMatch = aiResponse.match(SEARCH_TAG_PATTERN);
+    if (searchMatch) {
+      const searchQuery = searchMatch[1].trim();
+      console.log("WEB SEARCH REQUESTED:", searchQuery);
+
+      const results = await webSearch(searchQuery);
+      const searchContext = results.length > 0
+        ? `--- WEB SEARCH RESULTS FOR "${searchQuery}" ---\n` +
+          results.map((r, i) => `${i + 1}. ${r.title}\n${r.description}\n${r.url}`).join("\n\n") +
+          `\n--- END WEB SEARCH RESULTS ---\nAnswer the user's original question using these results. If they don't actually answer it, say so honestly instead of guessing.\n\n`
+        : `--- NOTE: The web search for "${searchQuery}" returned no results (or web search isn't configured). Tell the user you couldn't find current information on this. ---\n\n`;
+
+      const followUpPrompt = `System Instruction:\n${metaSystemInstruction}\n\n` + searchContext + `Conversation History:\n${recentHistory}\n\n` + `User Request:\n${message}`;
+
+      aiResponse = await callOllama(followUpPrompt, isComplex ? 3000 : 400);
+
+      console.log("FINAL AI RESPONSE AFTER SEARCH:");
+      console.log(aiResponse);
+    }
+
+    clearTimeout(timeout);
+
     console.log("RESPONSE LENGTH:", aiResponse?.length ?? 0);
 
     let jsonModifications: Modification[] = [];

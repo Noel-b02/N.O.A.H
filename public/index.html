@@ -344,11 +344,59 @@
       sendMessage(message);
     });
 
+    // Cosmetic-only guess at what kind of request this is, so the loading
+    // line reflects it while the real (server-side, authoritative)
+    // classification in server.ts runs. Mirrors that logic loosely — it
+    // doesn't need to be exact, it just needs to feel right most of the time.
+    const LOADING_MESSAGES_BY_TASK = {
+      modification: [
+        'DRAFTING SELF-MODIFICATION PATCH...',
+        'REWRITING NEURAL PATHWAYS...',
+        'STAGING CODE MUTATION...'
+      ],
+      recall: [
+        'EXCAVATING ARCHIVED MEMORY BANKS...',
+        'CROSS-REFERENCING PAST SESSIONS...',
+        'SCANNING CONVERSATION ARCHIVES...'
+      ],
+      search: [
+        'SCANNING EXTERNAL DATA STREAMS...',
+        'QUERYING OUTSIDE NETWORKS...',
+        'TRIANGULATING LIVE INTEL...'
+      ],
+      default: [
+        'COMPILING LOGICAL MATRIX MODEL PATHWAYS...',
+        'PROCESSING CONVERSATIONAL MATRIX...',
+        'ALIGNING RESPONSE VECTORS...'
+      ]
+    };
+
+    function pickLoadingMessage(message) {
+      const msg = message.toLowerCase();
+
+      const isRememberQuestion = /\b(do|does|did)\s+(you|we)\s+remember\b/.test(msg);
+      const wantsModification = !isRememberQuestion &&
+        /\b(modify|change|rewrite|update|edit|improve|refactor|remember|memorize|store|save)\b/.test(msg);
+
+      const isRecall = !wantsModification && (
+        /(what did (we|i) (talk|speak) about|what did (i|we) (say|discuss|mention)|do you remember|did we (talk|speak) about|have we (talked|spoken) about|what were we discussing)/.test(msg) ||
+        /\b(on|the)\s+\d{1,2}(st|nd|rd|th)?\s+(of\s+)?(january|february|march|april|may|june|july|august|september|october|november|december)\b/.test(msg) ||
+        /\b(january|february|march|april|may|june|july|august|september|october|november|december)\s+\d{1,2}(st|nd|rd|th)?\b/.test(msg)
+      );
+
+      const looksLikeSearch = !wantsModification && !isRecall &&
+        /\b(who won|when (does|is|did)|release date|comes out|latest|current|today's|news|score|weather|price of|how much (is|does)|what year)\b/.test(msg);
+
+      const category = wantsModification ? 'modification' : isRecall ? 'recall' : looksLikeSearch ? 'search' : 'default';
+      const options = LOADING_MESSAGES_BY_TASK[category];
+      return options[Math.floor(Math.random() * options.length)];
+    }
+
     async function sendMessage(message) {
       appendMessage('user', message);
 
       setCoreState('thinking');
-      const loadingId = appendMessage('system', 'COMPILING LOGICAL MATRIX MODEL PATHWAYS...');
+      const loadingId = appendMessage('system', pickLoadingMessage(message));
 
       try {
         const response = await fetch('/api/chat', {
@@ -387,6 +435,10 @@
     // --- Voice output (TTS) ---
     let voiceOutputEnabled = false;
     let currentAudio = null;
+    // Bumped whenever playback should stop (voice toggled off, or a new reply
+    // starts speaking) so any in-flight sentence-playback loop below abandons
+    // itself instead of racing with newer audio.
+    let speechQueueToken = 0;
 
     function setVoiceOutput(enabled) {
       voiceOutputEnabled = enabled;
@@ -402,6 +454,7 @@
         voiceToggleBtn.classList.remove('text-cyan-400', 'border-cyan-500/60', 'bg-cyan-500/10', 'shadow-[0_0_12px_rgba(0,240,255,0.15)]');
         voiceToggleBtn.classList.add('text-slate-600', 'border-cyan-500/40');
 
+        speechQueueToken++;
         if (currentAudio) {
           currentAudio.pause();
           currentAudio = null;
@@ -414,9 +467,12 @@
 
     voiceToggleBtn.addEventListener('click', () => setVoiceOutput(!voiceOutputEnabled));
 
-    async function speakReply(text) {
-      if (!voiceOutputEnabled || !text) return;
+    function splitIntoSentences(text) {
+      const sentences = text.match(/[^.!?]+[.!?]+(?:\s+|$)|[^.!?]+$/g);
+      return (sentences || [text]).map(s => s.trim()).filter(Boolean);
+    }
 
+    async function fetchSpeechAudioUrl(text) {
       try {
         const response = await fetch('/api/speak', {
           method: 'POST',
@@ -426,18 +482,43 @@
 
         if (!response.ok) {
           console.error('TTS request failed:', await response.text().catch(() => response.status));
-          return;
+          return null;
         }
 
         const audioBlob = await response.blob();
-        const audioUrl = URL.createObjectURL(audioBlob);
-
-        if (currentAudio) currentAudio.pause();
-        currentAudio = new Audio(audioUrl);
-        currentAudio.play().catch(err => console.error('Audio playback blocked:', err));
-        currentAudio.addEventListener('ended', () => URL.revokeObjectURL(audioUrl));
+        return URL.createObjectURL(audioBlob);
       } catch (err) {
         console.error('TTS error:', err);
+        return null;
+      }
+    }
+
+    function playAudioUrl(url) {
+      return new Promise((resolve) => {
+        if (currentAudio) currentAudio.pause();
+        currentAudio = new Audio(url);
+        currentAudio.addEventListener('ended', () => { URL.revokeObjectURL(url); resolve(); });
+        currentAudio.play().catch(err => { console.error('Audio playback blocked:', err); resolve(); });
+      });
+    }
+    
+    async function speakReply(text) {
+      if (!voiceOutputEnabled || !text) return;
+
+      const myToken = ++speechQueueToken;
+      const sentences = splitIntoSentences(text);
+      if (sentences.length === 0) return;
+
+      let nextAudioPromise = fetchSpeechAudioUrl(sentences[0]);
+
+      for (let i = 0; i < sentences.length; i++) {
+        const audioUrl = await nextAudioPromise;
+        if (myToken !== speechQueueToken) return;
+
+        nextAudioPromise = i + 1 < sentences.length ? fetchSpeechAudioUrl(sentences[i + 1]) : null;
+
+        if (audioUrl) await playAudioUrl(audioUrl);
+        if (myToken !== speechQueueToken) return;
       }
     }
 
