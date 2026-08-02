@@ -1,37 +1,3 @@
-"""
-N.O.A.H. Speech Service
-------------------------
-Local-only STT (faster-whisper) + TTS (Kokoro-82M) behind a tiny FastAPI app.
-Node's server.ts calls this over HTTP the same way it calls Ollama — nothing
-here ever leaves the machine.
-
-Run with:
-    uvicorn server:app --host 0.0.0.0 --port 5001
-
-Config is via environment variables (mirrors how server.ts reads OLLAMA_URL etc):
-    WHISPER_MODEL          tiny | base | small | medium | large-v3   (default: small)
-    WHISPER_DEVICE         cpu | cuda                                 (default: cpu)
-    WHISPER_COMPUTE_TYPE   int8 | float16 | float32 (default depends on device)
-    KOKORO_LANG_CODE       a (American English) | b (British English)  (default: b)
-    KOKORO_VOICE            e.g. bm_george, bm_lewis, bf_emma, bf_isabella,
-                             af_heart, am_adam, ...                    (default: bm_george)
-    KOKORO_SPEED            0.5 - 2.0, 1.0 = normal pace               (default: 1.0)
-    KOKORO_USE_GPU          true | false                                (default: false)
-
-Why Whisper AND Kokoro default to CPU: your GPU is already doing double duty
-running CHAT_MODEL/CODE_MODEL in Ollama. Loading either of these into the
-same 8GB of VRAM risks the same model-swap-latency problem you already fixed
-on the LLM side (see keep_alive / warmup in server.ts). A 9800X3D handles
-both comfortably on CPU for short voice commands and short replies. Set
-KOKORO_USE_GPU=true / WHISPER_DEVICE=cuda if you want to try GPU anyway,
-accepting that VRAM tradeoff.
-
-One-time system setup beyond `pip install -r requirements.txt`:
-    Kokoro needs espeak-ng installed as a SYSTEM package (not pip-installable).
-    On Windows: download the installer from the espeak-ng GitHub releases page
-    and run it, or `choco install espeak-ng` if you use Chocolatey.
-"""
-
 import io
 import os
 import tempfile
