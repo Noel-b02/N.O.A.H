@@ -184,10 +184,19 @@
               required
               autocomplete="off"
             />
+            <!-- Live mic input level, driven by the Web Audio analyser — cyan while
+                 passively listening for barge-in during playback, rose while actively recording. -->
+            <div id="mic-visualizer" class="hidden items-end space-x-0.5 h-4 mr-2">
+              <div class="w-0.5 rounded-full transition-all duration-75" style="height: 15%"></div>
+              <div class="w-0.5 rounded-full transition-all duration-75" style="height: 15%"></div>
+              <div class="w-0.5 rounded-full transition-all duration-75" style="height: 15%"></div>
+              <div class="w-0.5 rounded-full transition-all duration-75" style="height: 15%"></div>
+              <div class="w-0.5 rounded-full transition-all duration-75" style="height: 15%"></div>
+            </div>
             <button
               type="button"
               id="mic-btn"
-              title="Hold to speak"
+              title="Click to speak"
               class="bg-cyan-950/40 hover:bg-cyan-500/15 border border-cyan-500/40 text-cyan-400 font-bold tracking-widest text-[10px] px-4 py-3 rounded uppercase transition duration-300 mr-2"
             >
               🎤
@@ -432,6 +441,72 @@
       }
     }
 
+    // --- Shared mic-input visualizer (used by both recording and barge-in listening) ---
+    // Reads live volume from a MediaStream via an AnalyserNode and drives the
+    // bar heights + an optional per-frame callback (barge-in uses this to
+    // detect when to interrupt playback).
+    function attachVisualizer(stream, onVolume) {
+      const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+      const audioContext = new AudioContextClass();
+      const source = audioContext.createMediaStreamSource(stream);
+      const analyser = audioContext.createAnalyser();
+      analyser.fftSize = 512;
+      source.connect(analyser);
+
+      const dataArray = new Uint8Array(analyser.frequencyBinCount);
+      let rafId = null;
+
+      function poll() {
+        analyser.getByteTimeDomainData(dataArray);
+        let sumSquares = 0;
+        for (let i = 0; i < dataArray.length; i++) {
+          const deviation = dataArray[i] - 128;
+          sumSquares += deviation * deviation;
+        }
+        const rms = Math.sqrt(sumSquares / dataArray.length);
+
+        updateMicVisualizer(rms);
+        if (onVolume) onVolume(rms);
+
+        rafId = requestAnimationFrame(poll);
+      }
+      poll();
+
+      return function cleanup() {
+        if (rafId) cancelAnimationFrame(rafId);
+        audioContext.close();
+      };
+    }
+
+    function updateMicVisualizer(rms) {
+      const el = document.getElementById('mic-visualizer');
+      if (!el) return;
+      const level = Math.min(1, rms / 60);
+      for (const bar of el.children) {
+        const jitter = 0.7 + Math.random() * 0.6;
+        bar.style.height = Math.max(15, Math.min(100, level * 100 * jitter)) + '%';
+      }
+    }
+
+    function showMicVisualizer(colorClass) {
+      const el = document.getElementById('mic-visualizer');
+      if (!el) return;
+      el.classList.remove('hidden', 'bg-cyan-400', 'bg-rose-400');
+      el.classList.add('flex');
+      for (const bar of el.children) bar.classList.add(colorClass);
+    }
+
+    function hideMicVisualizer() {
+      const el = document.getElementById('mic-visualizer');
+      if (!el) return;
+      el.classList.add('hidden');
+      el.classList.remove('flex');
+      for (const bar of el.children) {
+        bar.style.height = '15%';
+        bar.classList.remove('bg-cyan-400', 'bg-rose-400');
+      }
+    }
+
     // --- Voice output (TTS) ---
     let voiceOutputEnabled = false;
     let currentAudio = null;
@@ -439,6 +514,44 @@
     // starts speaking) so any in-flight sentence-playback loop below abandons
     // itself instead of racing with newer audio.
     let speechQueueToken = 0;
+
+    // Mic stream kept open (only) while Noah is speaking, purely to detect
+    // if the user starts talking so playback can be interrupted — separate
+    // from the recording stream used when the mic button is pressed.
+    let bargeInStream = null;
+    let bargeInCleanup = null;
+    const BARGE_IN_VOLUME_THRESHOLD = 30; // tuned for typical speech vs background noise on a 0-~90 RMS scale
+
+    async function startBargeInListening() {
+      if (bargeInStream) return;
+      try {
+        bargeInStream = await navigator.mediaDevices.getUserMedia({
+          audio: { echoCancellation: true, noiseSuppression: true }
+        });
+      } catch (err) {
+        console.error('Barge-in mic access failed (continuing without interrupt support):', err);
+        return;
+      }
+
+      showMicVisualizer('bg-cyan-400');
+      bargeInCleanup = attachVisualizer(bargeInStream, (rms) => {
+        if (rms > BARGE_IN_VOLUME_THRESHOLD && currentAudio && !currentAudio.paused) {
+          interruptSpeech();
+        }
+      });
+    }
+
+    function stopBargeInListening() {
+      if (bargeInCleanup) { bargeInCleanup(); bargeInCleanup = null; }
+      if (bargeInStream) { bargeInStream.getTracks().forEach(track => track.stop()); bargeInStream = null; }
+      hideMicVisualizer();
+    }
+
+    function interruptSpeech() {
+      speechQueueToken++;
+      if (currentAudio) { currentAudio.pause(); currentAudio = null; }
+      stopBargeInListening();
+    }
 
     function setVoiceOutput(enabled) {
       voiceOutputEnabled = enabled;
@@ -459,6 +572,7 @@
           currentAudio.pause();
           currentAudio = null;
         }
+        stopBargeInListening();
       }
     }
 
@@ -509,6 +623,11 @@
       const sentences = splitIntoSentences(text);
       if (sentences.length === 0) return;
 
+      // No-op if a barge-in listener from a previous (still-current) reply is
+      // already open — keeps one continuous mic session across sentences
+      // instead of reacquiring the mic between each one.
+      await startBargeInListening();
+
       let nextAudioPromise = fetchSpeechAudioUrl(sentences[0]);
 
       for (let i = 0; i < sentences.length; i++) {
@@ -520,16 +639,19 @@
         if (audioUrl) await playAudioUrl(audioUrl);
         if (myToken !== speechQueueToken) return;
       }
+
+      if (myToken === speechQueueToken) stopBargeInListening();
     }
 
     // --- Voice input (STT) ---
-    // Hold the mic button to record, release to stop and transcribe.
+    // Click the mic button to start recording, click again to stop.
     let mediaRecorder = null;
     let recordedChunks = [];
     let isRecording = false;
     let isStarting = false;      // true while getUserMedia is still resolving
-    let stopRequested = false;   // true if the button was released before recording actually started
+    let stopRequested = false;   // true if stop was clicked before recording actually started
     let recordingStartedAt = 0;
+    let recordingVisualizerCleanup = null;
     const MIN_RECORDING_MS = 300; // recordings shorter than this are almost never real speech
 
     async function startRecording() {
@@ -537,11 +659,17 @@
       isStarting = true;
       stopRequested = false;
 
+      // Pressing the mic is a deliberate "I'm about to talk" signal — cut
+      // Noah off immediately rather than waiting for barge-in volume
+      // detection to notice over whatever he's still saying.
+      interruptSpeech();
+
       try {
         const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
 
-        // The button may have already been released while we were waiting on
-        // permission/stream setup — honor that instead of recording forever.
+        // The button may have already been clicked again while we were
+        // waiting on permission/stream setup — honor that instead of
+        // recording forever.
         if (stopRequested) {
           stream.getTracks().forEach(track => track.stop());
           isStarting = false;
@@ -557,10 +685,13 @@
 
         mediaRecorder.onstop = async () => {
           stream.getTracks().forEach(track => track.stop());
+          if (recordingVisualizerCleanup) { recordingVisualizerCleanup(); recordingVisualizerCleanup = null; }
+          hideMicVisualizer();
+
           const durationMs = Date.now() - recordingStartedAt;
 
           if (durationMs < MIN_RECORDING_MS) {
-            appendMessage('system', 'HOLD THE MIC BUTTON LONGER TO SPEAK.');
+            appendMessage('system', 'SPEAK FOR A LITTLE LONGER BEFORE STOPPING.');
             return;
           }
 
@@ -573,6 +704,9 @@
         isRecording = true;
         isStarting = false;
         micBtn.classList.add('bg-rose-500/20', 'border-rose-500/60', 'text-rose-400');
+        micBtn.title = 'Click to stop';
+        showMicVisualizer('bg-rose-400');
+        recordingVisualizerCleanup = attachVisualizer(stream);
       } catch (err) {
         console.error('Microphone access denied or unavailable:', err);
         appendMessage('system', 'MICROPHONE ACCESS DENIED OR UNAVAILABLE.');
@@ -584,7 +718,7 @@
       if (isStarting && !isRecording) {
         // Recording hasn't actually begun yet — flag it so startRecording()
         // stops immediately once getUserMedia resolves, instead of recording
-        // indefinitely until the next button press.
+        // indefinitely until the next button click.
         stopRequested = true;
         return;
       }
@@ -592,11 +726,12 @@
       mediaRecorder.stop();
       isRecording = false;
       micBtn.classList.remove('bg-rose-500/20', 'border-rose-500/60', 'text-rose-400');
+      micBtn.title = 'Click to speak';
     }
 
     async function transcribeAndSend(audioBlob) {
       if (audioBlob.size < 1000) {
-        appendMessage('system', 'NO AUDIO CAPTURED — TRY HOLDING THE MIC BUTTON LONGER.');
+        appendMessage('system', 'NO AUDIO CAPTURED — TRY AGAIN AND SPEAK CLEARLY.');
         return;
       }
 
@@ -633,40 +768,66 @@
       }
     }
 
-    // Press-and-hold on desktop (mouse) and mobile (touch)
-    micBtn.addEventListener('mousedown', startRecording);
-    micBtn.addEventListener('mouseup', stopRecording);
-    micBtn.addEventListener('mouseleave', () => { if (isRecording) stopRecording(); });
-    micBtn.addEventListener('touchstart', (e) => { e.preventDefault(); startRecording(); });
-    micBtn.addEventListener('touchend', (e) => { e.preventDefault(); stopRecording(); });
+    // Single click toggles recording on/off — works for mouse, touch, and
+    // keyboard activation alike since 'click' covers all of them natively.
+    micBtn.addEventListener('click', () => {
+      if (isRecording || isStarting) {
+        stopRecording();
+      } else {
+        startRecording();
+      }
+    });
 
     let messageIdCounter = 0;
+
+    // Escapes HTML special characters so text can be safely inserted via
+    // innerHTML — needed before we start wrapping URLs in real <a> tags,
+    // otherwise any literal <, >, or & in a response (or a pasted-in user
+    // message) would be interpreted as markup instead of shown as text.
+    function escapeHtml(text) {
+      const div = document.createElement('div');
+      div.textContent = text;
+      return div.innerHTML;
+    }
+
+    // Wraps bare URLs in clickable links. Escapes first, then finds URLs in
+    // the escaped text — the URL itself never contains unescaped HTML since
+    // it came from the same escaped string, so this stays safe.
+    function linkify(text) {
+      const escaped = escapeHtml(text);
+      return escaped.replace(/(https?:\/\/[^\s<]+)/g, (url) => {
+        const trailingMatch = url.match(/[).,!?;:]+$/);
+        const trailing = trailingMatch ? trailingMatch[0] : '';
+        const cleanUrl = trailing ? url.slice(0, -trailing.length) : url;
+        return `<a href="${cleanUrl}" target="_blank" rel="noopener noreferrer" class="text-cyan-400 underline decoration-cyan-500/40 hover:text-cyan-300 hover:decoration-cyan-300 break-all">${cleanUrl}</a>${trailing}`;
+      });
+    }
 
     function appendMessage(sender, text) {
       const msgId = 'msg-' + (++messageIdCounter);
       const div = document.createElement('div');
       div.id = msgId;
       div.className = "relative p-6 rounded transition duration-300 max-w-3xl glass-hud shadow-[0_0_15px_rgba(0,240,255,0.01)]";
-      
+
       if (sender === 'user') {
         div.className += " ml-auto border-amber-500/20 shadow-[0_0_15px_rgba(245,158,11,0.01)]";
         div.innerHTML = `
           <div class="absolute top-0 right-0 w-2 h-2 border-t border-r border-amber-400"></div>
           <p class="text-[9px] font-mono tracking-widest text-amber-500 font-extrabold mb-2">CREATOR INSTRUCTION PROTOCOL</p>
-          <p class="text-sm text-slate-300 font-mono tracking-wide leading-relaxed">${text}</p>
+          <p class="text-sm text-slate-300 font-mono tracking-wide leading-relaxed">${linkify(text)}</p>
         `;
       } else if (sender === 'assistant') {
         div.className += " border-cyan-500/20 shadow-[0_0_15px_rgba(0,240,255,0.01)]";
         div.innerHTML = `
           <div class="absolute top-0 left-0 w-2 h-2 border-t border-l border-cyan-400"></div>
           <p class="text-[9px] font-mono tracking-widest text-cyan-400 font-extrabold mb-2">NOAH CORE OUTPUT</p>
-          <p class="text-sm text-slate-300 leading-relaxed">${text.replace(/\n/g, '<br>')}</p>
+          <p class="text-sm text-slate-300 leading-relaxed">${linkify(text).replace(/\n/g, '<br>')}</p>
         `;
       } else {
         div.className += " bg-rose-950/10 border-rose-500/20 max-w-xl text-rose-300";
         div.innerHTML = `
           <p class="text-[9px] font-mono tracking-widest text-rose-400 font-extrabold mb-1">TERMINAL PROCESS EVENT</p>
-          <p class="text-xs leading-relaxed font-mono">${text}</p>
+          <p class="text-xs leading-relaxed font-mono">${linkify(text)}</p>
         `;
       }
       

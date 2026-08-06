@@ -101,6 +101,12 @@ let stickyRecallContext = "";
 let stickyRecallTurnsRemaining = 0;
 const STICKY_RECALL_FOLLOWUP_TURNS = 3;
 
+// Same idea, for web search: a follow-up like "give me the link to the sites
+// you used" needs the same search results (with real URLs) that answered the
+// original question, not just its own text summary from conversation history.
+let stickySearchContext = "";
+let stickySearchTurnsRemaining = 0;
+
 
 function loadHistory(): string[] {
   try {
@@ -177,6 +183,8 @@ function archiveSession(reason: "startup" | "manual", archivedAt: Date = new Dat
 
   stickyRecallContext = "";
   stickyRecallTurnsRemaining = 0;
+  stickySearchContext = "";
+  stickySearchTurnsRemaining = 0;
 
   console.log(`Archived session (${reason}) -> ${archivePath}`);
   return archivePath;
@@ -212,9 +220,15 @@ function stripHtmlTags(text: string): string {
   return text.replace(/<\/?[^>]+>/g, "");
 }
 
-async function webSearch(query: string): Promise<WebSearchResult[]> {
+async function webSearch(
+  query: string,
+  options: { categories?: string; timeRange?: string } = {}
+): Promise<WebSearchResult[]> {
   try {
-    const url = `${SEARXNG_URL}/search?q=${encodeURIComponent(query)}&format=json`;
+    let url = `${SEARXNG_URL}/search?q=${encodeURIComponent(query)}&format=json`;
+    if (options.categories) url += `&categories=${encodeURIComponent(options.categories)}`;
+    if (options.timeRange) url += `&time_range=${encodeURIComponent(options.timeRange)}`;
+
     const res = await fetch(url);
 
     if (!res.ok) {
@@ -234,6 +248,16 @@ async function webSearch(query: string): Promise<WebSearchResult[]> {
     console.error("Web search error (is SearXNG running at " + SEARXNG_URL + "?):", err);
     return [];
   }
+}
+
+// "Give me today's headlines" is a fundamentally different task from a
+// factual lookup like "who won the world cup" — it's not searching FOR
+// anything specific, so a plain web search just surfaces static homepages
+// (which rank highest for a bare term like "headlines"). SearXNG's news
+// category plus a day-range filter routes through actual news-aggregator
+// engines and returns real, dated, current articles instead.
+async function fetchTodaysHeadlines(topic?: string): Promise<WebSearchResult[]> {
+  return webSearch(topic?.trim() || "news", { categories: "news", timeRange: "day" });
 }
 
 function findArchivesByDate(targetDate: Date): ArchivedSession[] {
@@ -600,6 +624,13 @@ app.post('/api/chat', async (req, res) => {
   // get the archived context and the smarter model.
   const isStickyRecallFollowup = !wantsModification && !isRecallQuery && stickyRecallTurnsRemaining > 0;
 
+  // "Give me today's headlines" is a news-digest request, not a factual
+  // lookup — it gets its own trigger and its own fetch path (SearXNG's news
+  // category + day filter) rather than a plain web search, which just
+  // surfaces static homepages for a bare term like "headlines".
+  const HEADLINES_TRIGGER_PATTERN = /\b(headlines|breaking news|today'?s news|news today|on the news|what'?s (been )?reported|happening in the world)\b/i;
+  const looksLikeHeadlinesQuery = !wantsModification && !isRecallQuery && !isStickyRecallFollowup && HEADLINES_TRIGGER_PATTERN.test(message);
+
   // Deterministic web-search trigger for common "needs current info" phrasings
   // — mirrors the recall-trigger approach above rather than relying on the
   // model to notice it needs to search and correctly emit [SEARCH: ...]. That
@@ -607,12 +638,20 @@ app.post('/api/chat', async (req, res) => {
   // practice they don't: they either wrap the tag in prose or skip it and
   // hallucinate an excuse instead. Catching the obvious cases here means the
   // search actually happens instead of being gated on model cooperation.
-  const SEARCH_TRIGGER_PATTERN = /\b(top headlines|headlines today|latest news|breaking news|news today|on the news|what'?s (been )?reported|happening in the world|who won|release date|launch date|premiere date|when('s| is| does| will).{0,30}(come out|coming out|releas(e|ing)|drop(ping)?|launch(ing)?|premier(e|ing))|current (weather|price|score|exchange rate)|how much (is|does|would)|price of|what'?s the weather|weather (today|forecast|right now))\b/i;
-  const looksLikeSearchQuery = !wantsModification && !isRecallQuery && !isStickyRecallFollowup && SEARCH_TRIGGER_PATTERN.test(message);
+  const SEARCH_TRIGGER_PATTERN = /\b(latest news|who won|release date|launch date|premiere date|when('s| is| does| will).{0,30}(come out|coming out|releas(e|ing)|drop(ping)?|launch(ing)?|premier(e|ing))|current (weather|price|score|exchange rate)|how much (is|does|would)|price of|what'?s the weather|weather (today|forecast|right now))\b/i;
+  const looksLikeSearchQuery = !wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeHeadlinesQuery && SEARCH_TRIGGER_PATTERN.test(message);
+
+  // A follow-up on an already-answered search or headlines request (e.g.
+  // "give me the link to the sites you used", "which one said that") —
+  // needs the same results (with real URLs) rather than the model
+  // improvising from its own summary.
+  const isStickySearchFollowup = !wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeHeadlinesQuery && !looksLikeSearchQuery && stickySearchTurnsRemaining > 0;
 
   console.log("IS RECALL QUERY:", isRecallQuery);
   console.log("IS STICKY RECALL FOLLOWUP:", isStickyRecallFollowup, "| turns remaining:", stickyRecallTurnsRemaining);
+  console.log("LOOKS LIKE HEADLINES QUERY:", looksLikeHeadlinesQuery);
   console.log("LOOKS LIKE SEARCH QUERY:", looksLikeSearchQuery);
+  console.log("IS STICKY SEARCH FOLLOWUP:", isStickySearchFollowup, "| turns remaining:", stickySearchTurnsRemaining);
 
   // Short messages like ("hi", "thanks", "ok") are never complex on keyword grounds alone —
   // skip straight to the fast model rather than utilize the smart model to decrease latency
@@ -620,7 +659,7 @@ app.post('/api/chat', async (req, res) => {
   // they need to reliably produce structured JSON output.
   const wordCount = message.trim().split(/\s+/).length;
 
-  const isComplex = wantsModification || isRecallQuery || isStickyRecallFollowup || looksLikeSearchQuery || (
+  const isComplex = wantsModification || isRecallQuery || isStickyRecallFollowup || looksLikeHeadlinesQuery || looksLikeSearchQuery || isStickySearchFollowup || (
     wordCount > 5 && /(typescript|javascript|debug|refactor|git|branch)/i.test(message)
   );
 
@@ -747,7 +786,7 @@ app.post('/api/chat', async (req, res) => {
   // Recall queries already have their own dedicated context (archived
   // conversations); the web-search tag is for outside-world facts the model
   // doesn't already know, so only offer it outside those two paths.
-  const searchInstructions = (!wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeSearchQuery) ? `
+  const searchInstructions = (!wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeHeadlinesQuery && !looksLikeSearchQuery && !isStickySearchFollowup) ? `
   If answering requires current or real-world information you don't already know — release dates, sports results, news, prices, "when does X come out", "who won Y" — do not guess or make something up. Instead, respond with EXACTLY this and nothing else, no other words:
 
   [SEARCH: concise web search query]
@@ -852,6 +891,21 @@ app.post('/api/chat', async (req, res) => {
       stickyRecallTurnsRemaining--;
 
       console.log("USING STICKY RECALL CONTEXT, turns left after this:", stickyRecallTurnsRemaining);
+    } else if (looksLikeHeadlinesQuery) {
+      console.log("FETCHING TODAY'S HEADLINES");
+      const results = await fetchTodaysHeadlines();
+      recallContext = results.length > 0
+        ? `--- TODAY'S NEWS HEADLINES ---\n` +
+          results.map((r, i) => `${i + 1}. ${r.title}\n${r.description}\n${r.url}`).join("\n\n") +
+          `\n--- END TODAY'S NEWS HEADLINES ---\n` +
+          `Summarize these as today's headlines for the user. ` +
+          `Don't list the URLs unless asked — but if the user later asks for the link(s)/source(s), use the exact URLs shown above. Never invent a URL that isn't listed there.\n\n`
+        : `--- NOTE: No current headlines could be retrieved (news search may not be configured). Tell the user you couldn't find today's news. ---\n\n`;
+
+      // Keep these results (with real URLs) available for a follow-up like
+      // "give me the link to the sites you used".
+      stickySearchContext = recallContext;
+      stickySearchTurnsRemaining = STICKY_RECALL_FOLLOWUP_TURNS;
     } else if (looksLikeSearchQuery) {
       // Searching with the raw message tanks result quality — conversational
       // filler ("Hey Noah, I should have granted you...") dilutes relevance
@@ -866,8 +920,23 @@ app.post('/api/chat', async (req, res) => {
       recallContext = results.length > 0
         ? `--- WEB SEARCH RESULTS FOR "${searchQuery}" ---\n` +
           results.map((r, i) => `${i + 1}. ${r.title}\n${r.description}\n${r.url}`).join("\n\n") +
-          `\n--- END WEB SEARCH RESULTS ---\nAnswer the user's question using these results. If they don't actually answer it, say so honestly instead of guessing.\n\n`
+          `\n--- END WEB SEARCH RESULTS ---\n` +
+          `Answer the user's question using these results. If they don't actually answer it, say so honestly instead of guessing. ` +
+          `Don't list the URLs unless asked — but if the user later asks for the link(s)/source(s), use the exact URLs shown above. Never invent a URL that isn't listed there.\n\n`
         : `--- NOTE: The web search for "${searchQuery}" returned no results (or web search isn't configured). Tell the user you couldn't find current information on this. ---\n\n`;
+
+      // Keep these results (with real URLs) available for a follow-up like
+      // "give me the link to the sites you used".
+      stickySearchContext = recallContext;
+      stickySearchTurnsRemaining = STICKY_RECALL_FOLLOWUP_TURNS;
+    } else if (isStickySearchFollowup) {
+      recallContext = stickySearchContext.replace(
+        "Don't list the URLs unless asked — but if the user later asks for the link(s)/source(s), use the exact URLs shown above. Never invent a URL that isn't listed there.",
+        "The user is now asking about this follow-up — use the exact URLs shown above if they're asking for links or sources. Never invent a URL that isn't listed there."
+      );
+      stickySearchTurnsRemaining--;
+
+      console.log("USING STICKY SEARCH CONTEXT, turns left after this:", stickySearchTurnsRemaining);
     }
 
     const fullPrompt = wantsModification ? `System Instruction:\n${metaSystemInstruction}\n\n` + `User Request:\n${message}`: `System Instruction:\n${metaSystemInstruction}\n\n` + recallContext + `Conversation History:\n${recentHistory}\n\n` + `User Request:\n${message}`;
@@ -892,8 +961,15 @@ app.post('/api/chat', async (req, res) => {
       const searchContext = results.length > 0
         ? `--- WEB SEARCH RESULTS FOR "${searchQuery}" ---\n` +
           results.map((r, i) => `${i + 1}. ${r.title}\n${r.description}\n${r.url}`).join("\n\n") +
-          `\n--- END WEB SEARCH RESULTS ---\nAnswer the user's original question using these results. If they don't actually answer it, say so honestly instead of guessing.\n\n`
+          `\n--- END WEB SEARCH RESULTS ---\n` +
+          `Answer the user's original question using these results. If they don't actually answer it, say so honestly instead of guessing. ` +
+          `Don't list the URLs unless asked — but if the user later asks for the link(s)/source(s), use the exact URLs shown above. Never invent a URL that isn't listed there.\n\n`
         : `--- NOTE: The web search for "${searchQuery}" returned no results (or web search isn't configured). Tell the user you couldn't find current information on this. ---\n\n`;
+
+      // Keep these results (with real URLs) available for a follow-up like
+      // "give me the link to the sites you used".
+      stickySearchContext = searchContext;
+      stickySearchTurnsRemaining = STICKY_RECALL_FOLLOWUP_TURNS;
 
       const followUpPrompt = `System Instruction:\n${metaSystemInstruction}\n\n` + searchContext + `Conversation History:\n${recentHistory}\n\n` + `User Request:\n${message}`;
 
