@@ -929,28 +929,6 @@ app.post('/api/chat', async (req, res) => {
       // Not JSON, continue normally
     }
     
-    if (!aiResponse.includes("I cannot execute") && !aiResponse.includes("I am an AI model")) {
-
-      const isRefusal = aiResponse.includes("cannot execute") || aiResponse.includes("cannot modify") || aiResponse.includes("I am an AI model");
-
-      if (!isRefusal) {
-        const historySafeResponse = isPureJsonResponse
-          ? `[Proposed modification: ${pendingCommit?.title ?? "changes drafted"}]`
-          : aiResponse.replace(
-              /\[UPDATE:.*?\]\s*```[\s\S]*?```/g,
-              "[UPDATE GENERATED]"
-            );
-
-        conversationHistory.push(`Assistant: ${historySafeResponse}`);     
-        saveHistory(); 
-      }
-    }
-
-    if (conversationHistory.length > 40) {
-      conversationHistory =
-      conversationHistory.slice(-40);
-  }
-
     // Parse out potential updates
     const pattern =  /\[UPDATE:\s*([^\]]+)\]\s*\n*\s*```[\w]*\n([\s\S]*?)```/g;
     const updates: { filepath: string; content: string }[] = [];
@@ -960,6 +938,47 @@ app.post('/api/chat', async (req, res) => {
       updates.push({
         filepath: match[1].trim(),
         content: match[2].trim()
+      });
+    }
+
+    const hasAnyProposal = updates.length > 0 || jsonModifications.length > 0;
+
+    // Noah issometimes asked to modify memory/personality but just chats back without actually proposing any changes
+    // Catches that here instead of forwarding the false confirmation.
+    const silentModificationFailure = wantsModification && !hasAnyProposal;
+
+    if (silentModificationFailure) {
+      console.warn("MODIFICATION REQUEST PRODUCED NO PROPOSAL — model replied without drafting a change:", aiResponse);
+    }
+
+    if (!aiResponse.includes("I cannot execute") && !aiResponse.includes("I am an AI model")) {
+
+      const isRefusal = aiResponse.includes("cannot execute") || aiResponse.includes("cannot modify") || aiResponse.includes("I am an AI model");
+
+      if (!isRefusal) {
+        const historySafeResponse = silentModificationFailure
+          ? "[Modification request failed: no change was drafted]"
+          : isPureJsonResponse
+          ? `[Proposed modification: ${pendingCommit?.title ?? "changes drafted"}]`
+          : aiResponse.replace(
+              /\[UPDATE:.*?\]\s*```[\s\S]*?```/g,
+              "[UPDATE GENERATED]"
+            );
+
+        conversationHistory.push(`Assistant: ${historySafeResponse}`);
+        saveHistory();
+      }
+    }
+
+    if (conversationHistory.length > 40) {
+      conversationHistory =
+      conversationHistory.slice(-40);
+  }
+
+    if (silentModificationFailure) {
+      return res.json({
+        response: "That didn't actually save — I wasn't able to draft the change, so nothing was updated. Try again, or rephrase it (e.g. \"remember that ...\").",
+        hasProposedChanges: false
       });
     }
 
