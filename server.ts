@@ -985,21 +985,26 @@ app.post('/api/chat', async (req, res) => {
 
     let jsonModifications: Modification[] = [];
     let isPureJsonResponse = false;
+    let matchedJsonBlock = "";
 
     try {
-      const parsed = JSON.parse(aiResponse);
-      isPureJsonResponse = true;
+      const jsonMatch = aiResponse.match(/\{[\s\S]*\}/);
+      if (jsonMatch) {
+        const parsed = JSON.parse(jsonMatch[0]);
+        isPureJsonResponse = true;
+        matchedJsonBlock = jsonMatch[0];
 
-      pendingCommit = parsed.commit ?? null;
+        pendingCommit = parsed.commit ?? null;
 
-      if (Array.isArray(parsed.modifications)) {
-          jsonModifications =
-              parsed.modifications as Modification[];
+        if (Array.isArray(parsed.modifications)) {
+            jsonModifications =
+                parsed.modifications as Modification[];
 
-          console.log(
-              "JSON MODIFICATIONS FOUND:",
-              jsonModifications.length
-          );
+            console.log(
+                "JSON MODIFICATIONS FOUND:",
+                jsonModifications.length
+            );
+        }
       }
     } catch {
       // Not JSON, continue normally
@@ -1174,9 +1179,8 @@ app.post('/api/chat', async (req, res) => {
       gitDiff = runGitCommand(["diff"]);
     }
 
-    // Strip update tags out of conversational response text
     const cleanText = isPureJsonResponse
-      ? ""
+      ? aiResponse.replace(matchedJsonBlock, "").trim()
       : aiResponse.replace(/\[UPDATE:.*?\]\s*```[\s\S]*?```/g, "").trim();
 
     res.json({
@@ -1219,10 +1223,8 @@ console.log(
   ])
 );
 
-// VS Code's Git extension reads .git/COMMIT_EDITMSG and shows it in the
-// Source Control input box whenever that box is empty. Git already writes
-// this file as part of `git commit -m`, but we write it explicitly here too
-// so the exact title/body formatting is guaranteed regardless of git version.
+// VS Code's Git extension reads .git/COMMIT_EDITMSG and shows it in the Source Control input box whenever that box is empty. 
+// Git already writes this file as part of `git commit -m`, but we write it explicitly here too
 try {
   fs.writeFileSync(
     path.join(".git", "COMMIT_EDITMSG"),
