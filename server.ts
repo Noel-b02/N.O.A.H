@@ -250,14 +250,71 @@ async function webSearch(
   }
 }
 
+function extractXmlTag(block: string, tag: string): string {
+  const match = block.match(new RegExp(`<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`, "i"));
+  if (!match) return "";
+  const cdataMatch = match[1].match(/^<!\[CDATA\[([\s\S]*?)\]\]>$/);
+  const raw = cdataMatch ? cdataMatch[1] : match[1];
+  return raw
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#0?39;/g, "'")
+    .replace(/<\/?[^>]+>/g, "")
+    .trim();
+}
+
+async function fetchRssHeadlines(feedUrl: string, limit = 5): Promise<WebSearchResult[]> {
+  try {
+    const res = await fetch(feedUrl);
+    if (!res.ok) {
+      console.error("RSS fetch failed:", feedUrl, res.status);
+      return [];
+    }
+
+    const xml = await res.text();
+    const items: WebSearchResult[] = [];
+    const itemPattern = /<item>([\s\S]*?)<\/item>/g;
+    let match;
+
+    while ((match = itemPattern.exec(xml)) !== null && items.length < limit) {
+      const block = match[1];
+      const title = extractXmlTag(block, "title");
+      const url = extractXmlTag(block, "link");
+      const description = extractXmlTag(block, "description");
+      if (title) items.push({ title, description, url });
+    }
+
+    return items;
+  } catch (err) {
+    console.error("RSS fetch error:", feedUrl, err);
+    return [];
+  }
+}
+
 // "Give me today's headlines" is a fundamentally different task from a
 // factual lookup like "who won the world cup" — it's not searching FOR
 // anything specific, so a plain web search just surfaces static homepages
 // (which rank highest for a bare term like "headlines"). SearXNG's news
 // category plus a day-range filter routes through actual news-aggregator
 // engines and returns real, dated, current articles instead.
+//
+// In practice, of SearXNG's ~17 configured news engines, only "reuters" is
+// consistently working right now — the rest are either broken by upstream
+// site changes (e.g. bing_news.py has an unfixed parser bug) or actively
+// blocked by CAPTCHA/rate-limiting (startpage, duckduckgo, brave), which is
+// a permanent cat-and-mouse reality of scraping-based search, not something
+// that stays fixed once patched. BBC's own RSS feed is added directly as a
+// second reliable, real source — no scraping, no CAPTCHA risk, no API key —
+// so headlines aren't reliant on a single outlet. Skipped for topic-specific
+// searches, since BBC's general front page wouldn't be relevant to those.
 async function fetchTodaysHeadlines(topic?: string): Promise<WebSearchResult[]> {
-  return webSearch(topic?.trim() || "news", { categories: "news", timeRange: "day" });
+  const searxResults = await webSearch(topic?.trim() || "news", { categories: "news", timeRange: "day" });
+  if (topic?.trim()) return searxResults;
+
+  const rssResults = await fetchRssHeadlines("http://feeds.bbci.co.uk/news/rss.xml", 5);
+  return [...searxResults, ...rssResults];
 }
 
 function findArchivesByDate(targetDate: Date): ArchivedSession[] {
