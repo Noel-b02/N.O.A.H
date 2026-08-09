@@ -581,9 +581,44 @@
 
     voiceToggleBtn.addEventListener('click', () => setVoiceOutput(!voiceOutputEnabled));
 
+    // Finds sentence-boundary punctuation (only when followed by whitespace or
+    // end-of-string, via lookahead so it isn't consumed) and slices between
+    // boundaries. The old version matched whole "sentence + punctuation"
+    // chunks directly, which meant a period NOT followed by whitespace (e.g.
+    // inside `personality.txt`, "e.g.", "3.14") made that match attempt fail
+    // outright — and since String.match() with /g just keeps advancing the
+    // search past failed positions, everything before the next successful
+    // match was silently dropped from the array (and never spoken) instead
+    // of just mis-split.
     function splitIntoSentences(text) {
-      const sentences = text.match(/[^.!?]+[.!?]+(?:\s+|$)|[^.!?]+$/g);
-      return (sentences || [text]).map(s => s.trim()).filter(Boolean);
+      const sentences = [];
+      const boundaryPattern = /[.!?]+(?=\s|$)/g;
+      let start = 0;
+      let match;
+      while ((match = boundaryPattern.exec(text)) !== null) {
+        const end = match.index + match[0].length;
+        sentences.push(text.slice(start, end).trim());
+        start = end;
+      }
+      if (start < text.length) sentences.push(text.slice(start).trim());
+
+      const raw = sentences.filter(Boolean);
+      if (raw.length === 0) return [text];
+
+      // Abbreviations like "Dr." or "e.g." are still valid boundaries here
+      // (the period IS followed by whitespace) but shouldn't be sent to TTS
+      // as their own tiny isolated clip — fold anything under this length
+      // into the following chunk instead.
+      const MIN_CHUNK_LENGTH = 12;
+      const merged = [];
+      for (const chunk of raw) {
+        if (merged.length > 0 && merged[merged.length - 1].length < MIN_CHUNK_LENGTH) {
+          merged[merged.length - 1] += ' ' + chunk;
+        } else {
+          merged.push(chunk);
+        }
+      }
+      return merged;
     }
 
     async function fetchSpeechAudioUrl(text) {

@@ -607,9 +607,17 @@ app.post('/api/chat', async (req, res) => {
   const personality = loadFile(PERSONALITY_FILE);
   const memory = loadMemory();
 
-  const wantsModification = REMEMBER_QUESTION_PATTERN.test(message)
-    ? /(modify|change|rewrite|update|edit|improve|refactor|memorize|store|save)/i.test(message)
-    : /(modify|change|rewrite|update|edit|improve|refactor|remember|memorize|store|save)/i.test(message);
+  // "No changes to your personality" / "I didn't change anything" mention the
+  // keyword while explicitly saying nothing should happen — without this,
+  // they trip wantsModification just as wrongly as "do you remember" tripped
+  // it on the word "remember" (see REMEMBER_QUESTION_PATTERN above).
+  const NEGATED_MODIFICATION_PATTERN = /\b(no|not|don'?t|didn'?t|without|never)\s+(\w+\s+){0,2}(changes?|modif(y|ication)|updates?)\b/i;
+
+  const wantsModification = !NEGATED_MODIFICATION_PATTERN.test(message) && (
+    REMEMBER_QUESTION_PATTERN.test(message)
+      ? /(modify|change|rewrite|update|edit|improve|refactor|memorize|store|save)/i.test(message)
+      : /(modify|change|rewrite|update|edit|improve|refactor|remember|memorize|store|save)/i.test(message)
+  );
 
   console.log( "WANTS MODIFICATION:", wantsModification );
 
@@ -784,9 +792,12 @@ app.post('/api/chat', async (req, res) => {
   const SEARCH_TAG_PATTERN = /\[SEARCH:\s*([^\]]+)\]/i;
 
   // Recall queries already have their own dedicated context (archived
-  // conversations); the web-search tag is for outside-world facts the model
-  // doesn't already know, so only offer it outside those two paths.
-  const searchInstructions = (!wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeHeadlinesQuery && !looksLikeSearchQuery && !isStickySearchFollowup) ? `
+  // conversations) and their "I have no record of that day" replies would
+  // otherwise false-positive as uncertainty below — the search fallback only
+  // makes sense for genuine open-ended chat turns, not those paths.
+  const isPlainChatTurn = !wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeHeadlinesQuery && !looksLikeSearchQuery && !isStickySearchFollowup;
+
+  const searchInstructions = isPlainChatTurn ? `
   If answering requires current or real-world information you don't already know — release dates, sports results, news, prices, "when does X come out", "who won Y" — do not guess or make something up. Instead, respond with EXACTLY this and nothing else, no other words:
 
   [SEARCH: concise web search query]
@@ -952,10 +963,24 @@ app.post('/api/chat', async (req, res) => {
     console.log("RAW AI RESPONSE:");
     console.log(aiResponse);
 
+
+    const UNCERTAINTY_PATTERN = /\b(i don'?t know|i do not know|i'?m not (sure|aware|certain)|i am not (sure|aware|certain)|i (can'?t|cannot) (verify|confirm|access)|as of my (last|knowledge)|i (don'?t|do not) have (\w+\s+){0,3}(access|information|real-time|up-to-date|current|internet|any (record|knowledge)|the (latest|current))|beyond my (knowledge|training)|no (real-time|live) (access|data)|i'?m unable to (access|verify|confirm)|i am unable to (access|verify|confirm))\b/i;
+
     const searchMatch = aiResponse.match(SEARCH_TAG_PATTERN);
-    if (searchMatch) {
-      const searchQuery = searchMatch[1].trim();
-      console.log("WEB SEARCH REQUESTED:", searchQuery);
+    const soundsUncertain = isPlainChatTurn && !searchMatch && UNCERTAINTY_PATTERN.test(aiResponse);
+
+    if (searchMatch || soundsUncertain) {
+      let searchQuery: string;
+      if (searchMatch) {
+        searchQuery = searchMatch[1].trim();
+        console.log("WEB SEARCH REQUESTED (via tag):", searchQuery);
+      } else {
+        console.log("MODEL SOUNDED UNCERTAIN — retrying with search. Raw response was:", aiResponse);
+        const queryExtractionPrompt = `Extract a short, focused web search query (3-8 words, no quotes or extra punctuation) that would find the answer to this request. Reply with ONLY the query text and nothing else.\n\nRequest: "${message}"`;
+        const rawQuery = await callOllama(queryExtractionPrompt, 30);
+        searchQuery = rawQuery.replace(/["'\n]+/g, " ").trim() || message;
+        console.log("EXTRACTED QUERY:", searchQuery);
+      }
 
       const results = await webSearch(searchQuery);
       const searchContext = results.length > 0
@@ -966,8 +991,7 @@ app.post('/api/chat', async (req, res) => {
           `Don't list the URLs unless asked — but if the user later asks for the link(s)/source(s), use the exact URLs shown above. Never invent a URL that isn't listed there.\n\n`
         : `--- NOTE: The web search for "${searchQuery}" returned no results (or web search isn't configured). Tell the user you couldn't find current information on this. ---\n\n`;
 
-      // Keep these results (with real URLs) available for a follow-up like
-      // "give me the link to the sites you used".
+      // Keep these results (with real URLs) available for a follow-up like "give me the link to the sites you used".
       stickySearchContext = searchContext;
       stickySearchTurnsRemaining = STICKY_RECALL_FOLLOWUP_TURNS;
 
@@ -1024,7 +1048,7 @@ app.post('/api/chat', async (req, res) => {
 
     const hasAnyProposal = updates.length > 0 || jsonModifications.length > 0;
 
-    // Noah issometimes asked to modify memory/personality but just chats back without actually proposing any changes
+    // Noah is sometimes asked to modify memory/personality but just chats back without actually proposing any changes
     // Catches that here instead of forwarding the false confirmation.
     const silentModificationFailure = wantsModification && !hasAnyProposal;
 
