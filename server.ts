@@ -1054,7 +1054,8 @@ app.post('/api/chat', async (req, res) => {
 
     console.log(`[MODEL] ${selectedModel} | complex=${isComplex}`);
 
-    let aiResponse = await callOllama(fullPrompt, isComplex ? 3000 : 80);
+   
+    let aiResponse = await callOllama(fullPrompt, isComplex ? 3000 : 300);
 
     console.log("RAW AI RESPONSE:");
     console.log(aiResponse);
