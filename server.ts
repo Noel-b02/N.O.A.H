@@ -440,6 +440,11 @@ const RECALL_TRIGGER_PATTERN = /(what did (we|i) (talk|speak) about|what did (i|
 // instruction to store a new memory — unlike an imperative "remember that X".
 const REMEMBER_QUESTION_PATTERN = /\b(do|does|did)\s+(you|we)\s+remember\b/i;
 
+// "I can't remember X" is the user describing their OWN forgetfulness — not
+// an instruction for Noah to store anything — but it contains "remember"
+// just as literally as an imperative would, so it needs the same carve-out.
+const FORGETFUL_STATEMENT_PATTERN = /\b(i|we)\s+(can'?t|cannot|couldn'?t|could not|don'?t|do not)\s+remember\b/i;
+
 function extractTopicKeyword(message: string): string {
   const aboutMatch = message.match(/about\s+(.+?)[\?\.!]?$/i);
   if (aboutMatch) return aboutMatch[1].trim();
@@ -729,7 +734,7 @@ app.post('/api/chat', async (req, res) => {
   const NEGATED_MODIFICATION_PATTERN = /\b(no|not|don'?t|didn'?t|without|never)\s+(\w+\s+){0,2}(changes?|modif(y|ication)|updates?)\b/i;
 
   const wantsModification = !NEGATED_MODIFICATION_PATTERN.test(message) && (
-    REMEMBER_QUESTION_PATTERN.test(message)
+    (REMEMBER_QUESTION_PATTERN.test(message) || FORGETFUL_STATEMENT_PATTERN.test(message))
       ? /(modify|change|rewrite|update|edit|improve|refactor|memorize|store|save)/i.test(message)
       : /(modify|change|rewrite|update|edit|improve|refactor|remember|memorize|store|save)/i.test(message)
   );

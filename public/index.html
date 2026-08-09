@@ -535,6 +535,11 @@
     let bargeInStream = null;
     let bargeInCleanup = null;
     const BARGE_IN_VOLUME_THRESHOLD = 30; // tuned for typical speech vs background noise on a 0-~90 RMS scale
+    // A single loud frame (a click, mic self-noise, a brief bump) shouldn't
+    // cut Noah off — real speech stays above the threshold continuously, so
+    // requiring it to hold for a short stretch filters out one-off spikes
+    // without adding noticeable lag to a genuine interruption.
+    const MIN_SUSTAINED_LOUD_MS = 150;
 
     async function startBargeInListening() {
       if (bargeInStream) return;
@@ -548,9 +553,15 @@
       }
 
       showMicVisualizer('bg-cyan-400');
+      let loudSince = null;
       bargeInCleanup = attachVisualizer(bargeInStream, (rms) => {
-        if (rms > BARGE_IN_VOLUME_THRESHOLD && currentAudio && !currentAudio.paused) {
-          interruptSpeech();
+        if (rms > BARGE_IN_VOLUME_THRESHOLD) {
+          if (loudSince === null) loudSince = performance.now();
+          if (performance.now() - loudSince >= MIN_SUSTAINED_LOUD_MS && currentAudio && !currentAudio.paused) {
+            interruptSpeech();
+          }
+        } else {
+          loudSince = null;
         }
       });
     }
