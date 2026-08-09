@@ -692,6 +692,12 @@ app.post('/api/speak', async (req, res) => {
     res.send(audioBuffer);
   } catch (err: any) {
     console.error("Speech synthesis failed:", err.message);
+
+    if (!speechServiceProcess) {
+      console.warn("[speech] Speech service process is down — attempting to restart it.");
+      startSpeechService().catch(e => console.error("[speech] Restart attempt failed:", e));
+    }
+
     res.status(500).json({ error: `Speech synthesis failed: ${err.message}` });
   }
 });

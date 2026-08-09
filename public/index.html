@@ -646,7 +646,7 @@
       return merged;
     }
 
-    async function fetchSpeechAudioUrl(text) {
+    async function fetchSpeechAudioUrl(text, attempt = 1) {
       try {
         const response = await fetch('/api/speak', {
           method: 'POST',
@@ -655,14 +655,25 @@
         });
 
         if (!response.ok) {
-          console.error('TTS request failed:', await response.text().catch(() => response.status));
+          const detail = await response.text().catch(() => response.status);
+          if (attempt < 2) {
+            console.warn('TTS request failed, retrying once:', detail);
+            await new Promise(r => setTimeout(r, 1000));
+            return fetchSpeechAudioUrl(text, attempt + 1);
+          }
+          console.error('TTS request failed after retry:', detail);
           return null;
         }
 
         const audioBlob = await response.blob();
         return URL.createObjectURL(audioBlob);
       } catch (err) {
-        console.error('TTS error:', err);
+        if (attempt < 2) {
+          console.warn('TTS error, retrying once:', err);
+          await new Promise(r => setTimeout(r, 1000));
+          return fetchSpeechAudioUrl(text, attempt + 1);
+        }
+        console.error('TTS error after retry:', err);
         return null;
       }
     }
@@ -689,6 +700,7 @@
       await startBargeInListening();
 
       let nextAudioPromise = fetchSpeechAudioUrl(sentences[0]);
+      let hadFailure = false;
 
       for (let i = 0; i < sentences.length; i++) {
         const audioUrl = await nextAudioPromise;
@@ -696,8 +708,18 @@
 
         nextAudioPromise = i + 1 < sentences.length ? fetchSpeechAudioUrl(sentences[i + 1]) : null;
 
-        if (audioUrl) await playAudioUrl(audioUrl);
+        if (audioUrl) {
+          await playAudioUrl(audioUrl);
+        } else {
+          hadFailure = true;
+        }
         if (myToken !== speechQueueToken) return;
+      }
+
+      // One message even if multiple sentences failed — not one per sentence,
+      // to avoid spamming the chat if the speech service is down entirely.
+      if (hadFailure) {
+        appendMessage('system', 'VOICE SYNTHESIS FAILED FOR PART OF THIS RESPONSE.');
       }
 
       if (myToken === speechQueueToken) stopBargeInListening();

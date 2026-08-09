@@ -1,8 +1,15 @@
+# Install torch FIRST, separately, before this file — see SPEECH_SETUP.md.
+# Mixing a CUDA-specific --index-url with a plain requirements.txt install is
+# unreliable for a package (torch) that's published under the same name on
+# both PyPI (CPU-only) and PyTorch's own index (CUDA) — pip's resolver can
+# silently pick either one depending on install order. Installing it as its
+# own explicit step avoids that ambiguity entirely.
 fastapi
 uvicorn[standard]
 python-multipart
 python-dotenv
+pydantic
 faster-whisper
 kokoro>=0.9.4
 soundfile
-torch
+numpy

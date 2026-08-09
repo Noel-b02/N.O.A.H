@@ -4,10 +4,10 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "predev": "tsx scripts/ensure-searxng.ts",
+    "predev": "tsx scripts/ensure-ollama.ts && tsx scripts/ensure-searxng.ts",
     "dev": "tsx server.ts",
     "build": "tsc",
-    "prestart": "tsx scripts/ensure-searxng.ts",
+    "prestart": "tsx scripts/ensure-ollama.ts && tsx scripts/ensure-searxng.ts",
     "start": "node dist/server.js"
   },
   "keywords": [],
