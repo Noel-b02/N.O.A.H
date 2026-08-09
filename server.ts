@@ -515,6 +515,64 @@ app.get('/api/status', (_, res) => {
   });
 });
 
+interface GpuStats {
+  utilizationPercent: number;
+  temperatureC: number;
+  vramUsedMB: number;
+  vramTotalMB: number;
+}
+
+function getGpuStats(): GpuStats | null {
+  try {
+    const output = execFileSync("nvidia-smi", [
+      "--query-gpu=utilization.gpu,temperature.gpu,memory.used,memory.total",
+      "--format=csv,noheader,nounits"
+    ], { encoding: "utf8", timeout: 3000 });
+
+    const [util, temp, used, total] = output.trim().split(",").map(s => parseFloat(s.trim()));
+    if ([util, temp, used, total].some(Number.isNaN)) return null;
+
+    return { utilizationPercent: util, temperatureC: temp, vramUsedMB: used, vramTotalMB: total };
+  } catch {
+    // No NVIDIA GPU, driver not installed, or nvidia-smi not on PATH.
+    return null;
+  }
+}
+
+async function isServiceHealthy(url: string, timeoutMs = 2000): Promise<boolean> {
+  try {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    const res = await fetch(url, { signal: controller.signal });
+    clearTimeout(timeout);
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+// Real system telemetry for the HUD, replacing what used to be Math.random()
+// fake fluctuations — CORE INTEGRITY reflects whether the backing services
+// (Ollama, SearXNG, the speech service) are actually reachable, and NEURAL
+// LOAD / MODEL TEMP read genuine GPU utilization and temperature.
+app.get('/api/hud-metrics', async (_, res) => {
+  const [ollamaHealthy, searxngHealthy, speechHealthy] = await Promise.all([
+    isServiceHealthy(OLLAMA_URL.replace(/\/api\/generate$/, "/api/version")),
+    isServiceHealthy(`${SEARXNG_URL}/healthz`),
+    isServiceHealthy(`${SPEECH_SERVICE_URL}/health`)
+  ]);
+
+  const services = { ollama: ollamaHealthy, searxng: searxngHealthy, speech: speechHealthy };
+  const healthyCount = Object.values(services).filter(Boolean).length;
+  const coreIntegrityPercent = (healthyCount / Object.keys(services).length) * 100;
+
+  res.json({
+    coreIntegrityPercent,
+    services,
+    gpu: getGpuStats()
+  });
+});
+
 // API: Speech-to-text — forwards recorded audio to the local Whisper service
 // and returns the transcribed text. Uses express.raw() scoped to just this
 // route since the body here is binary audio, not JSON.
@@ -632,12 +690,22 @@ app.post('/api/chat', async (req, res) => {
   // get the archived context and the smarter model.
   const isStickyRecallFollowup = !wantsModification && !isRecallQuery && stickyRecallTurnsRemaining > 0;
 
+  // "What does core integrity mean" is answered fine from the general
+  // explanation now in personality.txt — but "why isn't it 100%" or "what's
+  // down" needs the actual live health state, which the model has no way to
+  // know on its own. This always fetches fresh (no sticky reuse): unlike a
+  // search result, service health can flip within seconds, so reusing stale
+  // status from a previous turn would risk telling the user a service is
+  // down when it's since recovered, or vice versa.
+  const STATUS_TRIGGER_PATTERN = /\b(core integrity|neural load|model temp|diverg(ence)?[\s_-]?buf(fer)?|system status|what'?s down|which service|is (everything|anything) (down|broken|working|up)|are you (down|working|online)|health check)\b/i;
+  const looksLikeStatusQuery = !wantsModification && !isRecallQuery && !isStickyRecallFollowup && STATUS_TRIGGER_PATTERN.test(message);
+
   // "Give me today's headlines" is a news-digest request, not a factual
   // lookup — it gets its own trigger and its own fetch path (SearXNG's news
   // category + day filter) rather than a plain web search, which just
   // surfaces static homepages for a bare term like "headlines".
   const HEADLINES_TRIGGER_PATTERN = /\b(headlines|breaking news|today'?s news|news today|on the news|what'?s (been )?reported|happening in the world)\b/i;
-  const looksLikeHeadlinesQuery = !wantsModification && !isRecallQuery && !isStickyRecallFollowup && HEADLINES_TRIGGER_PATTERN.test(message);
+  const looksLikeHeadlinesQuery = !wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeStatusQuery && HEADLINES_TRIGGER_PATTERN.test(message);
 
   // Deterministic web-search trigger for common "needs current info" phrasings
   // — mirrors the recall-trigger approach above rather than relying on the
@@ -647,16 +715,17 @@ app.post('/api/chat', async (req, res) => {
   // hallucinate an excuse instead. Catching the obvious cases here means the
   // search actually happens instead of being gated on model cooperation.
   const SEARCH_TRIGGER_PATTERN = /\b(latest news|who won|release date|launch date|premiere date|when('s| is| does| will).{0,30}(come out|coming out|releas(e|ing)|drop(ping)?|launch(ing)?|premier(e|ing))|current (weather|price|score|exchange rate)|how much (is|does|would)|price of|what'?s the weather|weather (today|forecast|right now))\b/i;
-  const looksLikeSearchQuery = !wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeHeadlinesQuery && SEARCH_TRIGGER_PATTERN.test(message);
+  const looksLikeSearchQuery = !wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeStatusQuery && !looksLikeHeadlinesQuery && SEARCH_TRIGGER_PATTERN.test(message);
 
   // A follow-up on an already-answered search or headlines request (e.g.
   // "give me the link to the sites you used", "which one said that") —
   // needs the same results (with real URLs) rather than the model
   // improvising from its own summary.
-  const isStickySearchFollowup = !wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeHeadlinesQuery && !looksLikeSearchQuery && stickySearchTurnsRemaining > 0;
+  const isStickySearchFollowup = !wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeStatusQuery && !looksLikeHeadlinesQuery && !looksLikeSearchQuery && stickySearchTurnsRemaining > 0;
 
   console.log("IS RECALL QUERY:", isRecallQuery);
   console.log("IS STICKY RECALL FOLLOWUP:", isStickyRecallFollowup, "| turns remaining:", stickyRecallTurnsRemaining);
+  console.log("LOOKS LIKE STATUS QUERY:", looksLikeStatusQuery);
   console.log("LOOKS LIKE HEADLINES QUERY:", looksLikeHeadlinesQuery);
   console.log("LOOKS LIKE SEARCH QUERY:", looksLikeSearchQuery);
   console.log("IS STICKY SEARCH FOLLOWUP:", isStickySearchFollowup, "| turns remaining:", stickySearchTurnsRemaining);
@@ -667,7 +736,7 @@ app.post('/api/chat', async (req, res) => {
   // they need to reliably produce structured JSON output.
   const wordCount = message.trim().split(/\s+/).length;
 
-  const isComplex = wantsModification || isRecallQuery || isStickyRecallFollowup || looksLikeHeadlinesQuery || looksLikeSearchQuery || isStickySearchFollowup || (
+  const isComplex = wantsModification || isRecallQuery || isStickyRecallFollowup || looksLikeStatusQuery || looksLikeHeadlinesQuery || looksLikeSearchQuery || isStickySearchFollowup || (
     wordCount > 5 && /(typescript|javascript|debug|refactor|git|branch)/i.test(message)
   );
 
@@ -795,7 +864,7 @@ app.post('/api/chat', async (req, res) => {
   // conversations) and their "I have no record of that day" replies would
   // otherwise false-positive as uncertainty below — the search fallback only
   // makes sense for genuine open-ended chat turns, not those paths.
-  const isPlainChatTurn = !wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeHeadlinesQuery && !looksLikeSearchQuery && !isStickySearchFollowup;
+  const isPlainChatTurn = !wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeStatusQuery && !looksLikeHeadlinesQuery && !looksLikeSearchQuery && !isStickySearchFollowup;
 
   const searchInstructions = isPlainChatTurn ? `
   If answering requires current or real-world information you don't already know — release dates, sports results, news, prices, "when does X come out", "who won Y" — do not guess or make something up. Instead, respond with EXACTLY this and nothing else, no other words:
@@ -902,6 +971,33 @@ app.post('/api/chat', async (req, res) => {
       stickyRecallTurnsRemaining--;
 
       console.log("USING STICKY RECALL CONTEXT, turns left after this:", stickyRecallTurnsRemaining);
+    } else if (looksLikeStatusQuery) {
+      console.log("FETCHING LIVE SYSTEM STATUS");
+      const [ollamaHealthy, searxngHealthy, speechHealthy] = await Promise.all([
+        isServiceHealthy(OLLAMA_URL.replace(/\/api\/generate$/, "/api/version")),
+        isServiceHealthy(`${SEARXNG_URL}/healthz`),
+        isServiceHealthy(`${SPEECH_SERVICE_URL}/health`)
+      ]);
+      const statusServices = [
+        { name: "Ollama (language model)", healthy: ollamaHealthy },
+        { name: "SearXNG (web search)", healthy: searxngHealthy },
+        { name: "Speech service (voice input/output)", healthy: speechHealthy }
+      ];
+      const healthyCount = statusServices.filter(s => s.healthy).length;
+      const coreIntegrityPercent = (healthyCount / statusServices.length) * 100;
+      const gpu = getGpuStats();
+
+      recallContext = `--- LIVE SYSTEM STATUS ---\n` +
+        `Core Integrity: ${coreIntegrityPercent.toFixed(2)}% (${healthyCount}/${statusServices.length} services healthy)\n` +
+        statusServices.map(s => `- ${s.name}: ${s.healthy ? "UP" : "DOWN"}`).join("\n") +
+        (gpu
+          ? `\nNeural Load (GPU utilization): ${gpu.utilizationPercent}%\nModel Temp (GPU temperature): ${gpu.temperatureC}°C\nVRAM: ${gpu.vramUsedMB}MB / ${gpu.vramTotalMB}MB`
+          : `\nGPU stats unavailable (no NVIDIA GPU detected, or nvidia-smi isn't on PATH).`) +
+        `\n--- END LIVE SYSTEM STATUS ---\n` +
+        `Answer the user's question using this real, current status data. If any service is DOWN, name it specifically. Do not guess or make up different numbers.\n\n`;
+
+      console.log("LIVE STATUS CONTEXT:");
+      console.log(recallContext);
     } else if (looksLikeHeadlinesQuery) {
       console.log("FETCHING TODAY'S HEADLINES");
       const results = await fetchTodaysHeadlines();

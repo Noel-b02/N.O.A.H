@@ -104,19 +104,19 @@
       </div>
     </div>
 
-    <!-- Live Telemetry Monitor (Updates via JS interval) -->
+    <!-- Live Telemetry Monitor (real data via /api/hud-metrics, polled by JS) -->
     <div class="hidden lg:flex items-center space-x-8 font-mono text-[10px] text-slate-500 border-l border-slate-800 pl-8">
       <div>
-        CORE INTEGRITY: <span id="telemetry-integrity" class="text-cyan-400 font-bold">99.98%</span>
+        CORE INTEGRITY: <span id="telemetry-integrity" class="text-cyan-400 font-bold">--%</span>
       </div>
       <div>
-        NEURAL LOAD: <span id="telemetry-load" class="text-cyan-400 font-bold">12.4%</span>
+        NEURAL LOAD: <span id="telemetry-load" class="text-cyan-400 font-bold">--%</span>
       </div>
       <div>
-        MODEL TEMP: <span id="telemetry-temp" class="text-cyan-400 font-bold">0.72℃</span>
+        MODEL TEMP: <span id="telemetry-temp" class="text-cyan-400 font-bold">--℃</span>
       </div>
       <div>
-        DIVERG_BUF: <span id="telemetry-divergence" class="text-rose-500 font-bold">0.00%</span>
+        DIVERG_BUF: <span id="telemetry-divergence" class="text-rose-500 font-bold">0 LINES</span>
       </div>
     </div>
 
@@ -289,30 +289,44 @@
     const micBtn = document.getElementById('mic-btn');
     const voiceToggleBtn = document.getElementById('voice-toggle-btn');
 
-    // Simulate active system telemetry fluctuations
-    setInterval(() => {
-      // Core integrity fluctuates within 99.95 - 100
-      const integrity = (99.9 + Math.random() * 0.1).toFixed(3);
-      document.getElementById('telemetry-integrity').textContent = `${integrity}%`;
+    // Real system telemetry: CORE INTEGRITY reflects whether Ollama, SearXNG,
+    // and the speech service actually respond; NEURAL LOAD / MODEL TEMP read
+    // genuine GPU utilization/temperature via /api/hud-metrics (nvidia-smi on
+    // the server). DIVERG_BUF is the real changed-line count of whatever
+    // diff is currently pending review, tracked in pendingDiffChangedLines.
+    // Named "hud-metrics" rather than "telemetry" — ad-blockers/privacy
+    // extensions commonly blocklist that exact word in URLs (it's strongly
+    // associated with analytics/tracking endpoints) and silently drop the
+    // request client-side, which is indistinguishable from a real network
+    // failure without checking the console.
+    async function updateTelemetry() {
+      try {
+        const response = await fetch('/api/hud-metrics');
+        const data = await response.json();
 
-      // Temperature oscillates around 0.7℃
-      const temp = (0.65 + Math.random() * 0.1).toFixed(2);
-      document.getElementById('telemetry-temp').textContent = `${temp}℃`;
+        document.getElementById('telemetry-integrity').textContent = `${data.coreIntegrityPercent.toFixed(2)}%`;
 
-      // Update divergence load back to zero when no mutation is active
-      if (diffPanel.classList.contains('hidden')) {
-        document.getElementById('telemetry-divergence').textContent = `0.00%`;
-        // Idle Neural load
-        const load = (8.0 + Math.random() * 6).toFixed(1);
-        document.getElementById('telemetry-load').textContent = `${load}%`;
-      } else {
-        // Warning state divergence and high load
-        const divergence = (24.1 + Math.random() * 12).toFixed(2);
-        document.getElementById('telemetry-divergence').textContent = `${divergence}%`;
-        const load = (75 + Math.random() * 15).toFixed(1);
-        document.getElementById('telemetry-load').textContent = `${load}%`;
+        if (data.gpu) {
+          document.getElementById('telemetry-load').textContent = `${data.gpu.utilizationPercent.toFixed(1)}%`;
+          document.getElementById('telemetry-temp').textContent = `${data.gpu.temperatureC.toFixed(0)}℃`;
+        } else {
+          document.getElementById('telemetry-load').textContent = 'N/A';
+          document.getElementById('telemetry-temp').textContent = 'N/A';
+        }
+      } catch (err) {
+        console.error('Telemetry fetch failed:', err);
+        document.getElementById('telemetry-integrity').textContent = '0.00%';
+        document.getElementById('telemetry-load').textContent = 'N/A';
+        document.getElementById('telemetry-temp').textContent = 'N/A';
       }
-    }, 1500);
+
+      document.getElementById('telemetry-divergence').textContent = diffPanel.classList.contains('hidden')
+        ? '0 LINES'
+        : `${pendingDiffChangedLines} LINES`;
+    }
+
+    updateTelemetry();
+    setInterval(updateTelemetry, 3000);
 
     // Shifts the visual state of the Concentric Holographic Core
     function setCoreState(state) {
@@ -876,6 +890,10 @@
       if (el) el.remove();
     }
 
+    // Real count of changed lines in the currently-pending diff, shown as
+    // DIVERG_BUF in the header telemetry instead of a random percentage.
+    let pendingDiffChangedLines = 0;
+
     function showDiff(diffString, commit) {
       diffContainer.innerHTML = '';
       diffPanel.classList.remove('hidden');
@@ -892,14 +910,20 @@
 
       if (!diffString) {
         diffContainer.innerHTML = '<div class="text-slate-600 font-mono text-center mt-12 tracking-widest">ZERO ALIGNMENT DEVIATION RECORDED.</div>';
+        pendingDiffChangedLines = 0;
         return;
       }
 
       const lines = diffString.split('\n');
+      pendingDiffChangedLines = lines.filter(line =>
+        (line.startsWith('+') && !line.startsWith('+++')) ||
+        (line.startsWith('-') && !line.startsWith('---'))
+      ).length;
+
       lines.forEach(line => {
         const div = document.createElement('div');
         div.className = 'diff-font py-0.5 px-3 rounded tracking-wider border-l-2 mb-1';
-        
+
         if (line.startsWith('+') && !line.startsWith('+++')) {
           div.className += ' text-emerald-400 bg-emerald-950/20 border-emerald-500';
         } else if (line.startsWith('-') && !line.startsWith('---')) {
@@ -942,6 +966,7 @@
 
         diffPanel.classList.add('hidden');
         commitInfo.classList.add('hidden');
+        pendingDiffChangedLines = 0;
         setCoreState('idle');
         
         if (endpoint === 'approve') {
