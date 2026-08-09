@@ -19,6 +19,12 @@ const CHAT_MODEL = process.env.OLLAMA_CHAT_MODEL ?? "qwen3.5:4b";
 const CODE_MODEL = process.env.OLLAMA_CODE_MODEL ?? "qwen3.5:9b";
 
 const SEARXNG_URL = process.env.SEARXNG_URL ?? "http://localhost:8080";
+const FUSION_BRIDGE_URL = process.env.FUSION_BRIDGE_URL ?? "http://localhost:9000";
+
+const IMAGE23D_DIR = path.join(__dirname, "image23d");
+const IMAGE23D_TMP_DIR = path.join(IMAGE23D_DIR, "tmp");
+const TRIPOSR_DIR = path.join(IMAGE23D_DIR, "TripoSR");
+const TRIPOSR_PYTHON = path.join(TRIPOSR_DIR, "venv", "Scripts", "python.exe");
 
 const PERSONALITY_FILE = "personality.txt";
 const MEMORY_FILE = "memories/memory.json";
@@ -613,6 +619,228 @@ async function isServiceHealthy(url: string, timeoutMs = 2000): Promise<boolean>
   }
 }
 
+interface FusionExecutionResult {
+  success: boolean;
+  error?: string | null;
+}
+
+// Talks to the NoahFusionBridge add-in (fusion-bridge/NoahFusionBridge) —
+// a local HTTP server that only exists while Fusion 360 is running with that
+// add-in active. Executes generated Python against the live Fusion API on
+// Fusion's main thread (see the add-in's own comments for why that hand-off
+// is necessary) and reports back whether it actually succeeded.
+async function executeFusionScript(code: string): Promise<FusionExecutionResult> {
+  try {
+    const res = await fetch(`${FUSION_BRIDGE_URL}/execute`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ code }),
+      signal: AbortSignal.timeout(35000)
+    });
+
+    if (!res.ok) {
+      return { success: false, error: `Fusion bridge returned HTTP ${res.status}` };
+    }
+
+    return await res.json() as FusionExecutionResult;
+  } catch (err: any) {
+    return {
+      success: false,
+      error: `Could not reach the Fusion 360 bridge at ${FUSION_BRIDGE_URL}: ${err.message}. ` +
+        `Is Fusion 360 running with the NoahFusionBridge add-in active?`
+    };
+  }
+}
+
+// Pulls the named subject out of an image-based Fusion request (e.g. "create
+// a 3d model of spiderman in fusion" -> "spiderman") so it can be used as
+// both the image search query and the reply text, without needing a
+// dedicated Ollama call just to extract a noun phrase.
+// Matches a trailing sizing instruction (e.g. ", make it 5cm", "5cm tall",
+// "about 2 inches") so it can be stripped before subject extraction — left
+// in place, it either gets glued onto the subject text (breaking the image
+// search query) or its own "make" verb gets caught by the verb-stripping
+// regex below, leaving a mangled leftover like "it 5cm".
+const SIZE_CLAUSE_PATTERN = /,?\s*\b(?:make (?:it|the model)\s+|about\s+|roughly\s+|sized?\s+(?:at\s+)?|at\s+)?\d+(?:\.\d+)?\s?(?:millimeters?|mm|centimeters?|cm|meters?|m|inches?|in|feet|ft)\b(?:\s+(?:tall|high|wide|long|in\s+(?:height|size)))?/i;
+
+function extractFusionSubject(message: string): string {
+  const withoutSize = message.replace(SIZE_CLAUSE_PATTERN, "").trim();
+  const ofMatch = withoutSize.match(/\bof\s+(?:a|an|the)\s+(.+?)[\?\.!]*$/i) ?? withoutSize.match(/\bof\s+(.+?)[\?\.!]*$/i);
+  const raw = ofMatch ? ofMatch[1] : withoutSize.replace(/\b(create|make|generate|build|design)\b/gi, "").replace(/\b(a|an|the)\b/gi, "");
+  // The "of ..." match is greedy to end-of-string, so it swallows trailing
+  // trigger phrases too (e.g. "of a fox in fusion 360" -> "fox in fusion
+  // 360") — strip those out regardless of which branch produced the string.
+  return raw
+    .replace(/\b(3d models?|3d shapes?|cad models?|in fusion(?: ?360)?)\b/gi, "")
+    .trim();
+}
+
+// Looks for a "<number> <unit>" size mention (e.g. "5cm", "2 inches", "10mm
+// tall") and converts it to centimeters — the unit the Fusion import step
+// already treats TripoSR's raw output numbers as. Requires the unit to
+// immediately follow a digit, so ordinary words like "fox in fusion 360"
+// (which contains "in") don't false-positive.
+const SIZE_PATTERN = /(\d+(?:\.\d+)?)\s?(millimeters?|mm|centimeters?|cm|meters?|m\b|inches?|in\b|feet|ft\b)/i;
+
+function extractTargetSizeCm(message: string): number | null {
+  const match = message.match(SIZE_PATTERN);
+  if (!match) return null;
+  const value = parseFloat(match[1]);
+  const unit = match[2].toLowerCase();
+  if (unit.startsWith("mm") || unit.startsWith("millimet")) return value / 10;
+  if (unit.startsWith("cm") || unit.startsWith("centimet")) return value;
+  if (unit === "m" || unit.startsWith("meter")) return value * 100;
+  if (unit.startsWith("in")) return value * 2.54;
+  if (unit.startsWith("ft") || unit.startsWith("feet")) return value * 30.48;
+  return null;
+}
+
+// Rescales the generated mesh (via trimesh, already installed for TripoSR)
+// so its largest bounding-box dimension matches the requested size, before
+// it ever reaches Fusion — sidesteps relying on Fusion's own scale tooling
+// supporting mesh bodies, which isn't clearly documented either way. Writes
+// to a separate output file rather than overwriting the input: if this step
+// fails partway, the original mesh must still be importable as a fallback.
+function scaleMeshToTargetSize(meshPath: string, targetSizeCm: number): Promise<string | null> {
+  return new Promise((resolve) => {
+    const scaledPath = meshPath.replace(/\.obj$/i, "_scaled.obj");
+    const child = spawn(TRIPOSR_PYTHON, [path.join(IMAGE23D_DIR, "scale_mesh.py"), meshPath, String(targetSizeCm), scaledPath]);
+    let stderr = "";
+    child.stderr.on("data", (d) => { stderr += d.toString(); });
+    child.on("error", (err) => {
+      console.error("Failed to launch mesh scaling step:", err.message);
+      resolve(null);
+    });
+    child.on("exit", (code) => {
+      if (code !== 0 || !fs.existsSync(scaledPath)) {
+        console.error("Mesh scaling step failed:", stderr.trim().slice(-1000));
+        resolve(null);
+        return;
+      }
+      resolve(scaledPath);
+    });
+  });
+}
+
+// SearXNG's image category, used to find a reference photo for a named
+// subject before running it through the local image-to-3D model.
+async function webImageSearch(query: string): Promise<string[]> {
+  try {
+    const url = `${SEARXNG_URL}/search?q=${encodeURIComponent(query)}&format=json&categories=images`;
+    const res = await fetch(url);
+
+    if (!res.ok) {
+      console.error("SearXNG image search failed:", res.status, await res.text().catch(() => ""));
+      return [];
+    }
+
+    const data = await res.json() as { results?: any[] };
+    return (data.results ?? [])
+      .map((r: any) => r.img_src as string)
+      .filter((src: unknown): src is string => typeof src === "string" && /^https?:\/\//.test(src));
+  } catch (err) {
+    console.error("Web image search error (is SearXNG running at " + SEARXNG_URL + "?):", err);
+    return [];
+  }
+}
+
+async function downloadImageToFile(imageUrl: string, destPath: string): Promise<boolean> {
+  try {
+    // Some image hosts reject requests with no browser-like User-Agent
+    // (hotlink protection) — SearXNG's image results come from arbitrary
+    // sites, so this needs to look like a normal browser fetch.
+    const res = await fetch(imageUrl, {
+      signal: AbortSignal.timeout(15000),
+      headers: { "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36" }
+    });
+    if (!res.ok) {
+      console.error("Reference image download failed:", imageUrl, "HTTP", res.status);
+      return false;
+    }
+    const buffer = Buffer.from(await res.arrayBuffer());
+    fs.mkdirSync(path.dirname(destPath), { recursive: true });
+    fs.writeFileSync(destPath, buffer);
+    return true;
+  } catch (err) {
+    console.error("Reference image download error:", imageUrl, err);
+    return false;
+  }
+}
+
+interface MeshGenerationResult {
+  success: boolean;
+  meshPath?: string;
+  error?: string;
+}
+
+// Runs TripoSR (image23d/TripoSR) as a one-off child process rather than a
+// persistent service — this is a rarely-used, GPU-heavy step, and keeping it
+// out-of-process means it doesn't hold VRAM hostage from Ollama/Kokoro the
+// rest of the time. See IMAGE23D_SETUP.md for the venv this expects.
+function generateMeshFromImage(imagePath: string): Promise<MeshGenerationResult> {
+  return new Promise((resolve) => {
+    if (!fs.existsSync(TRIPOSR_PYTHON)) {
+      resolve({ success: false, error: `TripoSR venv not found at ${TRIPOSR_PYTHON} — see IMAGE23D_SETUP.md.` });
+      return;
+    }
+
+    const outputDir = path.join(TRIPOSR_DIR, "output");
+    const child = spawn(TRIPOSR_PYTHON, ["run.py", imagePath, "--output-dir", outputDir], { cwd: TRIPOSR_DIR });
+
+    let stderr = "";
+    child.stderr.on("data", (d) => { stderr += d.toString(); });
+
+    const timeout = setTimeout(() => {
+      child.kill();
+      resolve({ success: false, error: "TripoSR generation timed out after 3 minutes." });
+    }, 180000);
+
+    child.on("error", (err) => {
+      clearTimeout(timeout);
+      resolve({ success: false, error: `Failed to launch TripoSR: ${err.message}` });
+    });
+
+    child.on("exit", (code) => {
+      clearTimeout(timeout);
+      if (code !== 0) {
+        resolve({ success: false, error: stderr.trim().slice(-2000) || `TripoSR exited with code ${code}` });
+        return;
+      }
+      const meshPath = path.join(outputDir, "0", "mesh.obj");
+      if (!fs.existsSync(meshPath)) {
+        resolve({ success: false, error: "TripoSR finished but no mesh.obj was produced." });
+        return;
+      }
+      resolve({ success: true, meshPath });
+    });
+  });
+}
+
+// Mirrors executeFusionScript's shape, but hits the bridge's mesh-import
+// endpoint instead of exec()'ing generated code.
+async function importMeshToFusion(meshPath: string): Promise<FusionExecutionResult> {
+  try {
+    const res = await fetch(`${FUSION_BRIDGE_URL}/import-mesh`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path: meshPath }),
+      signal: AbortSignal.timeout(35000)
+    });
+
+    if (!res.ok) {
+      return { success: false, error: `Fusion bridge returned HTTP ${res.status}` };
+    }
+
+    return await res.json() as FusionExecutionResult;
+  } catch (err: any) {
+    return {
+      success: false,
+      error: `Could not reach the Fusion 360 bridge at ${FUSION_BRIDGE_URL}: ${err.message}. ` +
+        `Is Fusion 360 running with the NoahFusionBridge add-in active?`
+    };
+  }
+}
+
 // Real system telemetry for the HUD, replacing what used to be Math.random()
 // fake fluctuations — CORE INTEGRITY reflects whether the backing services
 // (Ollama, SearXNG, the speech service) are actually reachable, and NEURAL
@@ -778,6 +1006,28 @@ app.post('/api/chat', async (req, res) => {
   // improvising from its own summary.
   const isStickySearchFollowup = !wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeStatusQuery && !looksLikeHeadlinesQuery && !looksLikeSearchQuery && stickySearchTurnsRemaining > 0;
 
+  // Requires an explicit "3d model"/"cad model"/"in fusion" mention alongside
+  // a creation verb — kept deliberately narrow since this triggers real code
+  // execution inside a running Fusion 360 session, not just a chat response.
+  const FUSION_TRIGGER_PATTERN = /\b(create|make|generate|build|design|remove|delete|clear)\b.{0,40}\b(3d models?|3d shapes?|cad models?|in fusion(?: ?360)?)\b/i;
+  const looksLikeFusionRequest = !wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeStatusQuery && !looksLikeHeadlinesQuery && !looksLikeSearchQuery && !isStickySearchFollowup && FUSION_TRIGGER_PATTERN.test(message);
+
+  // A Fusion request either describes explicit parametric geometry (shape
+  // words, dimensions) — handled by the existing code-generation path — or
+  // names a real-world subject with none of that vocabulary (e.g. "a 3d
+  // model of spiderman"), which the model can't write CAD code for at all.
+  // Those instead go through the image-to-3D pipeline: find a reference
+  // photo, run it through a local image-to-mesh model, import the result.
+  // Removal requests always stay on the code path (there's no image
+  // involved in deleting existing bodies).
+  const REMOVAL_VERB_PATTERN = /\b(remove|delete|clear)\b/i;
+  // Deliberately excludes bare dimension mentions (e.g. "5cm") — a named
+  // subject like "a fox, make it 5cm tall" should still go through the
+  // image pipeline; only an actual shape word means parametric CAD code.
+  const SHAPE_WORD_PATTERN = /\b(cylinder|box|cube|sphere|cone|rectangle|pyramid|prism|torus|ring|tube|wedge|radius|diameter|extrude|revolve|fillet|chamfer)\b/i;
+  const looksLikeImageFusionRequest = looksLikeFusionRequest && !REMOVAL_VERB_PATTERN.test(message) && !SHAPE_WORD_PATTERN.test(message);
+  const looksLikeParametricFusionRequest = looksLikeFusionRequest && !looksLikeImageFusionRequest;
+
   // Ollama's "thinking" mode measurably improves how carefully the model reasons through a request, but costs ~10-15+ seconds of extra latency
   // per response (tested directly: a trivial one-sentence question took
   // 15.5s with it on vs ~1-2s off) — far too slow to enable by default, but worth it when the user explicitly asks for more thoroughness.
@@ -790,6 +1040,7 @@ app.post('/api/chat', async (req, res) => {
   console.log("LOOKS LIKE HEADLINES QUERY:", looksLikeHeadlinesQuery);
   console.log("LOOKS LIKE SEARCH QUERY:", looksLikeSearchQuery);
   console.log("IS STICKY SEARCH FOLLOWUP:", isStickySearchFollowup, "| turns remaining:", stickySearchTurnsRemaining);
+  console.log("LOOKS LIKE FUSION REQUEST:", looksLikeFusionRequest, "| parametric:", looksLikeParametricFusionRequest, "| image-based:", looksLikeImageFusionRequest);
   console.log("WANTS DEEPER THINKING:", wantsDeeperThinking);
 
   // Short messages like ("hi", "thanks", "ok") are never complex on keyword grounds alone —
@@ -798,7 +1049,7 @@ app.post('/api/chat', async (req, res) => {
   // they need to reliably produce structured JSON output.
   const wordCount = message.trim().split(/\s+/).length;
 
-  const isComplex = wantsModification || isRecallQuery || isStickyRecallFollowup || looksLikeStatusQuery || looksLikeHeadlinesQuery || looksLikeSearchQuery || isStickySearchFollowup || (
+  const isComplex = wantsModification || isRecallQuery || isStickyRecallFollowup || looksLikeStatusQuery || looksLikeHeadlinesQuery || looksLikeSearchQuery || isStickySearchFollowup || looksLikeFusionRequest || (
     wordCount > 5 && /(typescript|javascript|debug|refactor|git|branch)/i.test(message)
   );
 
@@ -926,7 +1177,7 @@ app.post('/api/chat', async (req, res) => {
   // conversations) and their "I have no record of that day" replies would
   // otherwise false-positive as uncertainty below — the search fallback only
   // makes sense for genuine open-ended chat turns, not those paths.
-  const isPlainChatTurn = !wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeStatusQuery && !looksLikeHeadlinesQuery && !looksLikeSearchQuery && !isStickySearchFollowup;
+  const isPlainChatTurn = !wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeStatusQuery && !looksLikeHeadlinesQuery && !looksLikeSearchQuery && !isStickySearchFollowup && !looksLikeFusionRequest;
 
   const searchInstructions = isPlainChatTurn ? `
   If answering requires current or real-world information you don't already know — release dates, sports results, news, prices, "when does X come out", "who won Y" — do not guess or make something up. Instead, respond with EXACTLY this and nothing else, no other words:
@@ -957,9 +1208,17 @@ app.post('/api/chat', async (req, res) => {
   try {
     const controller = new AbortController();
 
+    // Was 90s — too tight for Fusion code generation specifically, which can
+    // legitimately take well over a minute if the model rambles through a
+    // harder multi-step request (observed directly: sometimes 6-7s, sometimes
+    // much longer for the exact same prompt, since temperature>0 means it
+    // isn't deterministic). A slow-but-correct response beats a hard abort
+    // that forces a retry from scratch. This timeout is shared by every
+    // request type, not just Fusion ones, so a truly stuck Ollama call now
+    // takes longer to surface as an error too — an acceptable tradeoff here.
     const timeout = setTimeout(() => {
       controller.abort();
-    }, 90000);
+    }, 180000);
 
     async function callOllama(prompt: string, numPredict: number, think: boolean = false): Promise<string> {
       const res = await fetch(OLLAMA_URL, {
@@ -986,6 +1245,179 @@ app.post('/api/chat', async (req, res) => {
       if (!res.ok) throw new Error("Ollama connection failed");
       const data = await res.json() as { response: string };
       return data.response;
+    }
+
+    // Fusion 360 model generation is handled as its own early-return path —
+    // it needs a narrowly-scoped code-generation prompt (not the general
+    // chat/personality prompt), a real side effect (executing in a running
+    // Fusion session via the bridge add-in), and a result-shaped response —
+    // none of which fit the JSON-modification/recall/search pipeline below.
+    if (looksLikeParametricFusionRequest) {
+      const fusionPrompt = `You are generating Python code for Autodesk Fusion 360's API to create 3D geometry. This code will be executed via exec() inside a running Fusion 360 session. These variables already exist in scope — do not import adsk or redefine them:
+- adsk (the adsk module itself)
+- app (adsk.core.Application instance)
+- ui (the active UserInterface)
+- design (the active adsk.fusion.Design)
+- rootComp (design.rootComponent)
+
+Rules:
+- CRITICAL: output ONLY one \`\`\`python code block and NOTHING else — no explanation, no reasoning, and NO comment lines (lines starting with #) anywhere in the code. If you're unsure of the right approach, pick your best option silently and just output working code for it — never think out loud inside the code block, that wastes your output budget and can cut off the closing \`\`\` before it's reached.
+- Create sketches with rootComp.sketches.add(rootComp.xYConstructionPlane) (or another construction plane).
+- Circles: sketch.sketchCurves.sketchCircles.addByCenterRadius(point, radius).
+- Rectangles: sketch.sketchCurves.sketchLines.addTwoPointRectangle(p1, p2) — note the .sketchLines in between, addTwoPointRectangle is NOT a direct member of sketchCurves.
+- Extrude with rootComp.features.extrudeFeatures. Revolve with rootComp.features.revolveFeatures.
+- adsk.core.Point3D.create ALWAYS requires exactly 3 arguments (x, y, z) — e.g. Point3D.create(0, 0, 0), never Point3D.create(0, 0).
+- p1 and p2 for addTwoPointRectangle MUST be diagonally opposite corners — they must differ in BOTH x and y. If they share the same x or the same y, that's a zero-area degenerate rectangle and Fusion will reject it with "Invalid input points". E.g. for a 5x6 rectangle: p1=(0,0,0), p2=(5,6,0) — never p1=(2.5,-4.8,0), p2=(-2.5,-4.8,0) (same y on both).
+- Double-check that rectangle/shape coordinates actually produce the exact dimensions requested (e.g. for a rectangle addTwoPointRectangle(p1, p2), the distance between p1 and p2 on each axis must equal the requested width/length).
+- Always call .add(input) on the SPECIFIC feature collection you got createInput from (e.g. extrudes.add(...), revolves.add(...)) — never rootComp.features.add(...), which does not exist and will fail with AttributeError.
+- Keep it to simple, valid parametric geometry — do not guess at API members you're not sure exist.
+
+Example 1, for "a cylinder 5cm radius and 10cm tall":
+\`\`\`python
+sketch = rootComp.sketches.add(rootComp.xYConstructionPlane)
+sketch.sketchCurves.sketchCircles.addByCenterRadius(adsk.core.Point3D.create(0, 0, 0), 5)
+prof = sketch.profiles.item(0)
+extrudes = rootComp.features.extrudeFeatures
+extInput = extrudes.createInput(prof, adsk.fusion.FeatureOperations.NewBodyFeatureOperation)
+extInput.setDistanceExtent(False, adsk.core.ValueInput.createByReal(10))
+extrudes.add(extInput)
+\`\`\`
+
+Example 2, for "a box 4cm wide, 6cm long, and 3cm tall":
+\`\`\`python
+sketch = rootComp.sketches.add(rootComp.xYConstructionPlane)
+p1 = adsk.core.Point3D.create(0, 0, 0)
+p2 = adsk.core.Point3D.create(4, 6, 0)
+sketch.sketchCurves.sketchLines.addTwoPointRectangle(p1, p2)
+prof = sketch.profiles.item(0)
+extrudes = rootComp.features.extrudeFeatures
+extInput = extrudes.createInput(prof, adsk.fusion.FeatureOperations.NewBodyFeatureOperation)
+extInput.setDistanceExtent(False, adsk.core.ValueInput.createByReal(3))
+extrudes.add(extInput)
+\`\`\`
+
+Example 3, for "a sphere with 4cm radius" — there's no sphere primitive, so sketch a semicircle profile (an arc plus a straight diameter line closing it) and revolve it 360 degrees around the diameter line:
+\`\`\`python
+sketch = rootComp.sketches.add(rootComp.xYConstructionPlane)
+centerPoint = adsk.core.Point3D.create(0, 0, 0)
+startPoint = adsk.core.Point3D.create(0, 4, 0)
+endPoint = adsk.core.Point3D.create(0, -4, 0)
+sketch.sketchCurves.sketchArcs.addByCenterStartSweep(centerPoint, startPoint, math.pi)
+sketch.sketchCurves.sketchLines.addByTwoPoints(startPoint, endPoint)
+prof = sketch.profiles.item(0)
+revolves = rootComp.features.revolveFeatures
+revInput = revolves.createInput(prof, rootComp.yConstructionAxis, adsk.fusion.FeatureOperations.NewBodyFeatureOperation)
+revInput.setAngleExtent(False, adsk.core.ValueInput.createByString("360 deg"))
+revolves.add(revInput)
+\`\`\`
+
+Example 4, for "a cylinder with a hole through the center" — draw both circles in the SAME sketch and extrude the ring-shaped profile directly (the one with 2 profile loops, not 1) as a single new body. Do not use a separate cut/subtract step for this — one extrude of the ring profile already produces a hollow tube:
+\`\`\`python
+sketch = rootComp.sketches.add(rootComp.xYConstructionPlane)
+centerPoint = adsk.core.Point3D.create(0, 0, 0)
+sketch.sketchCurves.sketchCircles.addByCenterRadius(centerPoint, 5)
+sketch.sketchCurves.sketchCircles.addByCenterRadius(centerPoint, 2)
+ringProfile = None
+for p in sketch.profiles:
+    if p.profileLoops.count == 2:
+        ringProfile = p
+extrudes = rootComp.features.extrudeFeatures
+extInput = extrudes.createInput(ringProfile, adsk.fusion.FeatureOperations.NewBodyFeatureOperation)
+extInput.setDistanceExtent(False, adsk.core.ValueInput.createByReal(10))
+extrudes.add(extInput)
+\`\`\`
+
+math is already available (e.g. math.pi) — do not import it.
+
+If the request is to remove/delete/clear existing geometry instead of creating something, delete all bodies and sketches in the root component:
+\`\`\`python
+for body in list(rootComp.bRepBodies):
+    body.deleteMe()
+for sketch in list(rootComp.sketches):
+    sketch.deleteMe()
+\`\`\`
+
+Now generate code for this request: "${message}"`;
+
+      const fusionResponse = await callOllama(fusionPrompt, 2500);
+      const codeMatch = fusionResponse.match(/```(?:python)?\s*\n([\s\S]*?)```/);
+
+      let fusionReplyText: string;
+
+      if (!codeMatch) {
+        fusionReplyText = "I couldn't produce a valid code block for that model request. Try rephrasing it as a simpler shape.";
+      } else {
+        const generatedCode = codeMatch[1].trim();
+        const bridgeAvailable = await isServiceHealthy(`${FUSION_BRIDGE_URL}/health`);
+
+        if (!bridgeAvailable) {
+          fusionReplyText = `I generated code for this, but couldn't reach the Fusion 360 bridge at ${FUSION_BRIDGE_URL} — make sure Fusion 360 is running with the NoahFusionBridge add-in active.\n\nGenerated code:\n${generatedCode}`;
+        } else {
+          const result = await executeFusionScript(generatedCode);
+          fusionReplyText = result.success
+            ? `Done — applied that in Fusion 360.\n\nCode used:\n${generatedCode}`
+            : `Fusion rejected the generated code:\n${result.error}\n\nCode attempted:\n${generatedCode}`;
+        }
+      }
+
+      conversationHistory.push(`Assistant: ${fusionReplyText}`);
+      saveHistory();
+      clearTimeout(timeout);
+
+      return res.json({ response: fusionReplyText, hasProposedChanges: false });
+    }
+
+    // Image-to-3D path: the request names a real subject (not parametric
+    // geometry), so there's no CAD code to generate — instead find a
+    // reference photo, run it through the local TripoSR model to get a
+    // mesh, then import that mesh directly into the Fusion document.
+    if (looksLikeImageFusionRequest) {
+      const subject = extractFusionSubject(message);
+      const targetSizeCm = extractTargetSizeCm(message);
+      let imageReplyText: string;
+
+      const bridgeAvailable = await isServiceHealthy(`${FUSION_BRIDGE_URL}/health`);
+      if (!bridgeAvailable) {
+        imageReplyText = `I'd need the Fusion 360 bridge running to import a model of "${subject}" — make sure Fusion 360 is running with the NoahFusionBridge add-in active.`;
+      } else {
+        const imageUrls = await webImageSearch(subject);
+        if (imageUrls.length === 0) {
+          imageReplyText = `I couldn't find a usable reference image for "${subject}" to build a model from.`;
+        } else {
+          const imagePath = path.join(IMAGE23D_TMP_DIR, `${Date.now()}.jpg`);
+          const downloaded = await downloadImageToFile(imageUrls[0], imagePath);
+          if (!downloaded) {
+            imageReplyText = `Found a reference image for "${subject}" but couldn't download it to work with.`;
+          } else {
+            const meshResult = await generateMeshFromImage(imagePath);
+            if (!meshResult.success) {
+              imageReplyText = `Generating a mesh for "${subject}" failed: ${meshResult.error}`;
+            } else {
+              let meshPathForImport = meshResult.meshPath!;
+              let scaleNote = "Heads up: TripoSR's output isn't real-world scaled, so it may look tiny or huge at first — Fusion's Scale tool can fix that, and geometry detail is rough compared to a hand-modeled asset.";
+              if (targetSizeCm !== null) {
+                const scaledPath = await scaleMeshToTargetSize(meshResult.meshPath!, targetSizeCm);
+                if (scaledPath) {
+                  meshPathForImport = scaledPath;
+                  scaleNote = `Scaled it so its largest dimension is about ${targetSizeCm}cm — since I can't know which axis TripoSR treats as "height", that's an overall-size match rather than a guaranteed exact height.`;
+                } else {
+                  scaleNote = `Tried to scale it to ${targetSizeCm}cm but the scaling step failed, so it's still at TripoSR's raw output size — Fusion's Scale tool can fix that manually.`;
+                }
+              }
+              const importResult = await importMeshToFusion(meshPathForImport);
+              imageReplyText = importResult.success
+                ? `Done — imported a 3D model of "${subject}" into Fusion 360, built from this reference image: ${imageUrls[0]}\n\n${scaleNote}`
+                : `Fusion rejected importing the mesh: ${importResult.error}`;
+            }
+          }
+        }
+      }
+
+      conversationHistory.push(`Assistant: ${imageReplyText}`);
+      saveHistory();
+      clearTimeout(timeout);
+
+      return res.json({ response: imageReplyText, hasProposedChanges: false });
     }
 
     const recentHistory = conversationHistory.slice(-20).join("\n");

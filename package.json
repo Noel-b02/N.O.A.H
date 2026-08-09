@@ -5,7 +5,7 @@
   "main": "index.js",
   "scripts": {
     "predev": "tsx scripts/ensure-ollama.ts && tsx scripts/ensure-searxng.ts",
-    "dev": "tsx server.ts",
+    "dev": "tsx watch server.ts",
     "build": "tsc",
     "prestart": "tsx scripts/ensure-ollama.ts && tsx scripts/ensure-searxng.ts",
     "start": "node dist/server.js"

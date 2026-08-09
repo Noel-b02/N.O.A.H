@@ -8,3 +8,7 @@ node_modules/
 speech/venv/
 speech/__pycache__/
 speech/voices/
+image23d/TripoSR/venv/
+image23d/TripoSR/__pycache__/
+image23d/TripoSR/output/
+image23d/tmp/

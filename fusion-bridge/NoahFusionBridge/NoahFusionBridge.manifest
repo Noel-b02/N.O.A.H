@@ -1,0 +1,10 @@
+{
+    "autodeskProduct": "Fusion360",
+    "type": "addin",
+    "author": "",
+    "description": {
+        "": "Runs a local HTTP server that lets N.O.A.H create geometry in the active Fusion 360 document."
+    },
+    "supportedOS": "windows|mac",
+    "editEnabled": true
+}
