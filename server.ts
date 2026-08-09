@@ -753,18 +753,12 @@ app.post('/api/chat', async (req, res) => {
     mentionsRecall || (recallDate !== null && /what|talk|discuss|speak|say/i.test(message))
   );
 
-  // A follow-up on an already-answered recall query (e.g. "give me specifics",
-  // "quote it") — doesn't re-trigger isRecallQuery on its own, but should still
-  // get the archived context and the smarter model.
+  // A follow-up on an already-answered recall query (e.g. "give me specifics", "quote it") — doesn't re-trigger isRecallQuery on its own, but should still get the archived context and the smarter model.
   const isStickyRecallFollowup = !wantsModification && !isRecallQuery && stickyRecallTurnsRemaining > 0;
 
-  // "What does core integrity mean" is answered fine from the general
-  // explanation now in personality.txt — but "why isn't it 100%" or "what's
-  // down" needs the actual live health state, which the model has no way to
-  // know on its own. This always fetches fresh (no sticky reuse): unlike a
-  // search result, service health can flip within seconds, so reusing stale
-  // status from a previous turn would risk telling the user a service is
-  // down when it's since recovered, or vice versa.
+  // "What does core integrity mean" is answered fine from the general explanation now in personality.txt — but "why isn't it 100%" or "what's down" needs the actual live health state, which the model has no way to
+  // know on its own. This always fetches fresh (no sticky reuse): unlike a search result, service health can flip within seconds, so reusing stale
+  // status from a previous turn would risk telling the user a service is down when it's since recovered, or vice versa.
   const STATUS_TRIGGER_PATTERN = /\b(core integrity|neural load|model temp|diverg(ence)?[\s_-]?buf(fer)?|system status|what'?s down|which service|is (everything|anything) (down|broken|working|up)|are you (down|working|online)|health check)\b/i;
   const looksLikeStatusQuery = !wantsModification && !isRecallQuery && !isStickyRecallFollowup && STATUS_TRIGGER_PATTERN.test(message);
 
@@ -775,13 +769,6 @@ app.post('/api/chat', async (req, res) => {
   const HEADLINES_TRIGGER_PATTERN = /\b(headlines|breaking news|today'?s news|news today|on the news|what'?s (been )?reported|happening in the world)\b/i;
   const looksLikeHeadlinesQuery = !wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeStatusQuery && HEADLINES_TRIGGER_PATTERN.test(message);
 
-  // Deterministic web-search trigger for common "needs current info" phrasings
-  // — mirrors the recall-trigger approach above rather than relying on the
-  // model to notice it needs to search and correctly emit [SEARCH: ...]. That
-  // depends on smaller local models reliably following instructions, which in
-  // practice they don't: they either wrap the tag in prose or skip it and
-  // hallucinate an excuse instead. Catching the obvious cases here means the
-  // search actually happens instead of being gated on model cooperation.
   const SEARCH_TRIGGER_PATTERN = /\b(latest news|who won|release date|launch date|premiere date|when('s| is| does| will).{0,30}(come out|coming out|releas(e|ing)|drop(ping)?|launch(ing)?|premier(e|ing))|current (weather|price|score|exchange rate)|how much (is|does|would)|price of|what'?s the weather|weather (today|forecast|right now))\b/i;
   const looksLikeSearchQuery = !wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeStatusQuery && !looksLikeHeadlinesQuery && SEARCH_TRIGGER_PATTERN.test(message);
 
@@ -791,12 +778,19 @@ app.post('/api/chat', async (req, res) => {
   // improvising from its own summary.
   const isStickySearchFollowup = !wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeStatusQuery && !looksLikeHeadlinesQuery && !looksLikeSearchQuery && stickySearchTurnsRemaining > 0;
 
+  // Ollama's "thinking" mode measurably improves how carefully the model reasons through a request, but costs ~10-15+ seconds of extra latency
+  // per response (tested directly: a trivial one-sentence question took
+  // 15.5s with it on vs ~1-2s off) — far too slow to enable by default, but worth it when the user explicitly asks for more thoroughness.
+  const DIG_DEEPER_PATTERN = /\b(dig deeper|dig into (that|this|it)|look into (that|this|it) more|go deeper|expand on (that|this|it)|elaborate( on (that|this|it))?)\b/i;
+  const wantsDeeperThinking = DIG_DEEPER_PATTERN.test(message);
+
   console.log("IS RECALL QUERY:", isRecallQuery);
   console.log("IS STICKY RECALL FOLLOWUP:", isStickyRecallFollowup, "| turns remaining:", stickyRecallTurnsRemaining);
   console.log("LOOKS LIKE STATUS QUERY:", looksLikeStatusQuery);
   console.log("LOOKS LIKE HEADLINES QUERY:", looksLikeHeadlinesQuery);
   console.log("LOOKS LIKE SEARCH QUERY:", looksLikeSearchQuery);
   console.log("IS STICKY SEARCH FOLLOWUP:", isStickySearchFollowup, "| turns remaining:", stickySearchTurnsRemaining);
+  console.log("WANTS DEEPER THINKING:", wantsDeeperThinking);
 
   // Short messages like ("hi", "thanks", "ok") are never complex on keyword grounds alone —
   // skip straight to the fast model rather than utilize the smart model to decrease latency
@@ -967,7 +961,7 @@ app.post('/api/chat', async (req, res) => {
       controller.abort();
     }, 90000);
 
-    async function callOllama(prompt: string, numPredict: number): Promise<string> {
+    async function callOllama(prompt: string, numPredict: number, think: boolean = false): Promise<string> {
       const res = await fetch(OLLAMA_URL, {
         method: "POST",
         signal: controller.signal,
@@ -976,7 +970,7 @@ app.post('/api/chat', async (req, res) => {
           model: selectedModel,
           prompt,
           stream: false,
-          think: false,
+          think,
           options: {
             num_predict: numPredict,
             // Left at Ollama's default (4096) this silently truncates from the
@@ -1123,7 +1117,7 @@ app.post('/api/chat', async (req, res) => {
     console.log(`[MODEL] ${selectedModel} | complex=${isComplex}`);
 
    
-    let aiResponse = await callOllama(fullPrompt, isComplex ? 3000 : 300);
+    let aiResponse = await callOllama(fullPrompt, isComplex ? 3000 : 300, wantsDeeperThinking);
 
     console.log("RAW AI RESPONSE:");
     console.log(aiResponse);
@@ -1162,7 +1156,7 @@ app.post('/api/chat', async (req, res) => {
 
       const followUpPrompt = `System Instruction:\n${metaSystemInstruction}\n\n` + searchContext + `Conversation History:\n${recentHistory}\n\n` + `User Request:\n${message}`;
 
-      aiResponse = await callOllama(followUpPrompt, isComplex ? 3000 : 400);
+      aiResponse = await callOllama(followUpPrompt, isComplex ? 3000 : 400, wantsDeeperThinking);
 
       console.log("FINAL AI RESPONSE AFTER SEARCH:");
       console.log(aiResponse);
