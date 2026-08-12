@@ -1,5 +1,10 @@
 # N.O.A.H.
 
+**Edition: 8GB** — built and tuned to run within an 8GB VRAM budget (shape-
+only mesh generation, GPU-exclusive locking between Ollama and generation
+tasks). A 16GB edition is planned once hardware allows for the full
+texture+paint pipeline and more — see `IMAGE_GEN_ROADMAP.md`.
+
 A personal, local-first AI assistant. Runs entirely on your own hardware —
 local LLM (via [Ollama](https://ollama.com)), local web search (via
 [SearXNG](https://github.com/searxng/searxng)), local speech-to-text and
