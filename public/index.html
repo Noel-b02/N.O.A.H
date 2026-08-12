@@ -106,8 +106,10 @@
 
     <!-- Live Telemetry Monitor (real data via /api/hud-metrics, polled by JS) -->
     <div class="hidden lg:flex items-center space-x-8 font-mono text-[10px] text-slate-500 border-l border-slate-800 pl-8">
-      <div>
-        CORE INTEGRITY: <span id="telemetry-integrity" class="text-cyan-400 font-bold">--%</span>
+      <div class="flex items-center space-x-3">
+        <span class="flex items-center gap-1">COGNITION<span id="svc-ollama" class="h-1.5 w-1.5 rounded-full bg-slate-600"></span><span id="svc-ollama-text" class="font-bold">--</span></span>
+        <span class="flex items-center gap-1">DATA GRID<span id="svc-searxng" class="h-1.5 w-1.5 rounded-full bg-slate-600"></span><span id="svc-searxng-text" class="font-bold">--</span></span>
+        <span class="flex items-center gap-1">SPEECH<span id="svc-speech" class="h-1.5 w-1.5 rounded-full bg-slate-600"></span><span id="svc-speech-text" class="font-bold">--</span></span>
       </div>
       <div>
         NEURAL LOAD: <span id="telemetry-load" class="text-cyan-400 font-bold">--%</span>
@@ -115,6 +117,7 @@
       <div>
         MODEL TEMP: <span id="telemetry-temp" class="text-cyan-400 font-bold">--℃</span>
       </div>
+      <div class="flex items-center gap-1">MESH_GEN<span id="svc-meshgen" class="h-1.5 w-1.5 rounded-full bg-slate-600"></span><span id="svc-meshgen-text" class="font-bold">--</span></div>
       <div>
         DIVERG_BUF: <span id="telemetry-divergence" class="text-rose-500 font-bold">0 LINES</span>
       </div>
@@ -311,22 +314,69 @@
     const micBtn = document.getElementById('mic-btn');
     const voiceToggleBtn = document.getElementById('voice-toggle-btn');
 
-    // Real system telemetry: CORE INTEGRITY reflects whether Ollama, SearXNG,
-    // and the speech service actually respond; NEURAL LOAD / MODEL TEMP read
-    // genuine GPU utilization/temperature via /api/hud-metrics (nvidia-smi on
-    // the server). DIVERG_BUF is the real changed-line count of whatever
-    // diff is currently pending review, tracked in pendingDiffChangedLines.
-    // Named "hud-metrics" rather than "telemetry" — ad-blockers/privacy
-    // extensions commonly blocklist that exact word in URLs (it's strongly
-    // associated with analytics/tracking endpoints) and silently drop the
-    // request client-side, which is indistinguishable from a real network
-    // failure without checking the console.
+    // Real system telemetry: the COGNITION/DATA GRID/SPEECH dots reflect
+    // whether each backing service (Ollama, SearXNG, speech respectively)
+    // actually responds — shown per-service rather than as one aggregate
+    // percentage specifically so a problem is immediately identifiable
+    // ("DATA GRID's dot is red" beats "core integrity is 66%, guess which
+    // one"). MESH_GEN reflects gpuExclusiveTaskRunning server-side — the
+    // one class of work slow/disruptive enough (unloads Ollama/speech, can
+    // run for minutes) to be worth calling out explicitly. NEURAL LOAD /
+    // MODEL TEMP read genuine GPU utilization/temperature via
+    // /api/hud-metrics (nvidia-smi on the server). DIVERG_BUF is the real
+    // changed-line count of whatever diff is currently pending review,
+    // tracked in pendingDiffChangedLines. Named "hud-metrics" rather than
+    // "telemetry" — ad-blockers/privacy extensions commonly blocklist that
+    // exact word in URLs (it's strongly associated with analytics/tracking
+    // endpoints) and silently drop the request client-side, which is
+    // indistinguishable from a real network failure without checking the
+    // console.
+    function setServiceDot(id, healthy) {
+      const dot = document.getElementById(id);
+      dot.classList.remove('bg-slate-600', 'bg-emerald-400', 'bg-rose-500');
+      dot.classList.add(healthy ? 'bg-emerald-400' : 'bg-rose-500');
+      dot.title = healthy ? 'online' : 'offline';
+
+      const text = document.getElementById(`${id}-text`);
+      text.textContent = healthy ? 'ONLINE' : 'OFFLINE';
+      text.classList.remove('text-emerald-400', 'text-rose-500');
+      text.classList.add(healthy ? 'text-emerald-400' : 'text-rose-500');
+    }
+
+    // Three states, not two — separate from setServiceDot since the
+    // meaning differs: OFFLINE (Fusion bridge unreachable, red) takes
+    // priority over GENERATING (amber, mid-mesh-generation) which takes
+    // priority over IDLE (green, Fusion's up and nothing's running).
+    function setMeshGenState(fusionAvailable, generating) {
+      const dot = document.getElementById('svc-meshgen');
+      const text = document.getElementById('svc-meshgen-text');
+      dot.classList.remove('bg-slate-600', 'bg-emerald-400', 'bg-rose-500', 'bg-amber-400');
+      text.classList.remove('text-emerald-400', 'text-rose-500', 'text-amber-400');
+
+      let state, colorClass;
+      if (!fusionAvailable) {
+        state = 'OFFLINE'; colorClass = 'rose-500';
+      } else if (generating) {
+        state = 'GENERATING'; colorClass = 'amber-400';
+      } else {
+        state = 'IDLE'; colorClass = 'emerald-400';
+      }
+
+      dot.classList.add(`bg-${colorClass}`);
+      dot.title = state.toLowerCase();
+      text.textContent = state;
+      text.classList.add(`text-${colorClass}`);
+    }
+
     async function updateTelemetry() {
       try {
         const response = await fetch('/api/hud-metrics');
         const data = await response.json();
 
-        document.getElementById('telemetry-integrity').textContent = `${data.coreIntegrityPercent.toFixed(2)}%`;
+        setServiceDot('svc-ollama', data.services.ollama);
+        setServiceDot('svc-searxng', data.services.searxng);
+        setServiceDot('svc-speech', data.services.speech);
+        setMeshGenState(data.fusionAvailable, data.generating);
 
         if (data.gpu) {
           document.getElementById('telemetry-load').textContent = `${data.gpu.utilizationPercent.toFixed(1)}%`;
@@ -337,7 +387,10 @@
         }
       } catch (err) {
         console.error('Telemetry fetch failed:', err);
-        document.getElementById('telemetry-integrity').textContent = '0.00%';
+        setServiceDot('svc-ollama', false);
+        setServiceDot('svc-searxng', false);
+        setServiceDot('svc-speech', false);
+        setMeshGenState(false, false);
         document.getElementById('telemetry-load').textContent = 'N/A';
         document.getElementById('telemetry-temp').textContent = 'N/A';
       }

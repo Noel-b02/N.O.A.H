@@ -121,6 +121,11 @@ archiveSession("startup", previousSessionEndedAt);
 
 let requestInFlight = false;
 let pendingCommit: CommitInfo | null = null;
+// Surfaced on the HUD as MESH_GEN — withGpuExclusive() is the only thing
+// that sets this, since that's the only class of work slow/disruptive
+// enough (unloads Ollama/speech, can run for minutes) to be worth telling
+// the user about explicitly rather than just reading GPU utilization.
+let gpuExclusiveTaskRunning = false;
 
 
 function loadHistory(): string[] {
@@ -613,6 +618,7 @@ function unloadOllamaModels(): void {
 async function withGpuExclusive<T>(fn: () => Promise<T>): Promise<T> {
   unloadOllamaModels();
   stopSpeechService();
+  gpuExclusiveTaskRunning = true;
   // kill() is fire-and-forget (SIGTERM) — give the process a moment to
   // actually exit and release VRAM before starting the heavy step.
   await new Promise(r => setTimeout(r, 2000));
@@ -620,6 +626,7 @@ async function withGpuExclusive<T>(fn: () => Promise<T>): Promise<T> {
     return await fn();
   } finally {
     startSpeechService();
+    gpuExclusiveTaskRunning = false;
   }
 }
 
@@ -1077,14 +1084,21 @@ async function importMeshToFusion(meshPath: string): Promise<FusionExecutionResu
 }
 
 // Real system telemetry for the HUD, replacing what used to be Math.random()
-// fake fluctuations — CORE INTEGRITY reflects whether the backing services
-// (Ollama, SearXNG, the speech service) are actually reachable, and NEURAL
-// LOAD / MODEL TEMP read genuine GPU utilization and temperature.
+// fake fluctuations — COGNITION/DATA GRID/SPEECH reflect whether the backing
+// services (Ollama, SearXNG, the speech service respectively) are actually
+// reachable, NEURAL LOAD / MODEL TEMP read genuine GPU utilization and
+// temperature, and MESH_GEN combines Fusion bridge reachability with
+// gpuExclusiveTaskRunning (offline/idle/generating — see the frontend for
+// how those combine). Uses isServiceHealthy directly rather than
+// ensureFusionBridgeAvailable() — that function auto-launches Fusion if
+// it's not running, which would make this 3-second-polled endpoint launch
+// Fusion 360 (and block for up to 60s) just from having the HUD open.
 app.get('/api/hud-metrics', async (_, res) => {
-  const [ollamaHealthy, searxngHealthy, speechHealthy] = await Promise.all([
+  const [ollamaHealthy, searxngHealthy, speechHealthy, fusionHealthy] = await Promise.all([
     isServiceHealthy(OLLAMA_URL.replace(/\/api\/generate$/, "/api/version")),
     isServiceHealthy(`${SEARXNG_URL}/healthz`),
-    isServiceHealthy(`${SPEECH_SERVICE_URL}/health`)
+    isServiceHealthy(`${SPEECH_SERVICE_URL}/health`),
+    isServiceHealthy(`${FUSION_BRIDGE_URL}/health`)
   ]);
 
   const services = { ollama: ollamaHealthy, searxng: searxngHealthy, speech: speechHealthy };
@@ -1093,6 +1107,8 @@ app.get('/api/hud-metrics', async (_, res) => {
 
   res.json({
     coreIntegrityPercent,
+    generating: gpuExclusiveTaskRunning,
+    fusionAvailable: fusionHealthy,
     services,
     gpu: getGpuStats()
   });
