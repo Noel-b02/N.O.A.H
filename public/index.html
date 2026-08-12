@@ -359,14 +359,35 @@
     // saveCurrentModel()/discardCurrentModel() know which id to act on.
     let currentModelId = null;
 
-    function openModelViewerPanel(modelId, modelUrl, subject) {
+    function openModelViewerPanel(modelId, modelUrl, subject, saved = false) {
       currentModelId = modelId;
       modelViewerEl.setAttribute('src', modelUrl);
       modelViewerSubjectEl.textContent = subject;
-      modelSaveBtn.disabled = false;
-      modelSaveBtn.textContent = 'SAVE';
+      modelSaveBtn.disabled = saved;
+      modelSaveBtn.textContent = saved ? 'SAVED' : 'SAVE';
       diffPanel.classList.add('hidden');
       modelViewerPanel.classList.remove('hidden');
+    }
+
+    // Fetches the model's CURRENT filename/url by id rather than trusting
+    // whatever was baked into the chat message's button when it was
+    // created — confirmed directly this matters: saving a model renames
+    // its file, so a button clicked again later (after a save) would
+    // otherwise point at a URL that no longer exists.
+    async function openModelViewerPanelById(modelId) {
+      try {
+        const res = await fetch(`/api/models/${modelId}`);
+        if (!res.ok) {
+          const detail = await res.json().catch(() => ({}));
+          appendMessage('system', `COULDN'T LOAD MODEL: ${detail.error || res.status}`);
+          return;
+        }
+        const data = await res.json();
+        openModelViewerPanel(data.id, data.url, data.subject, data.saved);
+      } catch (err) {
+        console.error('Failed to fetch model info:', err);
+        appendMessage('system', 'COULDN\'T LOAD MODEL: request dropped.');
+      }
     }
 
     function closeModelViewerPanel() {
@@ -376,24 +397,45 @@
     }
 
     async function saveCurrentModel() {
-      if (!currentModelId) return;
+      if (!currentModelId) {
+        console.warn('saveCurrentModel: no model currently open, ignoring click.');
+        return;
+      }
       try {
         const res = await fetch(`/api/models/${currentModelId}/save`, { method: 'POST' });
         if (res.ok) {
+          const data = await res.json();
+          // The file was just renamed server-side — repoint the live
+          // viewer at its new URL so it doesn't silently 404 next reload.
+          if (data.url) modelViewerEl.setAttribute('src', data.url);
           modelSaveBtn.textContent = 'SAVED';
           modelSaveBtn.disabled = true;
+        } else {
+          const detail = await res.json().catch(() => ({}));
+          appendMessage('system', `SAVE FAILED: ${detail.error || res.status}`);
         }
       } catch (err) {
         console.error('Failed to save model:', err);
+        appendMessage('system', 'SAVE FAILED: request dropped.');
       }
     }
 
     async function discardCurrentModel() {
-      if (!currentModelId) return;
+      if (!currentModelId) {
+        console.warn('discardCurrentModel: no model currently open, ignoring click.');
+        return;
+      }
       try {
-        await fetch(`/api/models/${currentModelId}`, { method: 'DELETE' });
+        const res = await fetch(`/api/models/${currentModelId}`, { method: 'DELETE' });
+        if (!res.ok) {
+          const detail = await res.json().catch(() => ({}));
+          appendMessage('system', `DISCARD FAILED: ${detail.error || res.status}`);
+          return;
+        }
       } catch (err) {
         console.error('Failed to discard model:', err);
+        appendMessage('system', 'DISCARD FAILED: request dropped.');
+        return;
       }
       closeModelViewerPanel();
     }
@@ -1146,7 +1188,7 @@
 
       if (model) {
         const btn = div.querySelector('.view-model-btn');
-        if (btn) btn.addEventListener('click', () => openModelViewerPanel(model.id, model.url, model.subject));
+        if (btn) btn.addEventListener('click', () => openModelViewerPanelById(model.id));
       }
 
       chatMessages.scrollTop = chatMessages.scrollHeight;

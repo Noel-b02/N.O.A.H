@@ -907,6 +907,15 @@ function saveModelsIndex(entries: GeneratedModelEntry[]): void {
   fs.writeFileSync(MODELS_INDEX_FILE, JSON.stringify(entries, null, 2));
 }
 
+// Turns a subject like "rubber duck" into "rubber-duck" for use in a
+// filename — used when a model gets saved (see the /save endpoint), not at
+// generation time, since the raw timestamp filename is fine until a human
+// might actually go looking for the file directly.
+function slugify(text: string): string {
+  const slug = text.toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "");
+  return slug || "model";
+}
+
 // Registers a freshly-converted .glb, then prunes the oldest UNSAVED
 // entries beyond MAX_UNSAVED_MODELS so preview files don't accumulate
 // forever with regular use — saved models are exempt from this entirely.
@@ -1211,15 +1220,51 @@ app.get('/api/hud-metrics', async (_, res) => {
   });
 });
 
+// API: returns a model's current info by id — used by the frontend instead
+// of trusting a URL baked into a chat message's button at creation time,
+// since /save below can rename the file out from under that URL later.
+app.get('/api/models/:id', (req, res) => {
+  const entry = loadModelsIndex().find(e => e.id === req.params.id);
+  if (!entry) return res.status(404).json({ success: false, error: "Model not found — it may already have been pruned or discarded." });
+  res.json({ success: true, id: entry.id, subject: entry.subject, url: `/generated-models/${entry.filename}`, saved: entry.saved });
+});
+
 // API: exempts a generated model from the MAX_UNSAVED_MODELS rotation —
-// the "SAVE" button in the model viewer panel.
+// the "SAVE" button in the model viewer panel. Also renames the file from
+// its generation-time timestamp to something derived from the subject
+// (e.g. rubber-duck.glb), purely so the file means something if you ever
+// go looking for it directly outside the app — nothing in the UI itself
+// shows the raw filename.
 app.post('/api/models/:id/save', (req, res) => {
   const entries = loadModelsIndex();
   const entry = entries.find(e => e.id === req.params.id);
   if (!entry) return res.status(404).json({ success: false, error: "Model not found — it may already have been pruned or discarded." });
+
+  const baseSlug = slugify(entry.subject);
+  let newFilename = `${baseSlug}.glb`;
+  let suffix = 2;
+  while (
+    entries.some(e => e.id !== entry.id && e.filename === newFilename) ||
+    (newFilename !== entry.filename && fs.existsSync(path.join(MODELS_DIR, newFilename)))
+  ) {
+    newFilename = `${baseSlug}-${suffix}.glb`;
+    suffix++;
+  }
+
+  if (newFilename !== entry.filename) {
+    try {
+      fs.renameSync(path.join(MODELS_DIR, entry.filename), path.join(MODELS_DIR, newFilename));
+      entry.filename = newFilename;
+    } catch (err: any) {
+      console.error("Failed to rename saved model file:", err.message);
+      // Not fatal — still mark it saved under its existing filename rather
+      // than losing the save entirely over a cosmetic rename failing.
+    }
+  }
+
   entry.saved = true;
   saveModelsIndex(entries);
-  res.json({ success: true });
+  res.json({ success: true, url: `/generated-models/${entry.filename}` });
 });
 
 // API: immediately deletes a generated model — the "DISCARD" button.
