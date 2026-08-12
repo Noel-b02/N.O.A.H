@@ -30,15 +30,29 @@ pendingResult = {}
 resultReady = threading.Event()
 
 
+# app.activeProduct is None only when NO document is open at all (Fusion's
+# empty start-screen state) — if some other document were open but simply
+# not the one the user meant, this would still return a Design, just the
+# wrong one. So there's no competing intent to override here; creating a
+# fresh document automatically is unambiguously the right move rather than
+# failing and making the user go create one manually first.
+def get_or_create_active_design():
+    design = adsk.fusion.Design.cast(app.activeProduct)
+    if design is not None:
+        return design
+    app.documents.add(adsk.core.DocumentTypes.FusionDesignDocumentType)
+    return adsk.fusion.Design.cast(app.activeProduct)
+
+
 class ExecuteCustomEventHandler(adsk.core.CustomEventHandler):
     def notify(self, args):
         global pendingResult
         try:
-            design = adsk.fusion.Design.cast(app.activeProduct)
+            design = get_or_create_active_design()
             if design is None:
                 pendingResult = {
                     "success": False,
-                    "error": "No active Fusion Design document — open or create one first."
+                    "error": "No active Fusion Design document, and couldn't create one automatically."
                 }
                 return
 
@@ -77,11 +91,19 @@ class ImportMeshCustomEventHandler(adsk.core.CustomEventHandler):
     def notify(self, args):
         global pendingResult
         try:
+            # Always a fresh document, unlike get_or_create_active_design()
+            # (used for parametric edits, where reusing the active document
+            # is the point — "make a cube" then "add a hole to it" are
+            # meant to build on each other). Each image-to-3D request is an
+            # unrelated standalone object instead — a coke can, then
+            # separately a fox — so reusing whatever's active would just
+            # pile unrelated meshes on top of each other in one document.
+            app.documents.add(adsk.core.DocumentTypes.FusionDesignDocumentType)
             design = adsk.fusion.Design.cast(app.activeProduct)
             if design is None:
                 pendingResult = {
                     "success": False,
-                    "error": "No active Fusion Design document — open or create one first."
+                    "error": "Couldn't create a new Fusion Design document."
                 }
                 return
 
