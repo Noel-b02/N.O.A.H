@@ -133,7 +133,11 @@ function loadHistory(): string[] {
   }
 }
 
+// Creates memories/history/ on demand — needed for a fresh clone, where
+// nothing under memories/ is tracked in git (it's all personal data) and so
+// the directory itself doesn't exist until something is actually saved.
 function saveHistory(): void {
+  fs.mkdirSync(path.dirname(HISTORY_FILE), { recursive: true });
   fs.writeFileSync(
     HISTORY_FILE,
     JSON.stringify(conversationHistory, null, 2)
@@ -471,6 +475,9 @@ function loadFile(filepath: string): string {
 }
 
 function writeFile(filepath: string, content: string): void {
+  // Same reasoning as saveHistory() — memories/memory.json's parent
+  // directory isn't guaranteed to exist on a fresh clone.
+  fs.mkdirSync(path.dirname(filepath), { recursive: true });
   fs.writeFileSync(filepath, content, 'utf8');
 }
 

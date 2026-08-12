@@ -1,9 +1,9 @@
 .venv/
 .vscode/
 .env
-memories/history/
+memories/history/*
+!memories/history/active.example.json
 memories/memory.json
-memories/active.json
 node_modules/
 speech/venv/
 speech/__pycache__/
