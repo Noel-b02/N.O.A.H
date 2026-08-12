@@ -862,6 +862,11 @@ function scaleMeshToTargetSize(meshPath: string, targetSizeCm: number): Promise<
 // than replacing it. Best-effort: a failure here shouldn't sink the whole
 // reply just because the preview couldn't be generated.
 function convertMeshToGlb(meshPath: string, outputPath: string): Promise<boolean> {
+  // MODELS_DIR otherwise only gets created inside saveModelsIndex(), which
+  // doesn't run until AFTER this succeeds — confirmed directly: the very
+  // first conversion failed because its own output directory didn't exist
+  // yet. Same class of bug as saveHistory()/writeFile() earlier.
+  fs.mkdirSync(path.dirname(outputPath), { recursive: true });
   return new Promise((resolve) => {
     const child = spawn(HUNYUAN3D_PYTHON, [path.join(IMAGE23D_DIR, "convert_to_glb.py"), meshPath, outputPath]);
     let stderr = "";
