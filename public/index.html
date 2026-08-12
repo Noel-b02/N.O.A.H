@@ -5,6 +5,9 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>N.O.A.H. Neural Matrix HUD</title>
   <script src="https://cdn.tailwindcss.com"></script>
+  <!-- 3D preview for generated meshes (converted to .glb server-side — see
+       convertMeshToGlb in server.ts, Fusion itself needs .obj instead). -->
+  <script type="module" src="https://cdn.jsdelivr.net/npm/@google/model-viewer@3.1.1/dist/model-viewer.min.js"></script>
   <!-- Sci-Fi Google Fonts -->
   <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;600;900&family=Rajdhani:wght@500;600;700&family=Share+Tech+Mono&display=swap" rel="stylesheet">
   
@@ -298,6 +301,40 @@
         </button>
       </div>
     </section>
+
+    <!-- Generated Model Preview (opens from the "VIEW MODEL" tab on a
+         successful image-to-3D reply) -->
+    <section id="model-viewer-panel" class="w-[500px] xl:w-[650px] bg-slate-950/95 border-l border-cyan-500/20 flex flex-col hidden relative z-20">
+      <div class="absolute top-0 right-0 w-4 h-4 border-t-2 border-r-2 border-cyan-400/30"></div>
+
+      <div class="p-6 border-b border-cyan-500/20 bg-cyan-950/5 flex items-center justify-between">
+        <div>
+          <h2 class="text-xs font-black text-cyan-400 tracking-widest uppercase">MESH PREVIEW</h2>
+          <p id="model-viewer-subject" class="text-[9px] text-slate-500 mt-1 uppercase tracking-widest font-mono">—</p>
+        </div>
+        <button onclick="closeModelViewerPanel()" class="text-slate-500 hover:text-cyan-400 text-xs font-mono">✕</button>
+      </div>
+
+      <div class="flex-1 relative bg-slate-950/20">
+        <model-viewer id="model-viewer-el" style="width: 100%; height: 100%;" camera-controls auto-rotate shadow-intensity="1" environment-image="neutral"></model-viewer>
+      </div>
+
+      <div class="p-6 border-t border-cyan-500/10 bg-slate-950/40 flex space-x-3">
+        <button
+          onclick="saveCurrentModel()"
+          id="model-save-btn"
+          class="flex-1 bg-emerald-950/20 hover:bg-emerald-500/15 border border-emerald-500/50 text-emerald-400 font-bold tracking-widest text-[10px] py-4 rounded uppercase transition duration-300 hover:shadow-[0_0_15px_rgba(16,185,129,0.1)]"
+        >
+          SAVE
+        </button>
+        <button
+          onclick="discardCurrentModel()"
+          class="flex-1 bg-slate-950 hover:bg-rose-500/10 border border-rose-500/30 text-rose-400 font-bold tracking-widest text-[10px] py-4 rounded uppercase transition duration-300"
+        >
+          DISCARD
+        </button>
+      </div>
+    </section>
   </main>
 
   <!-- Control Scripts & Visual Interactions -->
@@ -313,6 +350,53 @@
     const equalizer = document.getElementById('equalizer-container');
     const micBtn = document.getElementById('mic-btn');
     const voiceToggleBtn = document.getElementById('voice-toggle-btn');
+    const modelViewerPanel = document.getElementById('model-viewer-panel');
+    const modelViewerEl = document.getElementById('model-viewer-el');
+    const modelViewerSubjectEl = document.getElementById('model-viewer-subject');
+    const modelSaveBtn = document.getElementById('model-save-btn');
+
+    // Tracks whichever model is currently open in the preview panel, so
+    // saveCurrentModel()/discardCurrentModel() know which id to act on.
+    let currentModelId = null;
+
+    function openModelViewerPanel(modelId, modelUrl, subject) {
+      currentModelId = modelId;
+      modelViewerEl.setAttribute('src', modelUrl);
+      modelViewerSubjectEl.textContent = subject;
+      modelSaveBtn.disabled = false;
+      modelSaveBtn.textContent = 'SAVE';
+      diffPanel.classList.add('hidden');
+      modelViewerPanel.classList.remove('hidden');
+    }
+
+    function closeModelViewerPanel() {
+      modelViewerPanel.classList.add('hidden');
+      modelViewerEl.removeAttribute('src');
+      currentModelId = null;
+    }
+
+    async function saveCurrentModel() {
+      if (!currentModelId) return;
+      try {
+        const res = await fetch(`/api/models/${currentModelId}/save`, { method: 'POST' });
+        if (res.ok) {
+          modelSaveBtn.textContent = 'SAVED';
+          modelSaveBtn.disabled = true;
+        }
+      } catch (err) {
+        console.error('Failed to save model:', err);
+      }
+    }
+
+    async function discardCurrentModel() {
+      if (!currentModelId) return;
+      try {
+        await fetch(`/api/models/${currentModelId}`, { method: 'DELETE' });
+      } catch (err) {
+        console.error('Failed to discard model:', err);
+      }
+      closeModelViewerPanel();
+    }
 
     // Real system telemetry: the COGNITION/DATA GRID/SPEECH dots reflect
     // whether each backing service (Ollama, SearXNG, speech respectively)
@@ -574,7 +658,8 @@
         }
 
         if (data.response) {
-          appendMessage('assistant', data.response);
+          const model = data.modelId ? { id: data.modelId, url: data.modelUrl, subject: data.modelSubject } : null;
+          appendMessage('assistant', data.response, model);
           speakReply(data.response);
         }
 
@@ -1023,7 +1108,12 @@
       });
     }
 
-    function appendMessage(sender, text) {
+    // model, when present, is { id, url, subject } for a successful
+    // image-to-3D reply — renders a clickable "VIEW MODEL" tab that opens
+    // the preview panel. Wired via addEventListener rather than an inline
+    // onclick attribute so subject (arbitrary user-influenced text) never
+    // has to be safely embedded inside an HTML attribute string.
+    function appendMessage(sender, text, model = null) {
       const msgId = 'msg-' + (++messageIdCounter);
       const div = document.createElement('div');
       div.id = msgId;
@@ -1042,6 +1132,7 @@
           <div class="absolute top-0 left-0 w-2 h-2 border-t border-l border-cyan-400"></div>
           <p class="text-[9px] font-mono tracking-widest text-cyan-400 font-extrabold mb-2">NOAH CORE OUTPUT</p>
           <p class="text-sm text-slate-300 leading-relaxed">${linkify(text).replace(/\n/g, '<br>')}</p>
+          ${model ? `<button class="view-model-btn mt-3 text-[9px] font-mono tracking-widest text-cyan-400 border border-cyan-500/30 px-3 py-1.5 rounded hover:bg-cyan-500/10 uppercase transition duration-300">VIEW MODEL: ${escapeHtml(model.subject)}</button>` : ''}
         `;
       } else {
         div.className += " bg-rose-950/10 border-rose-500/20 max-w-xl text-rose-300";
@@ -1050,8 +1141,14 @@
           <p class="text-xs leading-relaxed font-mono">${linkify(text)}</p>
         `;
       }
-      
+
       chatMessages.appendChild(div);
+
+      if (model) {
+        const btn = div.querySelector('.view-model-btn');
+        if (btn) btn.addEventListener('click', () => openModelViewerPanel(model.id, model.url, model.subject));
+      }
+
       chatMessages.scrollTop = chatMessages.scrollHeight;
       return msgId;
     }

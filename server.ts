@@ -3,6 +3,7 @@ import * as fs from 'fs';
 import { execFileSync, spawn, ChildProcess } from 'child_process';
 import path from 'path';
 import dotenv from 'dotenv';
+import { randomUUID } from 'crypto';
 
 dotenv.config();
 
@@ -30,6 +31,20 @@ const IMAGE23D_TMP_DIR = path.join(IMAGE23D_DIR, "tmp");
 // unloaded, speech service stopped) rather than alongside them.
 const HUNYUAN3D_DIR = path.join(IMAGE23D_DIR, "Hunyuan3D-2");
 const HUNYUAN3D_PYTHON = path.join(HUNYUAN3D_DIR, "venv", "Scripts", "python.exe");
+
+// Lives under public/ so express.static() serves the .glb files directly —
+// no separate file-serving endpoint needed. Kept distinct from
+// IMAGE23D_TMP_DIR: that one gets wiped per-request, these are meant to
+// stick around so the "view model" tab in the UI keeps working after the
+// chat response that created it has scrolled by.
+const MODELS_DIR = path.join(__dirname, "public", "generated-models");
+// Leading dot deliberately — express.static() ignores dotfiles by default,
+// so this internal bookkeeping (unlike the .glb files themselves) isn't
+// directly fetchable over HTTP.
+const MODELS_INDEX_FILE = path.join(MODELS_DIR, ".index.json");
+// Cap on UNSAVED models specifically — anything explicitly saved via the
+// UI is exempt, so this only prunes the rolling "recent, not saved" set.
+const MAX_UNSAVED_MODELS = 20;
 
 const PERSONALITY_FILE = "personality.txt";
 const MEMORY_FILE = "memories/memory.json";
@@ -841,6 +856,83 @@ function scaleMeshToTargetSize(meshPath: string, targetSizeCm: number): Promise<
   });
 }
 
+// Converts the final (post-scaling, if any) mesh to .glb purely for the
+// browser "view model" panel — Fusion needs the .obj, <model-viewer> needs
+// glTF, so this runs as an extra step alongside the Fusion import rather
+// than replacing it. Best-effort: a failure here shouldn't sink the whole
+// reply just because the preview couldn't be generated.
+function convertMeshToGlb(meshPath: string, outputPath: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    const child = spawn(HUNYUAN3D_PYTHON, [path.join(IMAGE23D_DIR, "convert_to_glb.py"), meshPath, outputPath]);
+    let stderr = "";
+    child.stderr.on("data", (d) => { stderr += d.toString(); });
+    child.on("error", (err) => {
+      console.error("Failed to launch GLB conversion step:", err.message);
+      resolve(false);
+    });
+    child.on("exit", (code) => {
+      if (code !== 0 || !fs.existsSync(outputPath)) {
+        console.error("GLB conversion step failed:", stderr.trim().slice(-1000));
+        resolve(false);
+        return;
+      }
+      resolve(true);
+    });
+  });
+}
+
+interface GeneratedModelEntry {
+  id: string;
+  subject: string;
+  filename: string;
+  createdAt: string;
+  saved: boolean;
+}
+
+function loadModelsIndex(): GeneratedModelEntry[] {
+  try {
+    return JSON.parse(fs.readFileSync(MODELS_INDEX_FILE, "utf8"));
+  } catch {
+    return [];
+  }
+}
+
+function saveModelsIndex(entries: GeneratedModelEntry[]): void {
+  fs.mkdirSync(MODELS_DIR, { recursive: true });
+  fs.writeFileSync(MODELS_INDEX_FILE, JSON.stringify(entries, null, 2));
+}
+
+// Registers a freshly-converted .glb, then prunes the oldest UNSAVED
+// entries beyond MAX_UNSAVED_MODELS so preview files don't accumulate
+// forever with regular use — saved models are exempt from this entirely.
+function registerGeneratedModel(subject: string, filename: string): GeneratedModelEntry {
+  const entries = loadModelsIndex();
+  const entry: GeneratedModelEntry = {
+    id: randomUUID(),
+    subject,
+    filename,
+    createdAt: new Date().toISOString(),
+    saved: false
+  };
+  entries.push(entry);
+
+  const unsaved = entries.filter(e => !e.saved);
+  if (unsaved.length > MAX_UNSAVED_MODELS) {
+    const toPrune = unsaved
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+      .slice(0, unsaved.length - MAX_UNSAVED_MODELS);
+    const pruneIds = new Set(toPrune.map(e => e.id));
+    for (const old of toPrune) {
+      fs.rm(path.join(MODELS_DIR, old.filename), { force: true }, () => {});
+    }
+    saveModelsIndex(entries.filter(e => !pruneIds.has(e.id)));
+  } else {
+    saveModelsIndex(entries);
+  }
+
+  return entry;
+}
+
 // SearXNG's image category, used to find a reference photo for a named
 // subject before running it through the local image-to-3D model.
 async function webImageSearch(query: string): Promise<string[]> {
@@ -1112,6 +1204,29 @@ app.get('/api/hud-metrics', async (_, res) => {
     services,
     gpu: getGpuStats()
   });
+});
+
+// API: exempts a generated model from the MAX_UNSAVED_MODELS rotation —
+// the "SAVE" button in the model viewer panel.
+app.post('/api/models/:id/save', (req, res) => {
+  const entries = loadModelsIndex();
+  const entry = entries.find(e => e.id === req.params.id);
+  if (!entry) return res.status(404).json({ success: false, error: "Model not found — it may already have been pruned or discarded." });
+  entry.saved = true;
+  saveModelsIndex(entries);
+  res.json({ success: true });
+});
+
+// API: immediately deletes a generated model — the "DISCARD" button.
+app.delete('/api/models/:id', (req, res) => {
+  const entries = loadModelsIndex();
+  const entry = entries.find(e => e.id === req.params.id);
+  if (!entry) return res.status(404).json({ success: false, error: "Model not found — it may already have been pruned or discarded." });
+  fs.rm(path.join(MODELS_DIR, entry.filename), { force: true }, (err) => {
+    if (err) console.error("Failed to delete discarded model file:", entry.filename, err.message);
+  });
+  saveModelsIndex(entries.filter(e => e.id !== req.params.id));
+  res.json({ success: true });
 });
 
 // API: Speech-to-text — forwards recorded audio to the local Whisper service
@@ -1636,6 +1751,7 @@ Now generate code for this request: "${message}"`;
       const targetSizeCm = extractTargetSizeCm(message);
       const userSuppliedImageUrl = extractImageUrl(message);
       let imageReplyText: string = "Something went wrong generating that model.";
+      let generatedModel: GeneratedModelEntry | null = null;
 
       const { available: bridgeAvailable, justLaunched } = await ensureFusionBridgeAvailable();
       if (!bridgeAvailable) {
@@ -1859,6 +1975,19 @@ Now generate code for this request: "${message}"`;
             imageReplyText = importResult.success
               ? `Done — imported a 3D model of "${subject}" into Fusion 360, built from ${referenceLabel}.\n\n${scaleNote}`
               : `Fusion rejected importing the mesh: ${importResult.error}`;
+
+            // Best-effort: the preview panel is a nice-to-have, not worth
+            // failing an otherwise-successful import over. Converts from
+            // meshPathForImport (post-scaling, if any) so the preview
+            // matches what actually landed in Fusion, not the raw
+            // pre-scale output.
+            if (importResult.success) {
+              const glbFilename = `${Date.now()}.glb`;
+              const glbPath = path.join(MODELS_DIR, glbFilename);
+              if (await convertMeshToGlb(meshPathForImport, glbPath)) {
+                generatedModel = registerGeneratedModel(subject, glbFilename);
+              }
+            }
           }
         }
 
@@ -1869,7 +1998,15 @@ Now generate code for this request: "${message}"`;
       saveHistory();
       clearTimeout(timeout);
 
-      return res.json({ response: imageReplyText, hasProposedChanges: false });
+      return res.json({
+        response: imageReplyText,
+        hasProposedChanges: false,
+        ...(generatedModel ? {
+          modelId: generatedModel.id,
+          modelUrl: `/generated-models/${generatedModel.filename}`,
+          modelSubject: generatedModel.subject
+        } : {})
+      });
     }
 
     // An attached image with no 3D-generation intent is a general "what is
