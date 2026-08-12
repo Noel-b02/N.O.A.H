@@ -54,27 +54,19 @@ memories/          conversation history/recall (gitignored — personal data)
 
 ## Setup
 
-Requires Node.js, Python, Docker (for SearXNG), and an NVIDIA GPU (for
-Ollama/Whisper/image-to-3D — CPU fallback exists for some pieces but is much
-slower). Each subsystem has its own one-time setup doc:
+See [`GETTING_STARTED.md`](GETTING_STARTED.md) for a full walkthrough —
+prerequisites, cloning, pulling the Ollama models Noah expects, and which
+of the optional subsystems below you actually need. Each subsystem also
+has its own detailed one-time setup doc:
 
-1. [`SPEECH_SETUP.md`](SPEECH_SETUP.md) — Whisper + Kokoro venv
-2. [`SEARXNG_SETUP.md`](SEARXNG_SETUP.md) — local search container
+1. [`SEARXNG_SETUP.md`](SEARXNG_SETUP.md) — local search container
+2. [`SPEECH_SETUP.md`](SPEECH_SETUP.md) — Whisper + Kokoro venv
 3. [`FUSION_SETUP.md`](FUSION_SETUP.md) — the Fusion 360 add-in
 4. [`HUNYUAN3D_SETUP.md`](HUNYUAN3D_SETUP.md) — the Hunyuan3D-2 venv
 
-Then:
-
-```bash
-npm install
-npm run dev
-```
-
-`predev` automatically starts Ollama and SearXNG if they aren't already
-running. The server comes up at `http://localhost:3000`.
-
-`npm run dev` uses `tsx watch` and auto-reloads on file changes. `npm start`
-runs the compiled build (`npm run build` first) instead.
+`npm run dev` uses `tsx watch` and auto-reloads on file changes — what you
+want day to day. `npm start` runs the compiled build (`npm run build`
+first) instead.
 
 ## Hardware notes
 
