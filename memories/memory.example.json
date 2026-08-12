@@ -1,1 +1,9 @@
-{}
+{
+  "owner": "Alex",
+  "assistant_name": "N.O.A.H",
+  "facts": {
+    "birthday": "June 15th, 1995",
+    "job_title": "Mechanical Engineer",
+    "favorite_hobby": "3D printing"
+  }
+}
