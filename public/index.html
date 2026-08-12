@@ -170,16 +170,38 @@
         <div class="absolute top-0 right-0 w-3 h-3 border-t-2 border-r-2 border-cyan-500/20"></div>
         
         <form id="chat-form" class="max-w-5xl mx-auto relative group">
-          <!-- Glowing neon outer frame -->
-          <div class="absolute -inset-0.5 bg-gradient-to-r from-cyan-500 to-blue-500 rounded opacity-10 group-focus-within:opacity-30 blur transition duration-500"></div>
-          
-          <div class="relative flex items-center bg-slate-950/90 border border-cyan-500/20 rounded p-2">
+          <!-- Glowing neon outer frame — purely decorative, but being
+               position:absolute it paints (and intercepts clicks) above any
+               later sibling that isn't itself positioned. The existing
+               input row was already `relative` so it stacked above this by
+               default; the new image-attach preview wasn't, which is why
+               its remove button silently ate clicks. pointer-events-none
+               keeps that from ever biting anything added here again. -->
+          <div class="absolute -inset-0.5 bg-gradient-to-r from-cyan-500 to-blue-500 rounded opacity-10 group-focus-within:opacity-30 blur transition duration-500 pointer-events-none"></div>
+
+          <!-- Attached-image preview chip, shown once an image is picked/dropped -->
+          <div id="image-attach-preview" class="hidden items-center gap-2 mb-2 px-2 py-1.5 bg-slate-950/90 border border-cyan-500/20 rounded text-xs text-cyan-300 font-mono">
+            <img id="image-attach-thumb" class="w-8 h-8 object-cover rounded border border-cyan-500/30" />
+            <span id="image-attach-name" class="flex-1 truncate"></span>
+            <button type="button" id="image-attach-remove" class="text-rose-400 hover:text-rose-300 px-2" title="Remove attached image">✕</button>
+          </div>
+
+          <div id="chat-drop-zone" class="relative flex items-center bg-slate-950/90 border border-cyan-500/20 rounded p-2 transition-colors duration-150">
             <!-- Bracket element inside input -->
             <span class="text-cyan-500 font-mono px-2 text-sm select-none">&gt;</span>
-            <input 
-              type="text" 
-              id="user-input" 
-              placeholder="Inject neural instruction directive..." 
+            <input type="file" id="image-attach-input" accept="image/*" class="hidden" />
+            <button
+              type="button"
+              id="image-attach-btn"
+              title="Attach an image (or drag & drop one here)"
+              class="bg-cyan-950/40 hover:bg-cyan-500/15 border border-cyan-500/40 text-cyan-400 font-bold tracking-widest text-[10px] px-4 py-3 rounded uppercase transition duration-300 mr-2"
+            >
+              📷
+            </button>
+            <input
+              type="text"
+              id="user-input"
+              placeholder="Inject neural instruction directive..."
               class="flex-1 bg-transparent px-2 py-3 text-sm focus:outline-none placeholder-slate-700 text-cyan-100 tracking-wider font-mono"
               required
               autocomplete="off"
@@ -359,12 +381,70 @@
       }
     }
 
+    // --- Image attach (drag & drop, or the paperclip button) ---
+    // Kept as base64 in a plain JS object rather than uploading immediately —
+    // simplest way to piggyback on the existing single JSON /api/chat
+    // endpoint without adding multipart form handling.
+    const imageAttachInput = document.getElementById('image-attach-input');
+    const imageAttachBtn = document.getElementById('image-attach-btn');
+    const imageAttachPreview = document.getElementById('image-attach-preview');
+    const imageAttachThumb = document.getElementById('image-attach-thumb');
+    const imageAttachName = document.getElementById('image-attach-name');
+    const imageAttachRemove = document.getElementById('image-attach-remove');
+    const chatDropZone = document.getElementById('chat-drop-zone');
+    let attachedImage = null; // { base64, mimeType, fileName } | null
+
+    function setAttachedImage(file) {
+      if (!file || !file.type.startsWith('image/')) return;
+      const reader = new FileReader();
+      reader.onload = () => {
+        const dataUrl = reader.result;
+        const base64 = dataUrl.slice(dataUrl.indexOf(',') + 1);
+        attachedImage = { base64, mimeType: file.type, fileName: file.name };
+        imageAttachThumb.src = dataUrl;
+        imageAttachName.textContent = file.name;
+        imageAttachPreview.classList.remove('hidden');
+        imageAttachPreview.classList.add('flex');
+      };
+      reader.readAsDataURL(file);
+    }
+
+    function clearAttachedImage() {
+      attachedImage = null;
+      imageAttachInput.value = '';
+      imageAttachPreview.classList.add('hidden');
+      imageAttachPreview.classList.remove('flex');
+    }
+
+    imageAttachBtn.addEventListener('click', () => imageAttachInput.click());
+    imageAttachInput.addEventListener('change', () => setAttachedImage(imageAttachInput.files[0]));
+    imageAttachRemove.addEventListener('click', clearAttachedImage);
+
+    ['dragover', 'dragenter'].forEach(evt => {
+      chatDropZone.addEventListener(evt, (e) => {
+        e.preventDefault();
+        chatDropZone.classList.add('border-cyan-400', 'bg-cyan-500/5');
+      });
+    });
+    ['dragleave', 'drop'].forEach(evt => {
+      chatDropZone.addEventListener(evt, (e) => {
+        e.preventDefault();
+        chatDropZone.classList.remove('border-cyan-400', 'bg-cyan-500/5');
+      });
+    });
+    chatDropZone.addEventListener('drop', (e) => {
+      const file = e.dataTransfer.files && e.dataTransfer.files[0];
+      if (file) setAttachedImage(file);
+    });
+
     chatForm.addEventListener('submit', async (e) => {
       e.preventDefault();
       const message = userInput.value.trim();
       if (!message) return;
       userInput.value = '';
-      sendMessage(message);
+      const imageToSend = attachedImage;
+      clearAttachedImage();
+      sendMessage(message, imageToSend);
     });
 
     // Cosmetic-only guess at what kind of request this is, so the loading
@@ -415,8 +495,8 @@
       return options[Math.floor(Math.random() * options.length)];
     }
 
-    async function sendMessage(message) {
-      appendMessage('user', message);
+    async function sendMessage(message, attachedImage = null) {
+      appendMessage('user', attachedImage ? `${message} 📷 ${attachedImage.fileName}` : message);
 
       setCoreState('thinking');
       const loadingId = appendMessage('system', pickLoadingMessage(message));
@@ -425,7 +505,10 @@
         const response = await fetch('/api/chat', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ message })
+          body: JSON.stringify({
+            message,
+            ...(attachedImage ? { attachedImage: { base64: attachedImage.base64, mimeType: attachedImage.mimeType } } : {})
+          })
         });
         const data = await response.json();
         
@@ -843,7 +926,9 @@
 
         if (!voiceOutputEnabled) setVoiceOutput(true);
 
-        sendMessage(text);
+        const imageToSend = attachedImage;
+        clearAttachedImage();
+        sendMessage(text, imageToSend);
       } catch (err) {
         removeMessage(loadingId);
         appendMessage('system', 'COMMUNICATIONS FAILURE: Transcription request dropped.');

@@ -54,9 +54,9 @@ real-world subject:
   which the bridge executes. This is the path described above.
 - **Named subjects** ("a 3d model of spiderman", "make a model of a fox") —
   routed instead through the image-to-3D pipeline: Noah searches the web for
-  a reference photo, runs it through a local TripoSR model to get a mesh,
+  a reference photo, runs it through a local Hunyuan3D-2 model to get a mesh,
   then imports that mesh into the document via the bridge's `/import-mesh`
-  endpoint. Requires the separate one-time setup in `IMAGE23D_SETUP.md`.
+  endpoint. Requires the separate one-time setup in `HUNYUAN3D_SETUP.md`.
   Quality is far rougher than a hand-modeled asset, and the mesh isn't
   real-world scaled — check `IMAGE23D_SETUP.md`'s known limitations before
   relying on it. You can ask for a target size in the same request (e.g.

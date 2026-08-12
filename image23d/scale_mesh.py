@@ -10,8 +10,8 @@ target_size_cm = float(sys.argv[2])
 output_path = sys.argv[3]
 
 loaded = trimesh.load(mesh_path, process=False)
-# TripoSR's own export can be a multi-geometry Scene rather than a single
-# Trimesh depending on the mesh format — collapse it to one mesh either way.
+# Export can be a multi-geometry Scene rather than a single Trimesh
+# depending on the mesh format — collapse it to one mesh either way.
 mesh = loaded.dump(concatenate=True) if isinstance(loaded, trimesh.Scene) else loaded
 
 current_max = max(mesh.bounding_box.extents)

@@ -9,7 +9,10 @@ dotenv.config();
 const app = express();
 const PORT = 3000;
 
-app.use(express.json());
+// Default express.json() body limit is 100kb — far too small for a
+// base64-encoded photo attachment (which also inflates ~33% over the raw
+// file size), so this needs raising explicitly.
+app.use(express.json({ limit: "15mb" }));
 app.use(express.static(path.join(__dirname, 'public')));
 
 const OLLAMA_URL = process.env.OLLAMA_URL ?? "http://localhost:11434/api/generate";
@@ -23,8 +26,10 @@ const FUSION_BRIDGE_URL = process.env.FUSION_BRIDGE_URL ?? "http://localhost:900
 
 const IMAGE23D_DIR = path.join(__dirname, "image23d");
 const IMAGE23D_TMP_DIR = path.join(IMAGE23D_DIR, "tmp");
-const TRIPOSR_DIR = path.join(IMAGE23D_DIR, "TripoSR");
-const TRIPOSR_PYTHON = path.join(TRIPOSR_DIR, "venv", "Scripts", "python.exe");
+// Needs ~6GB VRAM in shape-only mode, so it runs exclusively (Ollama
+// unloaded, speech service stopped) rather than alongside them.
+const HUNYUAN3D_DIR = path.join(IMAGE23D_DIR, "Hunyuan3D-2");
+const HUNYUAN3D_PYTHON = path.join(HUNYUAN3D_DIR, "venv", "Scripts", "python.exe");
 
 const PERSONALITY_FILE = "personality.txt";
 const MEMORY_FILE = "memories/memory.json";
@@ -93,16 +98,14 @@ const previousSessionEndedAt = (() => {
   }
 })();
 
-let conversationHistory: string[] = loadHistory();
-archiveSession("startup", previousSessionEndedAt);
-
-let requestInFlight = false;
-let pendingCommit: CommitInfo | null = null;
-
 // Keeps the last retrieved archive context available for a few follow-up
 // turns (e.g. "give me specifics", "quote it") so the model doesn't have to
 // improvise from its own prior summary once the original recall query has
 // scrolled out of isRecallQuery detection.
+// Declared before archiveSession() is called below — that call reaches into
+// these on startup whenever there's leftover history to archive, so they
+// must already be initialized by the time it runs, not just by the time
+// their own line is reached.
 let stickyRecallContext = "";
 let stickyRecallTurnsRemaining = 0;
 const STICKY_RECALL_FOLLOWUP_TURNS = 3;
@@ -112,6 +115,12 @@ const STICKY_RECALL_FOLLOWUP_TURNS = 3;
 // original question, not just its own text summary from conversation history.
 let stickySearchContext = "";
 let stickySearchTurnsRemaining = 0;
+
+let conversationHistory: string[] = loadHistory();
+archiveSession("startup", previousSessionEndedAt);
+
+let requestInFlight = false;
+let pendingCommit: CommitInfo | null = null;
 
 
 function loadHistory(): string[] {
@@ -573,6 +582,40 @@ function stopSpeechService(): void {
   }
 }
 
+// Best-effort — if a model isn't currently loaded this just errors quietly,
+// which is fine, that's already the state we want.
+function unloadOllamaModels(): void {
+  for (const model of [CHAT_MODEL, CODE_MODEL]) {
+    try {
+      execFileSync("ollama", ["stop", model], { stdio: "pipe", timeout: 10000 });
+    } catch {
+      // Not loaded, or ollama isn't on PATH — either way, nothing to clean up.
+    }
+  }
+}
+
+// Some local models (Hunyuan3D's shape stage, ~6GB) need more VRAM than an
+// 8GB card has free once Ollama and the speech service are also holding
+// their share — there's no way to fit all three at once on this hardware.
+// This frees the other two first, runs the heavy step, then always restores
+// them afterward (even on failure) via finally. Voice input/output is
+// unavailable for the duration; the next Ollama reply after this also pays
+// a one-time model-reload cost. Once there's enough VRAM for everything at
+// once, this wrapper stops being necessary — it can just be removed instead
+// of updated.
+async function withGpuExclusive<T>(fn: () => Promise<T>): Promise<T> {
+  unloadOllamaModels();
+  stopSpeechService();
+  // kill() is fire-and-forget (SIGTERM) — give the process a moment to
+  // actually exit and release VRAM before starting the heavy step.
+  await new Promise(r => setTimeout(r, 2000));
+  try {
+    return await fn();
+  } finally {
+    startSpeechService();
+  }
+}
+
 startSpeechService();
 
 app.get('/api/status', (_, res) => {
@@ -619,6 +662,51 @@ async function isServiceHealthy(url: string, timeoutMs = 2000): Promise<boolean>
   }
 }
 
+// Fusion 360 auto-updates itself, and each update gets a new hash-named
+// folder under webdeploy/production — hardcoding a specific one would break
+// the next time it updates. Globbing for whichever folder currently has the
+// launcher keeps this working across updates with no maintenance.
+function findFusionLauncher(): string | null {
+  const base = path.join(process.env.LOCALAPPDATA ?? "", "Autodesk", "webdeploy", "production");
+  try {
+    for (const dir of fs.readdirSync(base)) {
+      const launcherPath = path.join(base, dir, "FusionLauncher.exe");
+      if (fs.existsSync(launcherPath)) return launcherPath;
+    }
+  } catch {
+    // webdeploy folder missing entirely — Fusion likely isn't installed
+    // under the default per-user location.
+  }
+  return null;
+}
+
+// Launches Fusion 360 if the bridge isn't reachable, then polls (rather than
+// guessing a fixed delay) since it's a heavy desktop app that can take a
+// while to start — real feedback beats a blind wait. Capped at 60s so the
+// rest of the pipeline (search/generation) still fits inside the overall
+// 180s request timeout on a first-launch request.
+async function ensureFusionBridgeAvailable(): Promise<{ available: boolean; justLaunched: boolean }> {
+  if (await isServiceHealthy(`${FUSION_BRIDGE_URL}/health`)) {
+    return { available: true, justLaunched: false };
+  }
+
+  const launcherPath = findFusionLauncher();
+  if (!launcherPath) {
+    return { available: false, justLaunched: false };
+  }
+
+  spawn(launcherPath, [], { detached: true, stdio: "ignore" }).unref();
+
+  const deadline = Date.now() + 60000;
+  while (Date.now() < deadline) {
+    await new Promise(r => setTimeout(r, 5000));
+    if (await isServiceHealthy(`${FUSION_BRIDGE_URL}/health`)) {
+      return { available: true, justLaunched: true };
+    }
+  }
+  return { available: false, justLaunched: true };
+}
+
 interface FusionExecutionResult {
   success: boolean;
   error?: string | null;
@@ -652,10 +740,21 @@ async function executeFusionScript(code: string): Promise<FusionExecutionResult>
   }
 }
 
+// Lets a request override the auto-searched reference image with a specific
+// one (e.g. "...in fusion 360: https://example.com/photo.jpg") — needed for
+// subjects like "controller holder" where every real product photo shows the
+// item in use, so no search phrasing can reliably find a clean shot.
+const IMAGE_URL_PATTERN = /(https?:\/\/\S+?\.(?:jpe?g|png|webp|gif)(?:\?\S*)?)(?=[\s.,;!?]|$)/i;
+
+function extractImageUrl(message: string): string | null {
+  const match = message.match(IMAGE_URL_PATTERN);
+  return match ? match[1] : null;
+}
+
 // Pulls the named subject out of an image-based Fusion request (e.g. "create
 // a 3d model of spiderman in fusion" -> "spiderman") so it can be used as
 // both the image search query and the reply text, without needing a
-// dedicated Ollama call just to extract a noun phrase.
+// dedicated Ollama call to extract a noun phrase.
 // Matches a trailing sizing instruction (e.g. ", make it 5cm", "5cm tall",
 // "about 2 inches") so it can be stripped before subject extraction — left
 // in place, it either gets glued onto the subject text (breaking the image
@@ -664,20 +763,25 @@ async function executeFusionScript(code: string): Promise<FusionExecutionResult>
 const SIZE_CLAUSE_PATTERN = /,?\s*\b(?:make (?:it|the model)\s+|about\s+|roughly\s+|sized?\s+(?:at\s+)?|at\s+)?\d+(?:\.\d+)?\s?(?:millimeters?|mm|centimeters?|cm|meters?|m|inches?|in|feet|ft)\b(?:\s+(?:tall|high|wide|long|in\s+(?:height|size)))?/i;
 
 function extractFusionSubject(message: string): string {
-  const withoutSize = message.replace(SIZE_CLAUSE_PATTERN, "").trim();
+  const withoutUrl = message.replace(IMAGE_URL_PATTERN, "").trim();
+  const withoutSize = withoutUrl.replace(SIZE_CLAUSE_PATTERN, "").trim();
   const ofMatch = withoutSize.match(/\bof\s+(?:a|an|the)\s+(.+?)[\?\.!]*$/i) ?? withoutSize.match(/\bof\s+(.+?)[\?\.!]*$/i);
   const raw = ofMatch ? ofMatch[1] : withoutSize.replace(/\b(create|make|generate|build|design)\b/gi, "").replace(/\b(a|an|the)\b/gi, "");
   // The "of ..." match is greedy to end-of-string, so it swallows trailing
   // trigger phrases too (e.g. "of a fox in fusion 360" -> "fox in fusion
   // 360") — strip those out regardless of which branch produced the string.
-  return raw
+  const cleaned = raw
     .replace(/\b(3d models?|3d shapes?|cad models?|in fusion(?: ?360)?)\b/gi, "")
+    .replace(/[:,.\s]+$/, "")
     .trim();
+  // A supplied URL leaves only a filler word behind (e.g. "this", "that") —
+  // swap in something readable for the reply text instead.
+  return cleaned && !/^(this|that|it)$/i.test(cleaned) ? cleaned : "the provided reference image";
 }
 
 // Looks for a "<number> <unit>" size mention (e.g. "5cm", "2 inches", "10mm
 // tall") and converts it to centimeters — the unit the Fusion import step
-// already treats TripoSR's raw output numbers as. Requires the unit to
+// already treats the generated mesh's raw output numbers as. Requires the unit to
 // immediately follow a digit, so ordinary words like "fox in fusion 360"
 // (which contains "in") don't false-positive.
 const SIZE_PATTERN = /(\d+(?:\.\d+)?)\s?(millimeters?|mm|centimeters?|cm|meters?|m\b|inches?|in\b|feet|ft\b)/i;
@@ -695,16 +799,17 @@ function extractTargetSizeCm(message: string): number | null {
   return null;
 }
 
-// Rescales the generated mesh (via trimesh, already installed for TripoSR)
-// so its largest bounding-box dimension matches the requested size, before
-// it ever reaches Fusion — sidesteps relying on Fusion's own scale tooling
-// supporting mesh bodies, which isn't clearly documented either way. Writes
-// to a separate output file rather than overwriting the input: if this step
-// fails partway, the original mesh must still be importable as a fallback.
+// Rescales the generated mesh (via trimesh, already installed for
+// Hunyuan3D-2) so its largest bounding-box dimension matches the requested
+// size, before it ever reaches Fusion — sidesteps relying on Fusion's own
+// scale tooling supporting mesh bodies, which isn't clearly documented
+// either way. Writes to a separate output file rather than overwriting the
+// input: if this step fails partway, the original mesh must still be
+// importable as a fallback.
 function scaleMeshToTargetSize(meshPath: string, targetSizeCm: number): Promise<string | null> {
   return new Promise((resolve) => {
     const scaledPath = meshPath.replace(/\.obj$/i, "_scaled.obj");
-    const child = spawn(TRIPOSR_PYTHON, [path.join(IMAGE23D_DIR, "scale_mesh.py"), meshPath, String(targetSizeCm), scaledPath]);
+    const child = spawn(HUNYUAN3D_PYTHON, [path.join(IMAGE23D_DIR, "scale_mesh.py"), meshPath, String(targetSizeCm), scaledPath]);
     let stderr = "";
     child.stderr.on("data", (d) => { stderr += d.toString(); });
     child.on("error", (err) => {
@@ -737,10 +842,30 @@ async function webImageSearch(query: string): Promise<string[]> {
     const data = await res.json() as { results?: any[] };
     return (data.results ?? [])
       .map((r: any) => r.img_src as string)
-      .filter((src: unknown): src is string => typeof src === "string" && /^https?:\/\//.test(src));
+      // SearXNG's image category mixes in unrelated dev-icon SVGs as noise
+      // (confirmed directly: devicons/lucide-static entries showing up for
+      // completely unrelated queries) — Hunyuan3D and the vision-model
+      // verification step both need a real raster photo, and Ollama flatly
+      // rejects SVGs ("Failed to load image or audio file"), so there's no
+      // point letting them occupy a candidate slot.
+      .filter((src: unknown): src is string => typeof src === "string" && /^https?:\/\//.test(src) && !/\.svg(\?|$)/i.test(src));
   } catch (err) {
     console.error("Web image search error (is SearXNG running at " + SEARXNG_URL + "?):", err);
     return [];
+  }
+}
+
+// Best-effort cleanup for the reference image and intermediate mesh files
+// created per image-to-3D request — this path is the only thing writing to
+// IMAGE23D_TMP_DIR, and without this it grows unbounded since nothing else
+// ever revisits old requests. Swallows errors since a leftover file here is
+// harmless and the request has already been answered by the time this runs.
+function cleanupTempFiles(paths: (string | null | undefined)[]): void {
+  for (const p of paths) {
+    if (!p) continue;
+    fs.rm(p, { force: true }, (err) => {
+      if (err) console.error("Temp file cleanup failed:", p, err.message);
+    });
   }
 }
 
@@ -757,6 +882,16 @@ async function downloadImageToFile(imageUrl: string, destPath: string): Promise<
       console.error("Reference image download failed:", imageUrl, "HTTP", res.status);
       return false;
     }
+    // Belt-and-suspenders alongside the .svg filter in webImageSearch — a
+    // URL with no telltale extension can still serve SVG, HTML (a soft
+    // 404), or another format neither Hunyuan3D nor Ollama's vision model
+    // can decode, and that's cheaper to catch here than after a wasted
+    // verification round-trip.
+    const contentType = res.headers.get("content-type") ?? "";
+    if (!contentType.startsWith("image/") || contentType.includes("svg")) {
+      console.error("Reference image download rejected:", imageUrl, "content-type", contentType);
+      return false;
+    }
     const buffer = Buffer.from(await res.arrayBuffer());
     fs.mkdirSync(path.dirname(destPath), { recursive: true });
     fs.writeFileSync(destPath, buffer);
@@ -767,51 +902,144 @@ async function downloadImageToFile(imageUrl: string, destPath: string): Promise<
   }
 }
 
+// Tries each candidate URL in turn until one actually downloads — a single
+// dead link (404, hotlink protection, or a domain your DNS resolver blocks —
+// confirmed directly: a Pi-hole install killed teahub.io and nothing else
+// downstream noticed) shouldn't sink the whole search when SearXNG handed
+// back several other usable results (typically hundreds). Capped well below
+// that since there's no value in exhausting all of them — 10 rather than 5
+// specifically because the multiview path's verify callback checks both
+// subject match AND full-body framing (confirmed directly: that two-part
+// bar has a real rejection rate, so 5 tries wasn't always enough headroom).
+async function downloadFirstAvailableImage(urls: string[], destPath: string, verify?: (path: string) => Promise<boolean>): Promise<string | null> {
+  for (const url of urls.slice(0, 10)) {
+    if (await downloadImageToFile(url, destPath)) {
+      if (!verify || await verify(destPath)) return url;
+    }
+  }
+  return null;
+}
+
+// Saves a UI-attached image (sent as base64 to keep the client-side upload
+// simple, no multipart parsing needed) to a temp file for the image-to-3D
+// model to read.
+function saveBase64ImageToFile(base64: string, mimeType: string): string {
+  const ext = (mimeType.split("/")[1] ?? "jpg").replace("jpeg", "jpg");
+  const filePath = path.join(IMAGE23D_TMP_DIR, `${Date.now()}.${ext}`);
+  fs.mkdirSync(IMAGE23D_TMP_DIR, { recursive: true });
+  fs.writeFileSync(filePath, Buffer.from(base64, "base64"));
+  return filePath;
+}
+
 interface MeshGenerationResult {
   success: boolean;
   meshPath?: string;
   error?: string;
 }
 
-// Runs TripoSR (image23d/TripoSR) as a one-off child process rather than a
-// persistent service — this is a rarely-used, GPU-heavy step, and keeping it
-// out-of-process means it doesn't hold VRAM hostage from Ollama/Kokoro the
-// rest of the time. See IMAGE23D_SETUP.md for the venv this expects.
-function generateMeshFromImage(imagePath: string): Promise<MeshGenerationResult> {
+// Real generative model with texture-capable output (though this call only
+// uses its shape stage; see HUNYUAN3D_DIR's comment above). The first call
+// downloads several GB of weights from Hugging Face, hence the long timeout.
+function generateMeshWithHunyuan3D(imagePath: string): Promise<MeshGenerationResult> {
   return new Promise((resolve) => {
-    if (!fs.existsSync(TRIPOSR_PYTHON)) {
-      resolve({ success: false, error: `TripoSR venv not found at ${TRIPOSR_PYTHON} — see IMAGE23D_SETUP.md.` });
+    if (!fs.existsSync(HUNYUAN3D_PYTHON)) {
+      resolve({ success: false, error: `Hunyuan3D venv not found at ${HUNYUAN3D_PYTHON}.` });
       return;
     }
 
-    const outputDir = path.join(TRIPOSR_DIR, "output");
-    const child = spawn(TRIPOSR_PYTHON, ["run.py", imagePath, "--output-dir", outputDir], { cwd: TRIPOSR_DIR });
+    // Must be .obj (or .stl/.3mf) — Fusion's meshBodies.add() only accepts
+    // those three formats and rejects .glb with "Unsupported file format"
+    // (confirmed directly). trimesh infers export format from the
+    // extension, so this alone is enough to fix it.
+    const outputPath = path.join(IMAGE23D_TMP_DIR, `${Date.now()}_hunyuan.obj`);
+    const child = spawn(HUNYUAN3D_PYTHON, ["run_shape_only.py", imagePath, outputPath], {
+      cwd: HUNYUAN3D_DIR,
+      // Hugging Face's newer "Xet" transfer backend has a well-documented
+      // stalling bug on large files (confirmed directly — a multi-GB weight
+      // file hung indefinitely at 0 bytes). Disabling it falls back to the
+      // older, reliable HTTP downloader. Only matters for the first run
+      // per model (weights are cached locally after), but costs nothing to
+      // always set.
+      env: { ...process.env, HF_HUB_DISABLE_XET: "1" }
+    });
 
     let stderr = "";
     child.stderr.on("data", (d) => { stderr += d.toString(); });
 
     const timeout = setTimeout(() => {
       child.kill();
-      resolve({ success: false, error: "TripoSR generation timed out after 3 minutes." });
-    }, 180000);
+      resolve({ success: false, error: "Hunyuan3D generation timed out after 8 minutes." });
+    }, 480000);
 
     child.on("error", (err) => {
       clearTimeout(timeout);
-      resolve({ success: false, error: `Failed to launch TripoSR: ${err.message}` });
+      resolve({ success: false, error: `Failed to launch Hunyuan3D: ${err.message}` });
     });
 
     child.on("exit", (code) => {
       clearTimeout(timeout);
       if (code !== 0) {
-        resolve({ success: false, error: stderr.trim().slice(-2000) || `TripoSR exited with code ${code}` });
+        resolve({ success: false, error: stderr.trim().slice(-2000) || `Hunyuan3D exited with code ${code}` });
         return;
       }
-      const meshPath = path.join(outputDir, "0", "mesh.obj");
-      if (!fs.existsSync(meshPath)) {
-        resolve({ success: false, error: "TripoSR finished but no mesh.obj was produced." });
+      if (!fs.existsSync(outputPath)) {
+        resolve({ success: false, error: "Hunyuan3D finished but no mesh file was produced." });
         return;
       }
-      resolve({ success: true, meshPath });
+      resolve({ success: true, meshPath: outputPath });
+    });
+  });
+}
+
+// Experimental: feeds three independently web-searched angle photos (front/
+// left/back) into Hunyuan3D-2mv instead of one photo into shape-only. Real
+// multiview conditioning gives better geometry ONLY if the three images
+// actually agree on what they're depicting — since they come from separate
+// searches, not one coordinated photoshoot, that's not guaranteed (different
+// art style, outfit variant, or pose per image is a real risk). Downloads
+// its own multi-GB weights from tencent/Hunyuan3D-2mv on first run, on top
+// of the shape-only model's weights.
+function generateMeshWithHunyuan3DMultiview(frontPath: string, leftPath: string, backPath: string): Promise<MeshGenerationResult> {
+  return new Promise((resolve) => {
+    if (!fs.existsSync(HUNYUAN3D_PYTHON)) {
+      resolve({ success: false, error: `Hunyuan3D venv not found at ${HUNYUAN3D_PYTHON}.` });
+      return;
+    }
+
+    const outputPath = path.join(IMAGE23D_TMP_DIR, `${Date.now()}_hunyuan_mv.obj`);
+    const child = spawn(HUNYUAN3D_PYTHON, ["run_multiview.py", frontPath, leftPath, backPath, outputPath], {
+      cwd: HUNYUAN3D_DIR,
+      env: { ...process.env, HF_HUB_DISABLE_XET: "1" }
+    });
+
+    let stderr = "";
+    child.stderr.on("data", (d) => { stderr += d.toString(); });
+
+    const timeout = setTimeout(() => {
+      child.kill();
+      // 45 minutes, not 10 — the first-ever call downloads its own multi-GB
+      // weight set from tencent/Hunyuan3D-2mv (confirmed directly: the base
+      // Hunyuan3D-2 weights alone took ~30 minutes on this connection), on
+      // top of whatever the actual diffusion pass needs afterward.
+      resolve({ success: false, error: "Hunyuan3D multiview generation timed out after 45 minutes." });
+    }, 2700000);
+
+    child.on("error", (err) => {
+      clearTimeout(timeout);
+      resolve({ success: false, error: `Failed to launch Hunyuan3D multiview: ${err.message}` });
+    });
+
+    child.on("exit", (code) => {
+      clearTimeout(timeout);
+      if (code !== 0) {
+        resolve({ success: false, error: stderr.trim().slice(-2000) || `Hunyuan3D multiview exited with code ${code}` });
+        return;
+      }
+      if (!fs.existsSync(outputPath)) {
+        resolve({ success: false, error: "Hunyuan3D multiview finished but no mesh file was produced." });
+        return;
+      }
+      resolve({ success: true, meshPath: outputPath });
     });
   });
 }
@@ -932,7 +1160,11 @@ app.post('/api/speak', async (req, res) => {
 
 // API: Send chat prompt to the assistant
 app.post('/api/chat', async (req, res) => {
- const { message } = req.body;
+  const { message, attachedImage } = req.body as {
+    message: string;
+    attachedImage?: { base64: string; mimeType: string } | null;
+  };
+  const hasAttachedImage = !!attachedImage?.base64;
 
   if (!message) {
     return res.status(400).json({ error: "Message is required." });
@@ -1220,16 +1452,19 @@ app.post('/api/chat', async (req, res) => {
       controller.abort();
     }, 180000);
 
-    async function callOllama(prompt: string, numPredict: number, think: boolean = false): Promise<string> {
+    async function callOllama(prompt: string, numPredict: number, think: boolean = false, images?: string[], model: string = selectedModel, signal: AbortSignal = controller.signal): Promise<string> {
       const res = await fetch(OLLAMA_URL, {
         method: "POST",
-        signal: controller.signal,
+        signal,
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          model: selectedModel,
+          model,
           prompt,
           stream: false,
           think,
+          // Ollama's vision models take images as a flat array of raw
+          // base64 strings (no data: URI prefix) alongside the prompt.
+          ...(images && images.length > 0 ? { images } : {}),
           options: {
             num_predict: numPredict,
             // Left at Ollama's default (4096) this silently truncates from the
@@ -1242,7 +1477,7 @@ app.post('/api/chat', async (req, res) => {
           }
         })
       });
-      if (!res.ok) throw new Error("Ollama connection failed");
+      if (!res.ok) throw new Error(`Ollama connection failed: HTTP ${res.status} ${await res.text().catch(() => "")}`.trim());
       const data = await res.json() as { response: string };
       return data.response;
     }
@@ -1348,10 +1583,12 @@ Now generate code for this request: "${message}"`;
         fusionReplyText = "I couldn't produce a valid code block for that model request. Try rephrasing it as a simpler shape.";
       } else {
         const generatedCode = codeMatch[1].trim();
-        const bridgeAvailable = await isServiceHealthy(`${FUSION_BRIDGE_URL}/health`);
+        const { available: bridgeAvailable, justLaunched } = await ensureFusionBridgeAvailable();
 
         if (!bridgeAvailable) {
-          fusionReplyText = `I generated code for this, but couldn't reach the Fusion 360 bridge at ${FUSION_BRIDGE_URL} — make sure Fusion 360 is running with the NoahFusionBridge add-in active.\n\nGenerated code:\n${generatedCode}`;
+          fusionReplyText = justLaunched
+            ? `I started Fusion 360 for you, but it's still loading (or the NoahFusionBridge add-in isn't set to run on startup) — give it a bit and try again. To make this automatic, check "Run on Startup" for NoahFusionBridge in Fusion's Add-Ins panel.\n\nGenerated code:\n${generatedCode}`
+            : `I generated code for this, but couldn't reach the Fusion 360 bridge at ${FUSION_BRIDGE_URL}, and couldn't find Fusion 360 to launch it automatically — make sure it's installed and running with the NoahFusionBridge add-in active.\n\nGenerated code:\n${generatedCode}`;
         } else {
           const result = await executeFusionScript(generatedCode);
           fusionReplyText = result.success
@@ -1369,48 +1606,240 @@ Now generate code for this request: "${message}"`;
 
     // Image-to-3D path: the request names a real subject (not parametric
     // geometry), so there's no CAD code to generate — instead find a
-    // reference photo, run it through the local TripoSR model to get a
+    // reference photo, run it through the local Hunyuan3D-2 model to get a
     // mesh, then import that mesh directly into the Fusion document.
     if (looksLikeImageFusionRequest) {
       const subject = extractFusionSubject(message);
       const targetSizeCm = extractTargetSizeCm(message);
-      let imageReplyText: string;
+      const userSuppliedImageUrl = extractImageUrl(message);
+      let imageReplyText: string = "Something went wrong generating that model.";
 
-      const bridgeAvailable = await isServiceHealthy(`${FUSION_BRIDGE_URL}/health`);
+      const { available: bridgeAvailable, justLaunched } = await ensureFusionBridgeAvailable();
       if (!bridgeAvailable) {
-        imageReplyText = `I'd need the Fusion 360 bridge running to import a model of "${subject}" — make sure Fusion 360 is running with the NoahFusionBridge add-in active.`;
+        imageReplyText = justLaunched
+          ? `I started Fusion 360 for you, but it's still loading (or the NoahFusionBridge add-in isn't set to run on startup) — give it a bit and try again. To make this automatic, check "Run on Startup" for NoahFusionBridge in Fusion's Add-Ins panel.`
+          : `I'd need Fusion 360 running to import a model of "${subject}", and couldn't find it installed to launch automatically — make sure it's running with the NoahFusionBridge add-in active.`;
       } else {
-        const imageUrls = await webImageSearch(subject);
-        if (imageUrls.length === 0) {
-          imageReplyText = `I couldn't find a usable reference image for "${subject}" to build a model from.`;
-        } else {
-          const imagePath = path.join(IMAGE23D_TMP_DIR, `${Date.now()}.jpg`);
-          const downloaded = await downloadImageToFile(imageUrls[0], imagePath);
-          if (!downloaded) {
-            imageReplyText = `Found a reference image for "${subject}" but couldn't download it to work with.`;
+        let imagePath: string | null = null;
+        let multiviewPaths: { front: string; left: string; back: string } | null = null;
+        let referenceLabel = "";
+        const tempFiles: string[] = [];
+
+        // An attached image is the most direct signal available — skip the
+        // URL/search steps entirely and use exactly what was dropped in.
+        if (hasAttachedImage) {
+          imagePath = saveBase64ImageToFile(attachedImage!.base64, attachedImage!.mimeType);
+          referenceLabel = "the image you attached";
+          tempFiles.push(imagePath);
+        } else if (userSuppliedImageUrl) {
+          const downloadPath = path.join(IMAGE23D_TMP_DIR, `${Date.now()}.jpg`);
+          const downloaded = await downloadImageToFile(userSuppliedImageUrl, downloadPath);
+          if (downloaded) {
+            imagePath = downloadPath;
+            referenceLabel = `this reference image: ${userSuppliedImageUrl}`;
+            tempFiles.push(imagePath);
           } else {
-            const meshResult = await generateMeshFromImage(imagePath);
-            if (!meshResult.success) {
-              imageReplyText = `Generating a mesh for "${subject}" failed: ${meshResult.error}`;
+            imageReplyText = `Found the image link you gave me for "${subject}" but couldn't download it to work with.`;
+          }
+        } else {
+          // The multiview search still applies to a partial-subject request
+          // (a bust genuinely does have a front/side/back worth capturing
+          // separately) — what has to change is what "correct framing"
+          // means. Requiring full-body for "a headbust of spiderman" would
+          // reject every real candidate, since a bust or close-up is BY
+          // DEFINITION not full-body. The verification prompt below keys
+          // off this instead of hardcoding full-body — and uses subject-
+          // agnostic language ("the entire X") rather than "full-body" /
+          // "face or head", which are person/creature-specific and don't
+          // fit a request like "a model of a car".
+          const wantsPartialSubject = /\b(headbust|bust|headshot|head[\s-]?only|close-?up|closeup|portrait)\b/i.test(subject);
+
+          // Explicit opt-out — an attached image or a pasted URL already
+          // forces the single-image path above regardless of wording, but
+          // there was no way to say "just use one image" in plain text when
+          // relying on search (confirmed directly: it silently attempted
+          // multiview anyway). Checked against the whole message, not just
+          // the extracted subject, since this is a request-shaped
+          // instruction rather than a description of what the subject is.
+          const wantsSingleImageOnly = /\b(one|single)\s+(image|photo|picture|reference)\b|\b(no|not|skip|without|don'?t)\b[^.?!]*\bmultiview\b/i.test(message);
+
+          if (!wantsSingleImageOnly) {
+          // Experimental: try to source three angle-matched photos so
+          // Hunyuan3D-2mv's real multiview conditioning can be used instead
+          // of one photo — see generateMeshWithHunyuan3DMultiview's comment
+          // for why three independently-searched images aren't guaranteed to
+          // actually agree with each other. Only commits to this path if all
+          // three searches return something; otherwise falls back to the
+          // proven single-image search below.
+
+          // Confirmed directly: without this, "spiderman front/side/back
+          // view" search results included at least one image that wasn't
+          // Spiderman at all, not just a different art style or pose — a
+          // mismatch real enough to sink the mesh, not just a quality risk.
+          // Ask the same local vision model used for image-description to
+          // reject candidates before they're ever fed to the mesh pipeline.
+          // Fails closed (treats an errored check as "not a match") since a
+          // silently-accepted bad image is the exact failure this exists to
+          // catch, and there are up to 5 other candidates left to try.
+          const verifyImageMatchesSubject = async (imagePath: string): Promise<boolean> => {
+            try {
+              const base64 = fs.readFileSync(imagePath).toString("base64");
+              // Uses its own timeout rather than the request-wide controller
+              // above — confirmed directly: that controller fires once at
+              // 180s for the whole /api/chat request, and up to 5 candidates
+              // per angle across 3 angles can plausibly take longer than
+              // that combined. Once it fires it's permanently tripped, so
+              // every verification call still in flight — for every
+              // angle, not just the slow one — would immediately fail and
+              // get treated as "not a match," collapsing the whole multiview
+              // attempt regardless of whether the images were actually fine.
+              // 200 tokens of budget covers this model's occasional (short)
+              // reasoning aside even with think=false, which does suppress
+              // the full chain-of-thought (confirmed directly).
+              // Confirmed directly: subject-match alone isn't enough — a
+              // genuine close-up crop and a genuine full view both pass
+              // "does this show spiderman"/"does this show a car", but
+              // they're incompatible views for one mesh (Hunyuan3D-2mv's
+              // own example images are all consistent full-subject
+              // framing). Reject close-ups too — unless the request itself
+              // wants a partial subject (a bust, a headshot), in which case
+              // a close-up IS the correct framing and requiring the whole
+              // subject would reject everything.
+              const answer = await callOllama(
+                wantsPartialSubject
+                  ? `Answer with exactly one word, YES or NO: does this image clearly show ${subject}?`
+                  : `Answer with exactly one word, YES or NO: does this image clearly show the entire ${subject}, not just a close-up of one part?`,
+                200,
+                false,
+                [base64],
+                CODE_MODEL,
+                AbortSignal.timeout(60000)
+              );
+              return /\byes\b/i.test(answer);
+            } catch (err) {
+              console.error("Image verification failed:", err);
+              return false;
+            }
+          };
+
+          // Fails closed like verifyImageMatchesSubject, same reasoning —
+          // an unreliable check should lose a mesh's worth of detail to the
+          // single-image fallback, not risk letting a genuinely conflicting
+          // set through. Ollama's images array can hold more than one
+          // image per call, and a vision-capable model can reason about all
+          // of them together in one response — this asks it to do exactly
+          // that instead of judging each photo alone.
+          const verifyImagesAreConsistentSet = async (frontPath: string, leftPath: string, backPath: string): Promise<boolean> => {
+            try {
+              const images = [frontPath, leftPath, backPath].map(p => fs.readFileSync(p).toString("base64"));
+              const answer = await callOllama(
+                `These three images are meant to be used as front, side, and back reference photos of the same subject for a 3D model. Answer with exactly one word, YES or NO: do all three actually show the same pose, art style, and appearance — not just the same subject, but consistent enough with each other to be usable as one coherent set?`,
+                300,
+                false,
+                images,
+                CODE_MODEL,
+                AbortSignal.timeout(90000)
+              );
+              return /\byes\b/i.test(answer);
+            } catch (err) {
+              console.error("Cross-image consistency check failed:", err);
+              return false;
+            }
+          };
+
+          const ts = Date.now();
+          const [frontUrls, leftUrls, backUrls] = await Promise.all([
+            webImageSearch(`${subject} front view`),
+            webImageSearch(`${subject} side view`),
+            webImageSearch(`${subject} back view`)
+          ]);
+          if (frontUrls.length > 0 && leftUrls.length > 0 && backUrls.length > 0) {
+            const frontPath = path.join(IMAGE23D_TMP_DIR, `${ts}_front.jpg`);
+            const leftPath = path.join(IMAGE23D_TMP_DIR, `${ts}_left.jpg`);
+            const backPath = path.join(IMAGE23D_TMP_DIR, `${ts}_back.jpg`);
+            // Sequential, not Promise.all — confirmed directly: three
+            // concurrent verification calls raced to cold-load the same
+            // model into VRAM simultaneously and Ollama errored out on all
+            // three. Once the model is loaded this would just queue safely,
+            // but there's no cheap way to know "already loaded" from here,
+            // so always serializing is the reliable option.
+            const frontUsed = await downloadFirstAvailableImage(frontUrls, frontPath, verifyImageMatchesSubject);
+            const leftUsed = await downloadFirstAvailableImage(leftUrls, leftPath, verifyImageMatchesSubject);
+            const backUsed = await downloadFirstAvailableImage(backUrls, backPath, verifyImageMatchesSubject);
+            tempFiles.push(frontPath, leftPath, backPath);
+            // Per-image verification above only checks each photo in
+            // isolation (right subject, right framing) — it can't catch the
+            // three of them disagreeing with EACH OTHER (confirmed directly:
+            // a Spiderman multiview mesh came out with two extra detached
+            // legs, almost certainly because the three source photos weren't
+            // actually the same pose — Hunyuan3D-2mv's multiview
+            // conditioning assumes all three ARE one pose from three camera
+            // angles, and feeding it three different poses/styles produces
+            // exactly this kind of geometry conflict). This final check
+            // shows all three together and asks whether they're actually
+            // usable as one consistent set — pose, art style, and
+            // appearance all need to roughly agree, not just the subject.
+            if (frontUsed && leftUsed && backUsed && await verifyImagesAreConsistentSet(frontPath, leftPath, backPath)) {
+              multiviewPaths = { front: frontPath, left: leftPath, back: backPath };
+              referenceLabel = `three separately-searched angle photos of "${subject}" (front: ${frontUsed}, side: ${leftUsed}, back: ${backUsed})`;
+            }
+          }
+          } // !wantsSingleImageOnly
+
+          if (!multiviewPaths) {
+            // Image-to-3D generation is highly sensitive to input quality —
+            // a clean, isolated-subject photo produces far better geometry
+            // than a random cluttered/watermarked web photo. Bias the
+            // search toward that first, falling back to a plain search if
+            // it finds nothing.
+            let imageUrls = await webImageSearch(`${subject} isolated on white background`);
+            if (imageUrls.length === 0) imageUrls = await webImageSearch(subject);
+            if (imageUrls.length === 0) {
+              imageReplyText = `I couldn't find a usable reference image for "${subject}" to build a model from.`;
             } else {
-              let meshPathForImport = meshResult.meshPath!;
-              let scaleNote = "Heads up: TripoSR's output isn't real-world scaled, so it may look tiny or huge at first — Fusion's Scale tool can fix that, and geometry detail is rough compared to a hand-modeled asset.";
-              if (targetSizeCm !== null) {
-                const scaledPath = await scaleMeshToTargetSize(meshResult.meshPath!, targetSizeCm);
-                if (scaledPath) {
-                  meshPathForImport = scaledPath;
-                  scaleNote = `Scaled it so its largest dimension is about ${targetSizeCm}cm — since I can't know which axis TripoSR treats as "height", that's an overall-size match rather than a guaranteed exact height.`;
-                } else {
-                  scaleNote = `Tried to scale it to ${targetSizeCm}cm but the scaling step failed, so it's still at TripoSR's raw output size — Fusion's Scale tool can fix that manually.`;
-                }
+              const downloadPath = path.join(IMAGE23D_TMP_DIR, `${Date.now()}.jpg`);
+              const usedUrl = await downloadFirstAvailableImage(imageUrls, downloadPath);
+              if (usedUrl) {
+                imagePath = downloadPath;
+                referenceLabel = `this reference image: ${usedUrl}`;
+                tempFiles.push(imagePath);
+              } else {
+                imageReplyText = `Found a reference image for "${subject}" but couldn't download it to work with.`;
               }
-              const importResult = await importMeshToFusion(meshPathForImport);
-              imageReplyText = importResult.success
-                ? `Done — imported a 3D model of "${subject}" into Fusion 360, built from this reference image: ${imageUrls[0]}\n\n${scaleNote}`
-                : `Fusion rejected importing the mesh: ${importResult.error}`;
             }
           }
         }
+
+        if (imagePath || multiviewPaths) {
+          // Needs exclusive use of the GPU on an 8GB card — see
+          // withGpuExclusive's comment for why and what that costs.
+          const meshResult = await withGpuExclusive(() => multiviewPaths
+            ? generateMeshWithHunyuan3DMultiview(multiviewPaths!.front, multiviewPaths!.left, multiviewPaths!.back)
+            : generateMeshWithHunyuan3D(imagePath!));
+          if (!meshResult.success) {
+            imageReplyText = `Generating a mesh for "${subject}" failed: ${meshResult.error}`;
+          } else {
+            tempFiles.push(meshResult.meshPath!);
+            let meshPathForImport = meshResult.meshPath!;
+            let scaleNote = "Heads up: this mesh isn't real-world scaled, so it may look tiny or huge at first — Fusion's Scale tool can fix that, and geometry detail is still rough compared to a hand-modeled asset.";
+            if (targetSizeCm !== null) {
+              const scaledPath = await scaleMeshToTargetSize(meshResult.meshPath!, targetSizeCm);
+              if (scaledPath) {
+                meshPathForImport = scaledPath;
+                tempFiles.push(scaledPath);
+                scaleNote = `Scaled it so its largest dimension is about ${targetSizeCm}cm — since I can't know which axis the model treats as "height", that's an overall-size match rather than a guaranteed exact height.`;
+              } else {
+                scaleNote = `Tried to scale it to ${targetSizeCm}cm but the scaling step failed, so it's still at the model's raw output size — Fusion's Scale tool can fix that manually.`;
+              }
+            }
+            const importResult = await importMeshToFusion(meshPathForImport);
+            imageReplyText = importResult.success
+              ? `Done — imported a 3D model of "${subject}" into Fusion 360, built from ${referenceLabel}.\n\n${scaleNote}`
+              : `Fusion rejected importing the mesh: ${importResult.error}`;
+          }
+        }
+
+        cleanupTempFiles(tempFiles);
       }
 
       conversationHistory.push(`Assistant: ${imageReplyText}`);
@@ -1418,6 +1847,32 @@ Now generate code for this request: "${message}"`;
       clearTimeout(timeout);
 
       return res.json({ response: imageReplyText, hasProposedChanges: false });
+    }
+
+    // An attached image with no 3D-generation intent is a general "what is
+    // this" / "describe this" question — send it straight to the local
+    // vision-capable model rather than the JSON-modification/recall pipeline
+    // below, which has nothing to do with image content.
+    if (hasAttachedImage) {
+      // Explicit and blunt on purpose: this model has a strong trained habit
+      // of reflexively claiming "I'm text-only, I can't see images" even
+      // when it demonstrably did receive and correctly process one (observed
+      // directly — it described real image content accurately, then denied
+      // being able to see anything). Left implicit, that denial reflex wins
+      // even over correct visual analysis in the same response.
+      const visionPrompt = `${personality}\n\nAn image is attached to this message and you can see it directly — for this request you have real vision input, not just text. Describe or answer based on what is actually visible. Never claim you can't see images or that you're text-only; that would be false here.\n\nUser: ${message}`;
+      let visionReply: string;
+      try {
+        visionReply = await callOllama(visionPrompt, 500, false, [attachedImage!.base64]);
+      } catch (err: any) {
+        visionReply = `I had trouble looking at that image: ${err.message}`;
+      }
+
+      conversationHistory.push(`Assistant: ${visionReply}`);
+      saveHistory();
+      clearTimeout(timeout);
+
+      return res.json({ response: visionReply, hasProposedChanges: false });
     }
 
     const recentHistory = conversationHistory.slice(-20).join("\n");
