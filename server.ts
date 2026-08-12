@@ -4,8 +4,6 @@ import { execFileSync, spawn, ChildProcess } from 'child_process';
 import path from 'path';
 import dotenv from 'dotenv';
 import { randomUUID } from 'crypto';
-import mqtt, { MqttClient } from 'mqtt';
-import { Client as FtpClient } from 'basic-ftp';
 
 dotenv.config();
 
@@ -26,17 +24,6 @@ const CODE_MODEL = process.env.OLLAMA_CODE_MODEL ?? "qwen3.5:9b";
 
 const SEARXNG_URL = process.env.SEARXNG_URL ?? "http://localhost:8080";
 const FUSION_BRIDGE_URL = process.env.FUSION_BRIDGE_URL ?? "http://localhost:9000";
-
-// Bambu Lab printer (local network, LAN/Developer Mode) — see
-// PRINTER_SETUP.md. Unlike every other URL above, these three have no safe
-// default: they're unique to one printer and network, so an empty string
-// means "printing disabled" rather than "use the default."
-const PRINTER_IP = process.env.PRINTER_IP ?? "";
-const PRINTER_SERIAL = process.env.PRINTER_SERIAL ?? "";
-const PRINTER_ACCESS_CODE = process.env.PRINTER_ACCESS_CODE ?? "";
-const PRINTER_MQTT_PORT = process.env.PRINTER_MQTT_PORT ?? "8883";
-const PRINTER_FTP_PORT = process.env.PRINTER_FTP_PORT ?? "990";
-const PRINTER_AUTOSTART = (process.env.PRINTER_AUTOSTART ?? "true").toLowerCase() !== "false";
 
 // Bambu Studio CLI (slicing) — see PRINTER_SETUP.md. Profile paths are left
 // blank rather than guessed: where Bambu Studio stores its bundled system
@@ -684,176 +671,37 @@ async function withGpuExclusive<T>(fn: () => Promise<T>): Promise<T> {
 
 startSpeechService();
 
-// --- Bambu Lab printer (local LAN MQTT status + FTPS upload) ---
-// See PRINTER_SETUP.md. Bambu's LAN protocol is reverse-engineered
-// community knowledge, not officially documented — the report/command
-// shapes below are the pieces most likely to need correction once tested
-// against a real printer.
-type PrinterConnectionState = "offline" | "connecting" | "idle" | "printing" | "paused" | "error";
-
-interface BambuPrinterReport {
-  gcodeState: string | null;
-  progressPercent: number | null;
-  nozzleTempC: number | null;
-  bedTempC: number | null;
-  currentFile: string | null;
-  remainingTimeMin: number | null;
-}
-
-let printerMqttClient: MqttClient | null = null;
-let printerConnectionState: PrinterConnectionState = "offline";
-let printerLastReport: BambuPrinterReport | null = null;
-let printerLastError: string | null = null;
-
-function printerConfigured(): boolean {
-  return Boolean(PRINTER_IP && PRINTER_SERIAL && PRINTER_ACCESS_CODE);
-}
-
-function connectPrinter(): void {
-  if (!PRINTER_AUTOSTART) {
-    console.log("[printer] Auto-connect disabled (PRINTER_AUTOSTART=false).");
-    return;
-  }
-  if (!printerConfigured()) {
-    console.log("[printer] PRINTER_IP/PRINTER_SERIAL/PRINTER_ACCESS_CODE not set — printing disabled until configured (see PRINTER_SETUP.md).");
-    return;
-  }
-  if (printerMqttClient) return;
-
-  printerConnectionState = "connecting";
-  console.log(`[printer] Connecting to ${PRINTER_IP}:${PRINTER_MQTT_PORT}...`);
-
-  const client = mqtt.connect(`mqtts://${PRINTER_IP}:${PRINTER_MQTT_PORT}`, {
-    username: "bblp",
-    password: PRINTER_ACCESS_CODE,
-    rejectUnauthorized: false, // printer uses a self-signed LAN cert
-    reconnectPeriod: 5000,
-  });
-
-  client.on("connect", () => {
-    printerConnectionState = "idle";
-    printerLastError = null;
-    console.log("[printer] Connected.");
-    client.subscribe(`device/${PRINTER_SERIAL}/report`);
-    // Requests an immediate full status snapshot instead of waiting for
-    // the printer's next scheduled report.
-    client.publish(`device/${PRINTER_SERIAL}/request`, JSON.stringify({ pushing: { sequence_id: "0", command: "pushall" } }));
-  });
-
-  client.on("message", (_topic, payload) => {
-    try {
-      const parsed = JSON.parse(payload.toString());
-      const print = parsed.print;
-      if (!print) return;
-      printerLastReport = {
-        gcodeState: print.gcode_state ?? null,
-        progressPercent: typeof print.mc_percent === "number" ? print.mc_percent : null,
-        nozzleTempC: typeof print.nozzle_temper === "number" ? print.nozzle_temper : null,
-        bedTempC: typeof print.bed_temper === "number" ? print.bed_temper : null,
-        currentFile: print.gcode_file ?? null,
-        remainingTimeMin: typeof print.mc_remaining_time === "number" ? print.mc_remaining_time : null,
-      };
-      if (printerLastReport.gcodeState === "RUNNING") printerConnectionState = "printing";
-      else if (printerLastReport.gcodeState === "PAUSE") printerConnectionState = "paused";
-      else if (printerConnectionState !== "error") printerConnectionState = "idle";
-    } catch (err) {
-      console.warn("[printer] Failed to parse status message:", (err as Error).message);
-    }
-  });
-
-  client.on("error", (err) => {
-    printerConnectionState = "error";
-    printerLastError = err.message;
-    console.warn("[printer] Connection error:", err.message);
-  });
-
-  client.on("close", () => {
-    if (printerConnectionState !== "error") printerConnectionState = "offline";
-  });
-
-  printerMqttClient = client;
-}
-
-function disconnectPrinter(): void {
-  if (printerMqttClient) {
-    printerMqttClient.end(true);
-    printerMqttClient = null;
-  }
-  printerConnectionState = "offline";
-}
-
-function isPrinterConnected(): boolean {
-  return printerMqttClient !== null && printerConnectionState !== "offline" && printerConnectionState !== "error";
-}
-
-// Opportunistic reconnect, called right before something that actually
-// needs the printer (uploading/starting a job) — unlike the other HUD
-// services, MQTT is a standing connection rather than a per-request HTTP
-// health check, so this isn't polled by the HUD endpoint.
-async function ensurePrinterConnected(): Promise<boolean> {
-  if (isPrinterConnected()) return true;
-  if (!printerConfigured()) return false;
-  connectPrinter();
-  for (let i = 0; i < 20; i++) {
-    if (isPrinterConnected()) return true;
-    await new Promise(r => setTimeout(r, 250));
-  }
-  return isPrinterConnected();
-}
-
-function getPrinterStatus(): { state: PrinterConnectionState; report: BambuPrinterReport | null; error: string | null; configured: boolean } {
-  return { state: printerConnectionState, report: printerLastReport, error: printerLastError, configured: printerConfigured() };
-}
-
-// Uploads a sliced .gcode.3mf to the printer's local FTPS server ahead of
-// starting a print job. The remote directory layout is reverse-engineered
-// like the MQTT schema above — needs live verification.
-async function uploadGcodeToPrinter(localPath: string, remoteFilename: string): Promise<{ success: boolean; error?: string }> {
-  const client = new FtpClient();
+// --- Bambu Connect (official print handoff) ---
+// See PRINTER_SETUP.md. Bambu Lab's own desktop relay app — chosen over a
+// direct MQTT/FTP connection specifically because that path requires
+// LAN-only + Developer Mode on the printer, which drops Bambu Handy and
+// remote cloud access entirely. Bambu Connect keeps the printer on normal
+// Cloud mode. Trade-off: this is a one-directional handoff (Noah opens the
+// file in Bambu Connect, the user confirms in ITS window) — there's no
+// channel back to Noah for live print status, so unlike a direct MQTT link
+// this can't report PRINTING/PAUSED/percent-complete.
+function isBambuConnectInstalled(): boolean {
   try {
-    await client.access({
-      host: PRINTER_IP,
-      port: Number(PRINTER_FTP_PORT),
-      user: "bblp",
-      password: PRINTER_ACCESS_CODE,
-      secure: true,
-      secureOptions: { rejectUnauthorized: false },
-    });
-    await client.uploadFrom(localPath, remoteFilename);
-    return { success: true };
-  } catch (err) {
-    return { success: false, error: (err as Error).message };
-  } finally {
-    client.close();
+    execFileSync("reg", ["query", "HKCR\\bambu-connect"], { stdio: "pipe", timeout: 3000 });
+    return true;
+  } catch {
+    return false;
   }
 }
 
-// Publishes the print-start command referencing an already-uploaded file.
-// This is the single least-documented piece of the whole integration —
-// isolated in its own function since it's the most likely to need
-// correction once tested against the real printer.
-function startPrintJob(remoteFilename: string): { success: boolean; error?: string } {
-  if (!isPrinterConnected() || !printerMqttClient) {
-    return { success: false, error: "Printer isn't connected." };
-  }
+// URL scheme is beta and undocumented beyond Bambu's own wiki page — Bambu
+// Lab could change it without notice. `start` with an empty title arg is
+// the standard way to hand a URL to whatever's registered for its protocol
+// on Windows, same as clicking a link would.
+function launchBambuConnect(gcodePath: string, name: string): { success: boolean; error?: string } {
+  const url = `bambu-connect://import-file?path=${encodeURIComponent(gcodePath)}&name=${encodeURIComponent(name)}&version=1.0.0`;
   try {
-    printerMqttClient.publish(`device/${PRINTER_SERIAL}/request`, JSON.stringify({
-      print: {
-        sequence_id: "0",
-        command: "project_file",
-        param: "Metadata/plate_1.gcode",
-        url: `file:///sdcard/${remoteFilename}`,
-        subtask_name: remoteFilename,
-        use_ams: false,
-      }
-    }));
+    spawn("cmd", ["/c", "start", "", url], { detached: true, stdio: "ignore" }).unref();
     return { success: true };
   } catch (err) {
     return { success: false, error: (err as Error).message };
   }
 }
-
-connectPrinter();
 
 app.get('/api/status', (_, res) => {
   res.json({
@@ -1554,7 +1402,7 @@ app.get('/api/hud-metrics', async (_, res) => {
     generating: gpuExclusiveTaskRunning,
     fusionAvailable: fusionHealthy,
     services,
-    printer: getPrinterStatus(),
+    printer: { installed: isBambuConnectInstalled() },
     gpu: getGpuStats()
   });
 });
@@ -1728,25 +1576,16 @@ app.post('/api/chat', async (req, res) => {
       pendingPrintJob = null;
       requestInFlight = false;
       conversationHistory.push(`User: ${message}`);
-      const connected = await ensurePrinterConnected();
-      if (!connected) {
-        const reply = "Couldn't reach the printer to start that print — check it's powered on and connected to the LAN (see PRINTER_SETUP.md).";
+      if (!isBambuConnectInstalled()) {
+        const reply = "Bambu Connect doesn't seem to be installed — install it and sign into your Bambu account first (see PRINTER_SETUP.md), then try again.";
         conversationHistory.push(`Assistant: ${reply}`);
         saveHistory();
         return res.json({ response: reply, hasProposedChanges: false });
       }
-      const remoteFilename = `${slugify(job.subject)}.gcode.3mf`;
-      const uploadResult = await uploadGcodeToPrinter(job.gcodePath, remoteFilename);
-      if (!uploadResult.success) {
-        const reply = `Uploading the sliced file to the printer failed: ${uploadResult.error}`;
-        conversationHistory.push(`Assistant: ${reply}`);
-        saveHistory();
-        return res.json({ response: reply, hasProposedChanges: false });
-      }
-      const startResult = startPrintJob(remoteFilename);
-      const reply = startResult.success
-        ? `Started printing "${job.subject}" on the P2S.`
-        : `Uploaded the file, but starting the print failed: ${startResult.error}`;
+      const launchResult = launchBambuConnect(job.gcodePath, job.subject);
+      const reply = launchResult.success
+        ? `Handed "${job.subject}" off to Bambu Connect — check its window to confirm and start the print.`
+        : `Couldn't hand the file off to Bambu Connect: ${launchResult.error}`;
       conversationHistory.push(`Assistant: ${reply}`);
       saveHistory();
       return res.json({ response: reply, hasProposedChanges: false });
@@ -2465,7 +2304,7 @@ Now generate code for this request: "${message}"`;
                   const estimateText = sliceResult.estimatedTimeMin
                     ? ` Estimated print time: ${sliceResult.estimatedTimeMin} min${sliceResult.estimatedFilamentG ? `, ~${sliceResult.estimatedFilamentG}g filament` : ""}.`
                     : "";
-                  imageReplyText += `\n\nSliced and ready to print.${estimateText} Reply "print" to start it, or ignore this to skip.`;
+                  imageReplyText += `\n\nSliced and ready to print.${estimateText} Reply "print" to hand it off to Bambu Connect, or ignore this to skip.`;
                 } else if (sliceResult.error) {
                   imageReplyText += `\n\n(Skipped printing: ${sliceResult.error})`;
                 }
@@ -3014,7 +2853,6 @@ function shutdown(signal: string) {
   console.log(`\nReceived ${signal}, archiving session before exit...`);
   archiveSession("manual");
   stopSpeechService();
-  disconnectPrinter();
   process.exit(0);
 }
 

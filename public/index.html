@@ -495,25 +495,19 @@
       text.classList.add(`text-${colorClass}`);
     }
 
-    // Five states, mirroring MESH_GEN's dot+text pattern but with an extra
-    // PAUSED/ERROR distinction the printer actually needs (a print can be
-    // paused mid-job, and the MQTT link can drop into a real error state,
-    // neither of which apply to the Fusion bridge's simpler up/down check).
-    function setPrinterState(state) {
+    // Only two states, unlike MESH_GEN's three — printing goes through
+    // Bambu Connect (a separate app Noah hands a file off to, see
+    // PRINTER_SETUP.md), which gives Noah no channel back for live status.
+    // This can only say whether Bambu Connect is installed and reachable
+    // via its URL scheme, not whether anything is actively printing.
+    function setPrinterState(installed) {
       const dot = document.getElementById('svc-printer');
       const text = document.getElementById('svc-printer-text');
-      dot.classList.remove('bg-slate-600', 'bg-emerald-400', 'bg-rose-500', 'bg-amber-400');
-      text.classList.remove('text-emerald-400', 'text-rose-500', 'text-amber-400');
+      dot.classList.remove('bg-slate-600', 'bg-emerald-400', 'bg-rose-500');
+      text.classList.remove('text-emerald-400', 'text-rose-500');
 
-      let label, colorClass;
-      switch (state) {
-        case 'idle': label = 'IDLE'; colorClass = 'emerald-400'; break;
-        case 'printing': label = 'PRINTING'; colorClass = 'amber-400'; break;
-        case 'paused': label = 'PAUSED'; colorClass = 'amber-400'; break;
-        case 'connecting': label = 'CONNECTING'; colorClass = 'amber-400'; break;
-        case 'error': label = 'ERROR'; colorClass = 'rose-500'; break;
-        default: label = 'OFFLINE'; colorClass = 'rose-500'; break;
-      }
+      const colorClass = installed ? 'emerald-400' : 'rose-500';
+      const label = installed ? 'READY' : 'OFFLINE';
 
       dot.classList.add(`bg-${colorClass}`);
       dot.title = label.toLowerCase();
@@ -530,7 +524,7 @@
         setServiceDot('svc-searxng', data.services.searxng);
         setServiceDot('svc-speech', data.services.speech);
         setMeshGenState(data.fusionAvailable, data.generating);
-        setPrinterState(data.printer ? data.printer.state : 'offline');
+        setPrinterState(Boolean(data.printer && data.printer.installed));
 
         if (data.gpu) {
           document.getElementById('telemetry-load').textContent = `${data.gpu.utilizationPercent.toFixed(1)}%`;
@@ -545,7 +539,7 @@
         setServiceDot('svc-searxng', false);
         setServiceDot('svc-speech', false);
         setMeshGenState(false, false);
-        setPrinterState('offline');
+        setPrinterState(false);
         document.getElementById('telemetry-load').textContent = 'N/A';
         document.getElementById('telemetry-temp').textContent = 'N/A';
       }
