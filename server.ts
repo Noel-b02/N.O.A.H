@@ -4,6 +4,8 @@ import { execFileSync, spawn, ChildProcess } from 'child_process';
 import path from 'path';
 import dotenv from 'dotenv';
 import { randomUUID } from 'crypto';
+import mqtt, { MqttClient } from 'mqtt';
+import { Client as FtpClient } from 'basic-ftp';
 
 dotenv.config();
 
@@ -24,6 +26,25 @@ const CODE_MODEL = process.env.OLLAMA_CODE_MODEL ?? "qwen3.5:9b";
 
 const SEARXNG_URL = process.env.SEARXNG_URL ?? "http://localhost:8080";
 const FUSION_BRIDGE_URL = process.env.FUSION_BRIDGE_URL ?? "http://localhost:9000";
+
+// Bambu Lab printer (local network, LAN/Developer Mode) — see
+// PRINTER_SETUP.md. Unlike every other URL above, these three have no safe
+// default: they're unique to one printer and network, so an empty string
+// means "printing disabled" rather than "use the default."
+const PRINTER_IP = process.env.PRINTER_IP ?? "";
+const PRINTER_SERIAL = process.env.PRINTER_SERIAL ?? "";
+const PRINTER_ACCESS_CODE = process.env.PRINTER_ACCESS_CODE ?? "";
+const PRINTER_MQTT_PORT = process.env.PRINTER_MQTT_PORT ?? "8883";
+const PRINTER_FTP_PORT = process.env.PRINTER_FTP_PORT ?? "990";
+const PRINTER_AUTOSTART = (process.env.PRINTER_AUTOSTART ?? "true").toLowerCase() !== "false";
+
+// Bambu Studio CLI (slicing) — see PRINTER_SETUP.md. Profile paths are left
+// blank rather than guessed: where Bambu Studio stores its bundled system
+// profiles varies and hasn't been confirmed against a real install yet.
+const BAMBU_STUDIO_EXE = process.env.BAMBU_STUDIO_EXE ?? "C:\\Program Files\\Bambu Studio\\bambu-studio.exe";
+const BAMBU_MACHINE_PROFILE = process.env.BAMBU_MACHINE_PROFILE ?? "";
+const BAMBU_PROCESS_PROFILE = process.env.BAMBU_PROCESS_PROFILE ?? "";
+const BAMBU_FILAMENT_PROFILE = process.env.BAMBU_FILAMENT_PROFILE ?? "";
 
 const IMAGE23D_DIR = path.join(__dirname, "image23d");
 const IMAGE23D_TMP_DIR = path.join(IMAGE23D_DIR, "tmp");
@@ -142,6 +163,21 @@ let pendingCommit: CommitInfo | null = null;
 // the user about explicitly rather than just reading GPU utilization.
 let gpuExclusiveTaskRunning = false;
 
+interface PendingPrintJob {
+  gcodePath: string;
+  subject: string;
+  estimatedTimeMin: number | null;
+  estimatedFilamentG: number | null;
+  createdAt: number;
+}
+// Deliberately NOT decremented/cleared by an unrelated intervening message
+// like the sticky-recall/search followups above are — a pending print
+// should survive small talk and only clear on explicit confirm, explicit
+// cancel, or PENDING_PRINT_EXPIRY_MS, since "reply print to start it"
+// implies the user can reply whenever, not necessarily next turn.
+let pendingPrintJob: PendingPrintJob | null = null;
+const PENDING_PRINT_EXPIRY_MS = 10 * 60 * 1000;
+
 
 function loadHistory(): string[] {
   try {
@@ -224,6 +260,7 @@ function archiveSession(reason: "startup" | "manual", archivedAt: Date = new Dat
   stickyRecallTurnsRemaining = 0;
   stickySearchContext = "";
   stickySearchTurnsRemaining = 0;
+  pendingPrintJob = null;
 
   console.log(`Archived session (${reason}) -> ${archivePath}`);
   return archivePath;
@@ -647,6 +684,177 @@ async function withGpuExclusive<T>(fn: () => Promise<T>): Promise<T> {
 
 startSpeechService();
 
+// --- Bambu Lab printer (local LAN MQTT status + FTPS upload) ---
+// See PRINTER_SETUP.md. Bambu's LAN protocol is reverse-engineered
+// community knowledge, not officially documented — the report/command
+// shapes below are the pieces most likely to need correction once tested
+// against a real printer.
+type PrinterConnectionState = "offline" | "connecting" | "idle" | "printing" | "paused" | "error";
+
+interface BambuPrinterReport {
+  gcodeState: string | null;
+  progressPercent: number | null;
+  nozzleTempC: number | null;
+  bedTempC: number | null;
+  currentFile: string | null;
+  remainingTimeMin: number | null;
+}
+
+let printerMqttClient: MqttClient | null = null;
+let printerConnectionState: PrinterConnectionState = "offline";
+let printerLastReport: BambuPrinterReport | null = null;
+let printerLastError: string | null = null;
+
+function printerConfigured(): boolean {
+  return Boolean(PRINTER_IP && PRINTER_SERIAL && PRINTER_ACCESS_CODE);
+}
+
+function connectPrinter(): void {
+  if (!PRINTER_AUTOSTART) {
+    console.log("[printer] Auto-connect disabled (PRINTER_AUTOSTART=false).");
+    return;
+  }
+  if (!printerConfigured()) {
+    console.log("[printer] PRINTER_IP/PRINTER_SERIAL/PRINTER_ACCESS_CODE not set — printing disabled until configured (see PRINTER_SETUP.md).");
+    return;
+  }
+  if (printerMqttClient) return;
+
+  printerConnectionState = "connecting";
+  console.log(`[printer] Connecting to ${PRINTER_IP}:${PRINTER_MQTT_PORT}...`);
+
+  const client = mqtt.connect(`mqtts://${PRINTER_IP}:${PRINTER_MQTT_PORT}`, {
+    username: "bblp",
+    password: PRINTER_ACCESS_CODE,
+    rejectUnauthorized: false, // printer uses a self-signed LAN cert
+    reconnectPeriod: 5000,
+  });
+
+  client.on("connect", () => {
+    printerConnectionState = "idle";
+    printerLastError = null;
+    console.log("[printer] Connected.");
+    client.subscribe(`device/${PRINTER_SERIAL}/report`);
+    // Requests an immediate full status snapshot instead of waiting for
+    // the printer's next scheduled report.
+    client.publish(`device/${PRINTER_SERIAL}/request`, JSON.stringify({ pushing: { sequence_id: "0", command: "pushall" } }));
+  });
+
+  client.on("message", (_topic, payload) => {
+    try {
+      const parsed = JSON.parse(payload.toString());
+      const print = parsed.print;
+      if (!print) return;
+      printerLastReport = {
+        gcodeState: print.gcode_state ?? null,
+        progressPercent: typeof print.mc_percent === "number" ? print.mc_percent : null,
+        nozzleTempC: typeof print.nozzle_temper === "number" ? print.nozzle_temper : null,
+        bedTempC: typeof print.bed_temper === "number" ? print.bed_temper : null,
+        currentFile: print.gcode_file ?? null,
+        remainingTimeMin: typeof print.mc_remaining_time === "number" ? print.mc_remaining_time : null,
+      };
+      if (printerLastReport.gcodeState === "RUNNING") printerConnectionState = "printing";
+      else if (printerLastReport.gcodeState === "PAUSE") printerConnectionState = "paused";
+      else if (printerConnectionState !== "error") printerConnectionState = "idle";
+    } catch (err) {
+      console.warn("[printer] Failed to parse status message:", (err as Error).message);
+    }
+  });
+
+  client.on("error", (err) => {
+    printerConnectionState = "error";
+    printerLastError = err.message;
+    console.warn("[printer] Connection error:", err.message);
+  });
+
+  client.on("close", () => {
+    if (printerConnectionState !== "error") printerConnectionState = "offline";
+  });
+
+  printerMqttClient = client;
+}
+
+function disconnectPrinter(): void {
+  if (printerMqttClient) {
+    printerMqttClient.end(true);
+    printerMqttClient = null;
+  }
+  printerConnectionState = "offline";
+}
+
+function isPrinterConnected(): boolean {
+  return printerMqttClient !== null && printerConnectionState !== "offline" && printerConnectionState !== "error";
+}
+
+// Opportunistic reconnect, called right before something that actually
+// needs the printer (uploading/starting a job) — unlike the other HUD
+// services, MQTT is a standing connection rather than a per-request HTTP
+// health check, so this isn't polled by the HUD endpoint.
+async function ensurePrinterConnected(): Promise<boolean> {
+  if (isPrinterConnected()) return true;
+  if (!printerConfigured()) return false;
+  connectPrinter();
+  for (let i = 0; i < 20; i++) {
+    if (isPrinterConnected()) return true;
+    await new Promise(r => setTimeout(r, 250));
+  }
+  return isPrinterConnected();
+}
+
+function getPrinterStatus(): { state: PrinterConnectionState; report: BambuPrinterReport | null; error: string | null; configured: boolean } {
+  return { state: printerConnectionState, report: printerLastReport, error: printerLastError, configured: printerConfigured() };
+}
+
+// Uploads a sliced .gcode.3mf to the printer's local FTPS server ahead of
+// starting a print job. The remote directory layout is reverse-engineered
+// like the MQTT schema above — needs live verification.
+async function uploadGcodeToPrinter(localPath: string, remoteFilename: string): Promise<{ success: boolean; error?: string }> {
+  const client = new FtpClient();
+  try {
+    await client.access({
+      host: PRINTER_IP,
+      port: Number(PRINTER_FTP_PORT),
+      user: "bblp",
+      password: PRINTER_ACCESS_CODE,
+      secure: true,
+      secureOptions: { rejectUnauthorized: false },
+    });
+    await client.uploadFrom(localPath, remoteFilename);
+    return { success: true };
+  } catch (err) {
+    return { success: false, error: (err as Error).message };
+  } finally {
+    client.close();
+  }
+}
+
+// Publishes the print-start command referencing an already-uploaded file.
+// This is the single least-documented piece of the whole integration —
+// isolated in its own function since it's the most likely to need
+// correction once tested against the real printer.
+function startPrintJob(remoteFilename: string): { success: boolean; error?: string } {
+  if (!isPrinterConnected() || !printerMqttClient) {
+    return { success: false, error: "Printer isn't connected." };
+  }
+  try {
+    printerMqttClient.publish(`device/${PRINTER_SERIAL}/request`, JSON.stringify({
+      print: {
+        sequence_id: "0",
+        command: "project_file",
+        param: "Metadata/plate_1.gcode",
+        url: `file:///sdcard/${remoteFilename}`,
+        subtask_name: remoteFilename,
+        use_ams: false,
+      }
+    }));
+    return { success: true };
+  } catch (err) {
+    return { success: false, error: (err as Error).message };
+  }
+}
+
+connectPrinter();
+
 app.get('/api/status', (_, res) => {
   res.json({
     activeDraftBranch,
@@ -882,6 +1090,136 @@ function convertMeshToGlb(meshPath: string, outputPath: string): Promise<boolean
         return;
       }
       resolve(true);
+    });
+  });
+}
+
+interface MeshRepairReport {
+  watertightBefore: boolean;
+  watertightAfter: boolean;
+  componentsFound: number;
+  componentDroppedCount: number;
+  repaired: boolean;
+  usable: boolean;
+  reason: string | null;
+}
+
+// Validates the raw generation output before it's trusted for Fusion import
+// or slicing — Hunyuan3D-2 occasionally produces a "detached limb" mesh
+// (an unrelated stray blob disconnected from the main shape), which passes
+// a naive watertight check per-component but is still garbage. Returns
+// null if the repair step itself couldn't run (script crash) — that's
+// "couldn't validate", not "confirmed broken", so callers should treat it
+// as a soft failure and fall back to the unrepaired mesh rather than
+// blocking the whole pipeline on a tooling bug. report.usable === false is
+// the actual "this mesh is too broken" verdict.
+function repairMesh(meshPath: string): Promise<{ outputPath: string; report: MeshRepairReport } | null> {
+  return new Promise((resolve) => {
+    const repairedPath = meshPath.replace(/\.obj$/i, "_repaired.obj");
+    const child = spawn(HUNYUAN3D_PYTHON, [path.join(IMAGE23D_DIR, "repair_mesh.py"), meshPath, repairedPath]);
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (d) => { stdout += d.toString(); });
+    child.stderr.on("data", (d) => { stderr += d.toString(); });
+    child.on("error", (err) => {
+      console.error("Failed to launch mesh repair step:", err.message);
+      resolve(null);
+    });
+    child.on("exit", (code) => {
+      if (code !== 0) {
+        console.error("Mesh repair step failed:", stderr.trim().slice(-1000));
+        resolve(null);
+        return;
+      }
+      let parsed: any;
+      try {
+        parsed = JSON.parse(stdout.trim().split("\n").pop() || "");
+      } catch {
+        console.error("Mesh repair step produced unparseable output:", stdout.trim().slice(-1000));
+        resolve(null);
+        return;
+      }
+      const report: MeshRepairReport = {
+        watertightBefore: parsed.watertight_before,
+        watertightAfter: parsed.watertight_after,
+        componentsFound: parsed.components_found,
+        componentDroppedCount: parsed.component_dropped_count,
+        repaired: parsed.repaired,
+        usable: parsed.usable,
+        reason: parsed.reason ?? null,
+      };
+      if (report.usable && !fs.existsSync(repairedPath)) {
+        console.error("Mesh repair step reported usable but output file is missing:", repairedPath);
+        resolve(null);
+        return;
+      }
+      resolve({ outputPath: report.usable ? repairedPath : "", report });
+    });
+  });
+}
+
+interface SliceResult {
+  success: boolean;
+  gcodePath?: string;
+  estimatedTimeMin?: number;
+  estimatedFilamentG?: number;
+  error?: string;
+  knownCliBug?: boolean;
+}
+
+// Slices a mesh via Bambu Studio's own CLI (not OrcaSlicer, not GUI
+// automation — see PRINTER_SETUP.md for why). NOTE: whether the CLI wants
+// a raw .obj or needs a .3mf wrapper first is unverified — this assumes
+// direct .obj input per the documented flag set; revisit once tested
+// against a real Bambu Studio install.
+function sliceModel(meshPath: string): Promise<SliceResult> {
+  return new Promise((resolve) => {
+    if (!fs.existsSync(BAMBU_STUDIO_EXE)) {
+      resolve({ success: false, error: `Bambu Studio not found at ${BAMBU_STUDIO_EXE}. Set BAMBU_STUDIO_EXE in .env, or see PRINTER_SETUP.md.` });
+      return;
+    }
+    if (!BAMBU_MACHINE_PROFILE || !BAMBU_PROCESS_PROFILE || !BAMBU_FILAMENT_PROFILE) {
+      resolve({ success: false, error: "Bambu Studio profile paths aren't configured — set BAMBU_MACHINE_PROFILE/BAMBU_PROCESS_PROFILE/BAMBU_FILAMENT_PROFILE in .env (see PRINTER_SETUP.md)." });
+      return;
+    }
+
+    const gcodePath = meshPath.replace(/\.(obj|3mf)$/i, ".gcode.3mf");
+    const args = [
+      "--slice", "0",
+      "--load-settings", `${BAMBU_MACHINE_PROFILE};${BAMBU_PROCESS_PROFILE}`,
+      "--load-filaments", BAMBU_FILAMENT_PROFILE,
+      "--export-3mf", gcodePath,
+      meshPath,
+    ];
+
+    const child = spawn(BAMBU_STUDIO_EXE, args);
+    let stderr = "";
+    let stdout = "";
+    child.stdout.on("data", (d) => { stdout += d.toString(); });
+    child.stderr.on("data", (d) => { stderr += d.toString(); });
+    child.on("error", (err) => {
+      resolve({ success: false, error: `Failed to launch Bambu Studio CLI: ${err.message}` });
+    });
+    child.on("exit", (code) => {
+      if (code !== 0 || !fs.existsSync(gcodePath)) {
+        const combined = (stderr + stdout).slice(-2000);
+        // A reported open GitHub issue on P2S CLI slicing specifically —
+        // distinguish it from a generic failure so the reply is actionable
+        // instead of an opaque "slicing failed."
+        const knownCliBug = /nozzle_volume_type/i.test(combined);
+        resolve({
+          success: false,
+          error: knownCliBug
+            ? 'Bambu Studio\'s CLI slicer hit a known bug on this printer profile ("nozzle_volume_type" error) — see PRINTER_SETUP.md\'s Known Limitations. Slice this one manually in Bambu Studio instead.'
+            : `Slicing failed: ${combined || "no output captured"}`,
+          knownCliBug,
+        });
+        return;
+      }
+      // Estimated time/filament parsing depends on the real output's
+      // metadata/gcode-header format, unverified until tested against an
+      // actual sliced file — left unset rather than guessed.
+      resolve({ success: true, gcodePath });
     });
   });
 }
@@ -1216,6 +1554,7 @@ app.get('/api/hud-metrics', async (_, res) => {
     generating: gpuExclusiveTaskRunning,
     fusionAvailable: fusionHealthy,
     services,
+    printer: getPrinterStatus(),
     gpu: getGpuStats()
   });
 });
@@ -1373,6 +1712,56 @@ app.post('/api/chat', async (req, res) => {
         : "Nothing to archive — this session is already empty.",
       hasProposedChanges: false
     });
+  }
+
+  // Print confirm/cancel gets checked before anything else in the cascade
+  // — a bare "print" or "yes" must win over every other intent (recall,
+  // search, modification, etc.), the same way endSessionPattern above
+  // short-circuits first. Only active while a slice is actually pending.
+  const PRINT_CONFIRM_PATTERN = /^\s*(print(?:\s+it)?|yes,?\s*print(?:\s+it)?|go ahead(?:\s+and\s+print)?|start(?:\s+the)?\s+print)\s*[.!]?\s*$/i;
+  const PRINT_CANCEL_PATTERN = /^\s*(no|cancel|nevermind|never\s*mind|skip|don'?t print)\s*[.!]?\s*$/i;
+  if (pendingPrintJob) {
+    if (Date.now() - pendingPrintJob.createdAt > PENDING_PRINT_EXPIRY_MS) {
+      pendingPrintJob = null;
+    } else if (PRINT_CONFIRM_PATTERN.test(message.trim())) {
+      const job = pendingPrintJob;
+      pendingPrintJob = null;
+      requestInFlight = false;
+      conversationHistory.push(`User: ${message}`);
+      const connected = await ensurePrinterConnected();
+      if (!connected) {
+        const reply = "Couldn't reach the printer to start that print — check it's powered on and connected to the LAN (see PRINTER_SETUP.md).";
+        conversationHistory.push(`Assistant: ${reply}`);
+        saveHistory();
+        return res.json({ response: reply, hasProposedChanges: false });
+      }
+      const remoteFilename = `${slugify(job.subject)}.gcode.3mf`;
+      const uploadResult = await uploadGcodeToPrinter(job.gcodePath, remoteFilename);
+      if (!uploadResult.success) {
+        const reply = `Uploading the sliced file to the printer failed: ${uploadResult.error}`;
+        conversationHistory.push(`Assistant: ${reply}`);
+        saveHistory();
+        return res.json({ response: reply, hasProposedChanges: false });
+      }
+      const startResult = startPrintJob(remoteFilename);
+      const reply = startResult.success
+        ? `Started printing "${job.subject}" on the P2S.`
+        : `Uploaded the file, but starting the print failed: ${startResult.error}`;
+      conversationHistory.push(`Assistant: ${reply}`);
+      saveHistory();
+      return res.json({ response: reply, hasProposedChanges: false });
+    } else if (PRINT_CANCEL_PATTERN.test(message.trim())) {
+      try { fs.unlinkSync(pendingPrintJob.gcodePath); } catch { /* already gone or never existed */ }
+      pendingPrintJob = null;
+      requestInFlight = false;
+      conversationHistory.push(`User: ${message}`);
+      const reply = "Cancelled — the print job wasn't started.";
+      conversationHistory.push(`Assistant: ${reply}`);
+      saveHistory();
+      return res.json({ response: reply, hasProposedChanges: false });
+    }
+    // Anything else falls through to normal routing below — a pending
+    // print survives unrelated small talk rather than being force-consumed.
   }
 
   conversationHistory.push(`User: ${message}`);
@@ -2021,21 +2410,65 @@ Now generate code for this request: "${message}"`;
                 scaleNote = `Tried to scale it to ${targetSizeCm}cm but the scaling step failed, so it's still at the model's raw output size — Fusion's Scale tool can fix that manually.`;
               }
             }
-            const importResult = await importMeshToFusion(meshPathForImport);
-            imageReplyText = importResult.success
-              ? `Done — imported a 3D model of "${subject}" into Fusion 360, built from ${referenceLabel}.\n\n${scaleNote}`
-              : `Fusion rejected importing the mesh: ${importResult.error}`;
+            let repairNote = "";
+            const repairResult = await repairMesh(meshPathForImport);
+            if (repairResult === null) {
+              repairNote = " (Couldn't run the mesh validation/repair check, so this is unvalidated — worth a closer look in Fusion before printing.)";
+            } else if (!repairResult.report.usable) {
+              imageReplyText = `Generated a mesh for "${subject}", but it came out too broken to use: ${repairResult.report.reason}. Try a different reference image, or a more distinct/isolated subject.`;
+            } else {
+              meshPathForImport = repairResult.outputPath;
+              tempFiles.push(repairResult.outputPath);
+              if (repairResult.report.componentDroppedCount > 0) {
+                repairNote = ` Dropped ${repairResult.report.componentDroppedCount} disconnected stray piece(s) that didn't belong to the main shape.`;
+              } else if (repairResult.report.repaired) {
+                repairNote = " Repaired some holes in the mesh before import.";
+              }
+            }
 
-            // Best-effort: the preview panel is a nice-to-have, not worth
-            // failing an otherwise-successful import over. Converts from
-            // meshPathForImport (post-scaling, if any) so the preview
-            // matches what actually landed in Fusion, not the raw
-            // pre-scale output.
-            if (importResult.success) {
-              const glbFilename = `${Date.now()}.glb`;
-              const glbPath = path.join(MODELS_DIR, glbFilename);
-              if (await convertMeshToGlb(meshPathForImport, glbPath)) {
-                generatedModel = registerGeneratedModel(subject, glbFilename);
+            // repairResult.report.usable === false is a hard stop — a
+            // known-broken mesh shouldn't reach Fusion at all. A null
+            // repairResult (the check itself failed to run) is a soft
+            // failure, so that case still falls through to import.
+            if (!(repairResult !== null && !repairResult.report.usable)) {
+              const importResult = await importMeshToFusion(meshPathForImport);
+              imageReplyText = importResult.success
+                ? `Done — imported a 3D model of "${subject}" into Fusion 360, built from ${referenceLabel}.\n\n${scaleNote}${repairNote}`
+                : `Fusion rejected importing the mesh: ${importResult.error}`;
+
+              // Best-effort: the preview panel is a nice-to-have, not worth
+              // failing an otherwise-successful import over. Converts from
+              // meshPathForImport (post-scaling and post-repair, if any) so
+              // the preview matches what actually landed in Fusion, not the
+              // raw pre-scale/pre-repair output.
+              if (importResult.success) {
+                const glbFilename = `${Date.now()}.glb`;
+                const glbPath = path.join(MODELS_DIR, glbFilename);
+                if (await convertMeshToGlb(meshPathForImport, glbPath)) {
+                  generatedModel = registerGeneratedModel(subject, glbFilename);
+                }
+
+                // Best-effort, same reasoning as the GLB preview above — a
+                // failed/unconfigured slicer shouldn't sink an otherwise
+                // successful generation. Deliberately NOT pushed to
+                // tempFiles: the .gcode.3mf needs to survive past this
+                // request until the user confirms or cancels the print.
+                const sliceResult = await sliceModel(meshPathForImport);
+                if (sliceResult.success && sliceResult.gcodePath) {
+                  pendingPrintJob = {
+                    gcodePath: sliceResult.gcodePath,
+                    subject,
+                    estimatedTimeMin: sliceResult.estimatedTimeMin ?? null,
+                    estimatedFilamentG: sliceResult.estimatedFilamentG ?? null,
+                    createdAt: Date.now(),
+                  };
+                  const estimateText = sliceResult.estimatedTimeMin
+                    ? ` Estimated print time: ${sliceResult.estimatedTimeMin} min${sliceResult.estimatedFilamentG ? `, ~${sliceResult.estimatedFilamentG}g filament` : ""}.`
+                    : "";
+                  imageReplyText += `\n\nSliced and ready to print.${estimateText} Reply "print" to start it, or ignore this to skip.`;
+                } else if (sliceResult.error) {
+                  imageReplyText += `\n\n(Skipped printing: ${sliceResult.error})`;
+                }
               }
             }
           }
@@ -2581,6 +3014,7 @@ function shutdown(signal: string) {
   console.log(`\nReceived ${signal}, archiving session before exit...`);
   archiveSession("manual");
   stopSpeechService();
+  disconnectPrinter();
   process.exit(0);
 }
 

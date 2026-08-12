@@ -41,7 +41,9 @@ Hunyuan3D-2mv (multiview) → mesh → slicer
    needs the new GPU.
 4. **Hunyuan3D-2mv**, unchanged — already expects exactly this
    {front, left, back} input shape.
-5. **Slicer** (Bambu Studio) — outside Noah, handles final print prep.
+5. **Slicer** (Bambu Studio) — no longer outside Noah. `sliceModel()` in
+   `server.ts` drives Bambu Studio's own CLI directly, chained after mesh
+   repair and Fusion import; see `PRINTER_SETUP.md`.
 
 ## What this fixes vs. doesn't
 

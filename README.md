@@ -29,6 +29,10 @@ Nothing is sent to a third-party API by default.
     and imports the resulting mesh — including an experimental multiview mode
     that sources front/side/back reference photos for better geometry. See
     `IMAGE_GEN_ROADMAP.md` for where this is headed next.
+- **3D printing**: a generated model can be repaired/validated, sliced with
+  Bambu Studio, and sent to a Bambu Lab printer over the local network —
+  Noah asks for explicit confirmation before anything actually prints. See
+  `PRINTER_SETUP.md`.
 - **Self-modification**: Noah can propose changes to its own source code,
   staged as a draft git branch/commit for you to review and approve or
   discard before anything touches `master`.
@@ -46,7 +50,8 @@ public/            chat UI (static HTML/JS)
 server.ts          main server — routing, Ollama calls, all the pipelines
 speech/            local Whisper (STT) + Kokoro (TTS) service
 fusion-bridge/      Fusion 360 add-in (NoahFusionBridge) — executes CAD code
-image23d/          Hunyuan3D-2, vendored, for image-to-3D generation
+image23d/          Hunyuan3D-2, vendored, for image-to-3D generation; also
+                   mesh repair (repair_mesh.py) ahead of Fusion import/print
 searxng/           SearXNG config for the local search container
 scripts/           startup helpers (auto-launch Ollama/SearXNG if not running)
 memories/          conversation history/recall (gitignored — personal data)
@@ -63,6 +68,7 @@ has its own detailed one-time setup doc:
 2. [`SPEECH_SETUP.md`](SPEECH_SETUP.md) — Whisper + Kokoro venv
 3. [`FUSION_SETUP.md`](FUSION_SETUP.md) — the Fusion 360 add-in
 4. [`HUNYUAN3D_SETUP.md`](HUNYUAN3D_SETUP.md) — the Hunyuan3D-2 venv
+5. [`PRINTER_SETUP.md`](PRINTER_SETUP.md) — slicing + printing on a Bambu Lab printer
 
 `npm run dev` uses `tsx watch` and auto-reloads on file changes — what you
 want day to day. `npm start` runs the compiled build (`npm run build`

@@ -121,6 +121,7 @@
         MODEL TEMP: <span id="telemetry-temp" class="text-cyan-400 font-bold">--℃</span>
       </div>
       <div class="flex items-center gap-1">MESH_GEN<span id="svc-meshgen" class="h-1.5 w-1.5 rounded-full bg-slate-600"></span><span id="svc-meshgen-text" class="font-bold">--</span></div>
+      <div class="flex items-center gap-1">PRINTER<span id="svc-printer" class="h-1.5 w-1.5 rounded-full bg-slate-600"></span><span id="svc-printer-text" class="font-bold">--</span></div>
       <div>
         DIVERG_BUF: <span id="telemetry-divergence" class="text-rose-500 font-bold">0 LINES</span>
       </div>
@@ -494,6 +495,32 @@
       text.classList.add(`text-${colorClass}`);
     }
 
+    // Five states, mirroring MESH_GEN's dot+text pattern but with an extra
+    // PAUSED/ERROR distinction the printer actually needs (a print can be
+    // paused mid-job, and the MQTT link can drop into a real error state,
+    // neither of which apply to the Fusion bridge's simpler up/down check).
+    function setPrinterState(state) {
+      const dot = document.getElementById('svc-printer');
+      const text = document.getElementById('svc-printer-text');
+      dot.classList.remove('bg-slate-600', 'bg-emerald-400', 'bg-rose-500', 'bg-amber-400');
+      text.classList.remove('text-emerald-400', 'text-rose-500', 'text-amber-400');
+
+      let label, colorClass;
+      switch (state) {
+        case 'idle': label = 'IDLE'; colorClass = 'emerald-400'; break;
+        case 'printing': label = 'PRINTING'; colorClass = 'amber-400'; break;
+        case 'paused': label = 'PAUSED'; colorClass = 'amber-400'; break;
+        case 'connecting': label = 'CONNECTING'; colorClass = 'amber-400'; break;
+        case 'error': label = 'ERROR'; colorClass = 'rose-500'; break;
+        default: label = 'OFFLINE'; colorClass = 'rose-500'; break;
+      }
+
+      dot.classList.add(`bg-${colorClass}`);
+      dot.title = label.toLowerCase();
+      text.textContent = label;
+      text.classList.add(`text-${colorClass}`);
+    }
+
     async function updateTelemetry() {
       try {
         const response = await fetch('/api/hud-metrics');
@@ -503,6 +530,7 @@
         setServiceDot('svc-searxng', data.services.searxng);
         setServiceDot('svc-speech', data.services.speech);
         setMeshGenState(data.fusionAvailable, data.generating);
+        setPrinterState(data.printer ? data.printer.state : 'offline');
 
         if (data.gpu) {
           document.getElementById('telemetry-load').textContent = `${data.gpu.utilizationPercent.toFixed(1)}%`;
@@ -517,6 +545,7 @@
         setServiceDot('svc-searxng', false);
         setServiceDot('svc-speech', false);
         setMeshGenState(false, false);
+        setPrinterState('offline');
         document.getElementById('telemetry-load').textContent = 'N/A';
         document.getElementById('telemetry-temp').textContent = 'N/A';
       }

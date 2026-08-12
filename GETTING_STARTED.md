@@ -17,6 +17,7 @@ else adds a capability on top:
 | Speech service | No | Voice input/output |
 | Fusion 360 bridge | No | CAD generation (parametric + image-to-3D) |
 | Hunyuan3D-2 | No | The image-to-3D part of the above specifically |
+| Bambu Lab printer | No | Slicing + printing a generated model, on top of Hunyuan3D-2 |
 
 If you just want to try the chat assistant, you can skip straight to
 [Run it](#5-run-it) after step 2 below.
@@ -71,6 +72,8 @@ Set up whichever of these you want, in any order:
 - [`FUSION_SETUP.md`](FUSION_SETUP.md) — CAD generation in Fusion 360
   - [`HUNYUAN3D_SETUP.md`](HUNYUAN3D_SETUP.md) — needed on top of the above
     specifically for "make me a model of X" style requests
+    - [`PRINTER_SETUP.md`](PRINTER_SETUP.md) — needed on top of Hunyuan3D-2
+      to actually slice and print a generated model on a Bambu Lab printer
 
 ## 5. Run it
 
