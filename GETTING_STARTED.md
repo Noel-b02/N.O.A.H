@@ -105,6 +105,7 @@ what you want for actually working on the project. `npm run build` then
   generative model downloads its weights from Hugging Face (several GB) —
   this is a one-time cost per model, see `HUNYUAN3D_SETUP.md`.
 - **CUDA out-of-memory errors** — see "Hardware notes" in `README.md`.
-  This project is built and tuned for 8GB VRAM (see the `noah-8gb-edition`
-  tag) — some things genuinely need more, and are labeled as such in their
-  setup docs.
+  This project currently runs on a 16GB card — the earlier 8GB-constrained
+  state is preserved at the `noah-8gb-edition` tag if you're on smaller
+  hardware. Some things genuinely need more than 16GB too, and are labeled
+  as such in their setup docs.

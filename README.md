@@ -1,9 +1,11 @@
 # N.O.A.H.
 
-**Edition: 8GB** — built and tuned to run within an 8GB VRAM budget (shape-
-only mesh generation, GPU-exclusive locking between Ollama and generation
-tasks). A 16GB edition is planned once hardware allows for the full
-texture+paint pipeline and more — see `IMAGE_GEN_ROADMAP.md`.
+**Edition: 16GB** — runs on a 16GB card, which unlocked single-seed
+novel-view synthesis for the multiview image-to-3D pipeline (see
+`IMAGE_GEN_ROADMAP.md`). The original 8GB-constrained state (shape-only
+mesh generation, no local novel-view model) is preserved at the
+`noah-8gb-edition` git tag. Hunyuan3D's full texture+paint pipeline is
+the next 16GB-unlocked feature, not yet built.
 
 **N.O.A.H.** (Noel's Operational AI Helper) is a local-first AI agent — not
 a chatbot wrapped around an API call. It combines conversational AI,
@@ -29,11 +31,13 @@ to a third-party API by default.
     10mm hole through it") and Noah generates and executes Fusion API code
     directly in your open document.
   - *Image-to-3D*: ask for a model of a real subject ("a model of a fox")
-    and Noah finds or generates reference photos, runs them through a local
+    and Noah finds or generates a reference photo, runs it through a local
     image-to-3D model ([Hunyuan3D-2](https://github.com/Tencent/Hunyuan3D-2)),
-    and imports the resulting mesh — including an experimental multiview mode
-    that sources front/side/back reference photos for better geometry. See
-    `IMAGE_GEN_ROADMAP.md` for where this is headed next.
+    and imports the resulting mesh — including a multiview mode that
+    generates consistent side/back views from that one verified photo
+    ([Zero123++](https://huggingface.co/sudo-ai/zero123plus-v1.2)) for
+    better geometry than a single angle alone. See `IMAGE_GEN_ROADMAP.md`
+    for the full pipeline and what's headed next.
 - **3D printing**: a generated model can be repaired/validated, sliced with
   Bambu Studio, and sent to a Bambu Lab printer over the local network —
   Noah asks for explicit confirmation before anything actually prints. See
@@ -58,7 +62,8 @@ graph TD
     Noah <--> SearXNG["SearXNG<br/>local web search"]
     Noah <--> Speech["Speech service<br/>Whisper STT + Kokoro TTS"]
     Noah <--> Bridge["Fusion 360 bridge"]
-    Noah --> Hunyuan["Hunyuan3D-2<br/>image-to-3D generation"]
+    Noah --> NovelView["Zero123++<br/>novel-view synthesis"]
+    NovelView --> Hunyuan["Hunyuan3D-2<br/>image-to-3D generation"]
 
     Hunyuan --> Bridge
     Hunyuan --> Slicer["Bambu Studio<br/>slicing"]
@@ -115,7 +120,11 @@ as if it were you.
 ## Hardware notes
 
 Image-to-3D generation and the full Ollama/Whisper stack are VRAM-hungry.
-An 8GB card runs the core assistant and shape-only mesh generation fine;
-Hunyuan3D's full texture+paint pipeline wants closer to 16GB. GPU-exclusive
-locking keeps generation tasks from fighting Ollama for VRAM on smaller
-cards — see the comments around `withGpuExclusive` in `server.ts`.
+Noah currently runs on a single 16GB card (RTX 5060 Ti); an 8GB card runs
+the core assistant and shape-only mesh generation fine but can't fit local
+novel-view synthesis alongside Ollama (see the `noah-8gb-edition` tag for
+that state). GPU-exclusive locking still keeps generation tasks from
+fighting Ollama for VRAM even on 16GB — see the comments around
+`withGpuExclusive` in `server.ts` for why it's kept rather than removed.
+Hunyuan3D's full texture+paint pipeline (not yet built) wants VRAM
+headroom too.

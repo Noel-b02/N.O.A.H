@@ -15,7 +15,9 @@ sometimes conflicting native-dependency versions of `torch`.
 This covers the **shape-only** path (what `run_shape_only.py` and
 `run_multiview.py` actually use today — no texture/color, just geometry).
 The full texture+paint pipeline needs a separately-compiled CUDA rasterizer
-and ~16GB VRAM; see `IMAGE_GEN_ROADMAP.md` for that.
+and ~16GB VRAM — not yet planned in detail, tracked as future work (see
+"Known limitations" below; `IMAGE_GEN_ROADMAP.md` covers a different
+16GB-unlocked feature, novel-view synthesis, not this one).
 
 ## 1. Create the venv and install dependencies
 
@@ -69,16 +71,38 @@ Should produce `output_test.obj`. Expect several minutes on the first run
 (weight download + model load), much faster on subsequent runs once weights
 are cached.
 
+## 4. Novel-view synthesis (multiview reference generation)
+
+`image23d/generate_novel_views.py` generates the "left" and "back" views
+for the multiview pipeline from one seed photo, via
+[Zero123++ v1.2](https://huggingface.co/sudo-ai/zero123plus-v1.2) — see
+`IMAGE_GEN_ROADMAP.md` for the full design. No separate venv: it reuses
+this one (diffusers/torch already installed).
+
+First run downloads `sudo-ai/zero123plus-v1.2`'s weights plus the
+`sudo-ai/zero123plus-pipeline` community pipeline code from Hugging Face —
+loading it executes that code (`trust_remote_code=True`), same trust
+category as any other model downloaded here, but worth knowing it's not
+just weights. Verify it works standalone the same way as step 3:
+
+```bash
+venv\Scripts\python ..\generate_novel_views.py <path-to-an-image.jpg> left_test.jpg back_test.jpg
+```
+
+Should produce two output images. Inspect them by eye — a correct result
+looks like plausible rotated views of the same subject, same art style and
+pose family as the input.
+
 ## How Noah uses it
 
-`server.ts` spawns `run_shape_only.py` (single reference image) or
-`run_multiview.py` (front/side/back, experimental — see
-`IMAGE_GEN_ROADMAP.md`) as one-off child processes per request rather than as
-a persistent service — this is a rarely-used, GPU-heavy step, and keeping it
-out-of-process means it doesn't hold VRAM hostage from Ollama/Kokoro the
-rest of the time. Runs under `withGpuExclusive` — see that function's
-comment in `server.ts` for why Ollama gets paused/unloaded while this runs
-on an 8GB card.
+`server.ts` spawns `run_shape_only.py` (single reference image),
+`generate_novel_views.py` + `run_multiview.py` (single seed image, two
+angle views generated from it — see `IMAGE_GEN_ROADMAP.md`), as one-off
+child processes per request rather than as a persistent service — this is
+a rarely-used, GPU-heavy step, and keeping it out-of-process means it
+doesn't hold VRAM hostage from Ollama/Kokoro the rest of the time. Runs
+under `withGpuExclusive` — see that function's comment in `server.ts` for
+why Ollama/speech get paused while these run.
 
 ## Known limitations — read before relying on this
 
@@ -97,13 +121,14 @@ on an 8GB card.
   complex subjects (a specific character's face, for example) are not
   reliable.
 - **Shape-only means no color/texture** — the output is bare geometry. Fine
-  for printing, not for anything needing surface color. See
-  `IMAGE_GEN_ROADMAP.md` for the plan to change that.
+  for printing, not for anything needing surface color. The full
+  texture+paint pipeline is planned next but not yet designed in detail
+  (see the note at the top of this file).
 - **Meaningfully slower than a single-pass reconstruction model** — this is
   a diffusion model doing iterative denoising, so expect noticeably longer
   generation time even once weights are cached.
-- **VRAM is shared with Ollama and the speech service on an 8GB card.** If a
-  generation fails with a CUDA out-of-memory error, close/pause other GPU
-  work (Ollama's model can be unloaded with `ollama stop <model>`) and
-  retry — `withGpuExclusive` handles this automatically for requests that
-  go through Noah, but manual troubleshooting may still need it.
+- **VRAM is shared with Ollama and the speech service.** If a generation
+  fails with a CUDA out-of-memory error, close/pause other GPU work
+  (Ollama's model can be unloaded with `ollama stop <model>`) and retry —
+  `withGpuExclusive` handles this automatically for requests that go
+  through Noah, but manual troubleshooting may still need it.

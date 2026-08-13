@@ -39,6 +39,9 @@ const IMAGE23D_TMP_DIR = path.join(IMAGE23D_DIR, "tmp");
 // unloaded, speech service stopped) rather than alongside them.
 const HUNYUAN3D_DIR = path.join(IMAGE23D_DIR, "Hunyuan3D-2");
 const HUNYUAN3D_PYTHON = path.join(HUNYUAN3D_DIR, "venv", "Scripts", "python.exe");
+// Reuses the Hunyuan3D-2 venv (diffusers/torch are already installed and
+// compatible) rather than a separate one — see IMAGE_GEN_ROADMAP.md.
+const NOVEL_VIEW_SCRIPT = path.join(IMAGE23D_DIR, "generate_novel_views.py");
 
 // Lives under public/ so express.static() serves the .glb files directly —
 // no separate file-serving endpoint needed. Kept distinct from
@@ -139,17 +142,6 @@ const STICKY_RECALL_FOLLOWUP_TURNS = 3;
 let stickySearchContext = "";
 let stickySearchTurnsRemaining = 0;
 
-let conversationHistory: string[] = loadHistory();
-archiveSession("startup", previousSessionEndedAt);
-
-let requestInFlight = false;
-let pendingCommit: CommitInfo | null = null;
-// Surfaced on the HUD as MESH_GEN — withGpuExclusive() is the only thing
-// that sets this, since that's the only class of work slow/disruptive
-// enough (unloads Ollama/speech, can run for minutes) to be worth telling
-// the user about explicitly rather than just reading GPU utilization.
-let gpuExclusiveTaskRunning = false;
-
 interface PendingPrintJob {
   gcodePath: string;
   subject: string;
@@ -162,9 +154,24 @@ interface PendingPrintJob {
 // should survive small talk and only clear on explicit confirm, explicit
 // cancel, or PENDING_PRINT_EXPIRY_MS, since "reply print to start it"
 // implies the user can reply whenever, not necessarily next turn.
+// Declared before archiveSession() is called below, same reason as the
+// sticky-recall/search vars above — confirmed directly: archiveSession's
+// body reaches into this on any startup where there's real leftover
+// conversation history to archive, not just when it's empty, so it must
+// already be initialized by the time that call runs.
 let pendingPrintJob: PendingPrintJob | null = null;
 const PENDING_PRINT_EXPIRY_MS = 10 * 60 * 1000;
 
+let conversationHistory: string[] = loadHistory();
+archiveSession("startup", previousSessionEndedAt);
+
+let requestInFlight = false;
+let pendingCommit: CommitInfo | null = null;
+// Surfaced on the HUD as MESH_GEN — withGpuExclusive() is the only thing
+// that sets this, since that's the only class of work slow/disruptive
+// enough (unloads Ollama/speech, can run for minutes) to be worth telling
+// the user about explicitly rather than just reading GPU utilization.
+let gpuExclusiveTaskRunning = false;
 
 function loadHistory(): string[] {
   try {
@@ -645,15 +652,20 @@ function unloadOllamaModels(): void {
   }
 }
 
-// Some local models (Hunyuan3D's shape stage, ~6GB) need more VRAM than an
-// 8GB card has free once Ollama and the speech service are also holding
-// their share — there's no way to fit all three at once on this hardware.
-// This frees the other two first, runs the heavy step, then always restores
-// them afterward (even on failure) via finally. Voice input/output is
-// unavailable for the duration; the next Ollama reply after this also pays
-// a one-time model-reload cost. Once there's enough VRAM for everything at
-// once, this wrapper stops being necessary — it can just be removed instead
-// of updated.
+// Some local generation steps (Hunyuan3D's shape stage ~6GB, Zero123++'s
+// novel-view synthesis ~5GB) need more VRAM than is comfortably free once
+// Ollama (two resident models) and the speech service are also holding
+// their share. This frees the other two first, runs the heavy step, then
+// always restores them afterward (even on failure) via finally. Voice
+// input/output is unavailable for the duration; the next Ollama reply
+// after this also pays a one-time model-reload cost.
+//
+// Deliberately kept even on a 16GB card: this doesn't guard against the
+// two generation steps contending with each other (they're separate
+// spawned processes — one's VRAM is released before the next starts), it
+// guards against Ollama/speech contending with either one, which is still
+// a real risk with a new ~5GB step added to the pipeline on top of the
+// existing ~6GB one. Revisit once there's real headroom data, not before.
 async function withGpuExclusive<T>(fn: () => Promise<T>): Promise<T> {
   unloadOllamaModels();
   stopSpeechService();
@@ -1368,14 +1380,65 @@ function generateMeshWithHunyuan3D(imagePath: string): Promise<MeshGenerationRes
   });
 }
 
-// Experimental: feeds three independently web-searched angle photos (front/
-// left/back) into Hunyuan3D-2mv instead of one photo into shape-only. Real
-// multiview conditioning gives better geometry ONLY if the three images
-// actually agree on what they're depicting — since they come from separate
-// searches, not one coordinated photoshoot, that's not guaranteed (different
-// art style, outfit variant, or pose per image is a real risk). Downloads
-// its own multi-GB weights from tencent/Hunyuan3D-2mv on first run, on top
-// of the shape-only model's weights.
+interface NovelViewResult {
+  success: boolean;
+  leftPath?: string;
+  backPath?: string;
+  error?: string;
+}
+
+// Generates the "left" and "back" views for the multiview pipeline from one
+// verified seed image, via Zero123++ (see IMAGE_GEN_ROADMAP.md) — replaces
+// sourcing all three angles from independent web searches, which could
+// (and once confirmed did) disagree on pose/style since they're not from
+// one coordinated photoshoot. Consistency is enforced by construction here:
+// one model generates all views from one seed in a single pass.
+function generateNovelViews(seedImagePath: string, leftPath: string, backPath: string): Promise<NovelViewResult> {
+  return new Promise((resolve) => {
+    if (!fs.existsSync(HUNYUAN3D_PYTHON)) {
+      resolve({ success: false, error: `Hunyuan3D venv not found at ${HUNYUAN3D_PYTHON}.` });
+      return;
+    }
+
+    const child = spawn(HUNYUAN3D_PYTHON, [NOVEL_VIEW_SCRIPT, seedImagePath, leftPath, backPath], {
+      env: { ...process.env, HF_HUB_DISABLE_XET: "1" }
+    });
+
+    let stderr = "";
+    child.stderr.on("data", (d) => { stderr += d.toString(); });
+
+    // Placeholder pending real first-run timing (weights are smaller than
+    // Hunyuan3D-2mv's, but this hasn't been measured against a production
+    // machine yet) — same honesty as the 45-minute figure below.
+    const timeout = setTimeout(() => {
+      child.kill();
+      resolve({ success: false, error: "Novel-view generation timed out after 20 minutes." });
+    }, 1200000);
+
+    child.on("error", (err) => {
+      clearTimeout(timeout);
+      resolve({ success: false, error: `Failed to launch novel-view generation: ${err.message}` });
+    });
+
+    child.on("exit", (code) => {
+      clearTimeout(timeout);
+      if (code !== 0) {
+        resolve({ success: false, error: stderr.trim().slice(-2000) || `Novel-view generation exited with code ${code}` });
+        return;
+      }
+      if (!fs.existsSync(leftPath) || !fs.existsSync(backPath)) {
+        resolve({ success: false, error: "Novel-view generation finished but didn't produce both output images." });
+        return;
+      }
+      resolve({ success: true, leftPath, backPath });
+    });
+  });
+}
+
+// Feeds a seed image plus two generated angle views (see
+// generateNovelViews above) into Hunyuan3D-2mv. Downloads its own multi-GB
+// weights from tencent/Hunyuan3D-2mv on first run, on top of the
+// shape-only model's weights.
 function generateMeshWithHunyuan3DMultiview(frontPath: string, leftPath: string, backPath: string): Promise<MeshGenerationResult> {
   return new Promise((resolve) => {
     if (!fs.existsSync(HUNYUAN3D_PYTHON)) {
@@ -2109,12 +2172,14 @@ Now generate code for this request: "${message}"`;
           : `I'd need Fusion 360 running to import a model of "${subject}", and couldn't find it installed to launch automatically — make sure it's running with the NoahFusionBridge add-in active.`;
       } else {
         let imagePath: string | null = null;
-        let multiviewPaths: { front: string; left: string; back: string } | null = null;
         let referenceLabel = "";
         const tempFiles: string[] = [];
 
         // An attached image is the most direct signal available — skip the
         // URL/search steps entirely and use exactly what was dropped in.
+        // Attached/URL images skip verification below (unchanged from
+        // before) — verification exists to filter untrustworthy SEARCH
+        // results, not to second-guess an image the user explicitly chose.
         if (hasAttachedImage) {
           imagePath = saveBase64ImageToFile(attachedImage!.base64, attachedImage!.mimeType);
           referenceLabel = "the image you attached";
@@ -2130,69 +2195,42 @@ Now generate code for this request: "${message}"`;
             imageReplyText = `Found the image link you gave me for "${subject}" but couldn't download it to work with.`;
           }
         } else {
-          // The multiview search still applies to a partial-subject request
-          // (a bust genuinely does have a front/side/back worth capturing
-          // separately) — what has to change is what "correct framing"
-          // means. Requiring full-body for "a headbust of spiderman" would
-          // reject every real candidate, since a bust or close-up is BY
-          // DEFINITION not full-body. The verification prompt below keys
-          // off this instead of hardcoding full-body — and uses subject-
-          // agnostic language ("the entire X") rather than "full-body" /
-          // "face or head", which are person/creature-specific and don't
-          // fit a request like "a model of a car".
+          // Multiview still applies to a partial-subject request (a bust
+          // genuinely does have a front/side/back worth capturing) — what
+          // changes is what "correct framing" means. Requiring full-body
+          // for "a headbust of spiderman" would reject every real
+          // candidate, since a bust or close-up is BY DEFINITION not
+          // full-body. The verification prompt below keys off this instead
+          // of hardcoding full-body — and uses subject-agnostic language
+          // ("the entire X") rather than "full-body"/"face or head", which
+          // are person/creature-specific and don't fit e.g. "a car".
           const wantsPartialSubject = /\b(headbust|bust|headshot|head[\s-]?only|close-?up|closeup|portrait)\b/i.test(subject);
 
-          // Explicit opt-out — an attached image or a pasted URL already
-          // forces the single-image path above regardless of wording, but
-          // there was no way to say "just use one image" in plain text when
-          // relying on search (confirmed directly: it silently attempted
-          // multiview anyway). Checked against the whole message, not just
-          // the extracted subject, since this is a request-shaped
-          // instruction rather than a description of what the subject is.
-          const wantsSingleImageOnly = /\b(one|single)\s+(image|photo|picture|reference)\b|\b(no|not|skip|without|don'?t)\b[^.?!]*\bmultiview\b/i.test(message);
-
-          if (!wantsSingleImageOnly) {
-          // Experimental: try to source three angle-matched photos so
-          // Hunyuan3D-2mv's real multiview conditioning can be used instead
-          // of one photo — see generateMeshWithHunyuan3DMultiview's comment
-          // for why three independently-searched images aren't guaranteed to
-          // actually agree with each other. Only commits to this path if all
-          // three searches return something; otherwise falls back to the
-          // proven single-image search below.
-
-          // Confirmed directly: without this, "spiderman front/side/back
-          // view" search results included at least one image that wasn't
-          // Spiderman at all, not just a different art style or pose — a
-          // mismatch real enough to sink the mesh, not just a quality risk.
-          // Ask the same local vision model used for image-description to
-          // reject candidates before they're ever fed to the mesh pipeline.
-          // Fails closed (treats an errored check as "not a match") since a
-          // silently-accepted bad image is the exact failure this exists to
-          // catch, and there are up to 5 other candidates left to try.
-          const verifyImageMatchesSubject = async (imagePath: string): Promise<boolean> => {
+          // Confirmed directly: without this, "spiderman" search results
+          // included at least one image that wasn't Spiderman at all, not
+          // just a different art style or pose — a mismatch real enough to
+          // sink the mesh, not just a quality risk. Fails closed (treats an
+          // errored check as "not a match") since a silently-accepted bad
+          // image is the exact failure this exists to catch, and there are
+          // up to 9 other candidates left to try.
+          const verifyImageMatchesSubject = async (candidatePath: string): Promise<boolean> => {
             try {
-              const base64 = fs.readFileSync(imagePath).toString("base64");
-              // Uses its own timeout rather than the request-wide controller
-              // above — confirmed directly: that controller fires once at
-              // 180s for the whole /api/chat request, and up to 5 candidates
-              // per angle across 3 angles can plausibly take longer than
-              // that combined. Once it fires it's permanently tripped, so
-              // every verification call still in flight — for every
-              // angle, not just the slow one — would immediately fail and
-              // get treated as "not a match," collapsing the whole multiview
-              // attempt regardless of whether the images were actually fine.
-              // 200 tokens of budget covers this model's occasional (short)
-              // reasoning aside even with think=false, which does suppress
-              // the full chain-of-thought (confirmed directly).
+              const base64 = fs.readFileSync(candidatePath).toString("base64");
+              // Own timeout rather than the request-wide controller —
+              // confirmed directly: that controller fires once at 180s for
+              // the whole /api/chat request, and up to 10 candidates can
+              // plausibly take longer than that. 200 tokens of budget
+              // covers this model's occasional (short) reasoning aside
+              // even with think=false, which does suppress the full
+              // chain-of-thought (confirmed directly).
               // Confirmed directly: subject-match alone isn't enough — a
               // genuine close-up crop and a genuine full view both pass
               // "does this show spiderman"/"does this show a car", but
-              // they're incompatible views for one mesh (Hunyuan3D-2mv's
-              // own example images are all consistent full-subject
-              // framing). Reject close-ups too — unless the request itself
-              // wants a partial subject (a bust, a headshot), in which case
-              // a close-up IS the correct framing and requiring the whole
-              // subject would reject everything.
+              // they're incompatible framing for one mesh. Reject
+              // close-ups too — unless the request itself wants a partial
+              // subject (a bust, a headshot), in which case a close-up IS
+              // the correct framing and requiring the whole subject would
+              // reject everything.
               const answer = await callOllama(
                 wantsPartialSubject
                   ? `Answer with exactly one word, YES or NO: does this image clearly show ${subject}?`
@@ -2210,100 +2248,67 @@ Now generate code for this request: "${message}"`;
             }
           };
 
-          // Fails closed like verifyImageMatchesSubject, same reasoning —
-          // an unreliable check should lose a mesh's worth of detail to the
-          // single-image fallback, not risk letting a genuinely conflicting
-          // set through. Ollama's images array can hold more than one
-          // image per call, and a vision-capable model can reason about all
-          // of them together in one response — this asks it to do exactly
-          // that instead of judging each photo alone.
-          const verifyImagesAreConsistentSet = async (frontPath: string, leftPath: string, backPath: string): Promise<boolean> => {
-            try {
-              const images = [frontPath, leftPath, backPath].map(p => fs.readFileSync(p).toString("base64"));
-              const answer = await callOllama(
-                `These three images are meant to be used as front, side, and back reference photos of the same subject for a 3D model. Answer with exactly one word, YES or NO: do all three actually show the same pose, art style, and appearance — not just the same subject, but consistent enough with each other to be usable as one coherent set?`,
-                300,
-                false,
-                images,
-                CODE_MODEL,
-                AbortSignal.timeout(90000)
-              );
-              return /\byes\b/i.test(answer);
-            } catch (err) {
-              console.error("Cross-image consistency check failed:", err);
-              return false;
-            }
-          };
-
-          const ts = Date.now();
-          const [frontUrls, leftUrls, backUrls] = await Promise.all([
-            webImageSearch(`${subject} front view`),
-            webImageSearch(`${subject} side view`),
-            webImageSearch(`${subject} back view`)
-          ]);
-          if (frontUrls.length > 0 && leftUrls.length > 0 && backUrls.length > 0) {
-            const frontPath = path.join(IMAGE23D_TMP_DIR, `${ts}_front.jpg`);
-            const leftPath = path.join(IMAGE23D_TMP_DIR, `${ts}_left.jpg`);
-            const backPath = path.join(IMAGE23D_TMP_DIR, `${ts}_back.jpg`);
-            // Sequential, not Promise.all — confirmed directly: three
-            // concurrent verification calls raced to cold-load the same
-            // model into VRAM simultaneously and Ollama errored out on all
-            // three. Once the model is loaded this would just queue safely,
-            // but there's no cheap way to know "already loaded" from here,
-            // so always serializing is the reliable option.
-            const frontUsed = await downloadFirstAvailableImage(frontUrls, frontPath, verifyImageMatchesSubject);
-            const leftUsed = await downloadFirstAvailableImage(leftUrls, leftPath, verifyImageMatchesSubject);
-            const backUsed = await downloadFirstAvailableImage(backUrls, backPath, verifyImageMatchesSubject);
-            tempFiles.push(frontPath, leftPath, backPath);
-            // Per-image verification above only checks each photo in
-            // isolation (right subject, right framing) — it can't catch the
-            // three of them disagreeing with EACH OTHER (confirmed directly:
-            // a Spiderman multiview mesh came out with two extra detached
-            // legs, almost certainly because the three source photos weren't
-            // actually the same pose — Hunyuan3D-2mv's multiview
-            // conditioning assumes all three ARE one pose from three camera
-            // angles, and feeding it three different poses/styles produces
-            // exactly this kind of geometry conflict). This final check
-            // shows all three together and asks whether they're actually
-            // usable as one consistent set — pose, art style, and
-            // appearance all need to roughly agree, not just the subject.
-            if (frontUsed && leftUsed && backUsed && await verifyImagesAreConsistentSet(frontPath, leftPath, backPath)) {
-              multiviewPaths = { front: frontPath, left: leftPath, back: backPath };
-              referenceLabel = `three separately-searched angle photos of "${subject}" (front: ${frontUsed}, side: ${leftUsed}, back: ${backUsed})`;
-            }
-          }
-          } // !wantsSingleImageOnly
-
-          if (!multiviewPaths) {
-            // Image-to-3D generation is highly sensitive to input quality —
-            // a clean, isolated-subject photo produces far better geometry
-            // than a random cluttered/watermarked web photo. Bias the
-            // search toward that first, falling back to a plain search if
-            // it finds nothing.
-            let imageUrls = await webImageSearch(`${subject} isolated on white background`);
-            if (imageUrls.length === 0) imageUrls = await webImageSearch(subject);
-            if (imageUrls.length === 0) {
-              imageReplyText = `I couldn't find a usable reference image for "${subject}" to build a model from.`;
+          // Image-to-3D generation is highly sensitive to input quality —
+          // a clean, isolated-subject photo produces far better geometry
+          // than a random cluttered/watermarked web photo. Bias the
+          // search toward that first, falling back to a plain search if
+          // it finds nothing.
+          let imageUrls = await webImageSearch(`${subject} isolated on white background`);
+          if (imageUrls.length === 0) imageUrls = await webImageSearch(subject);
+          if (imageUrls.length === 0) {
+            imageReplyText = `I couldn't find a usable reference image for "${subject}" to build a model from.`;
+          } else {
+            const downloadPath = path.join(IMAGE23D_TMP_DIR, `${Date.now()}.jpg`);
+            // Now verified like every other search-sourced candidate —
+            // previously this was the one search path that skipped
+            // verification entirely (it only ran inside the old three-photo
+            // multiview attempt), so a search-sourced single image could
+            // reach mesh generation completely unchecked.
+            const usedUrl = await downloadFirstAvailableImage(imageUrls, downloadPath, verifyImageMatchesSubject);
+            if (usedUrl) {
+              imagePath = downloadPath;
+              referenceLabel = `this reference image: ${usedUrl}`;
+              tempFiles.push(imagePath);
             } else {
-              const downloadPath = path.join(IMAGE23D_TMP_DIR, `${Date.now()}.jpg`);
-              const usedUrl = await downloadFirstAvailableImage(imageUrls, downloadPath);
-              if (usedUrl) {
-                imagePath = downloadPath;
-                referenceLabel = `this reference image: ${usedUrl}`;
-                tempFiles.push(imagePath);
-              } else {
-                imageReplyText = `Found a reference image for "${subject}" but couldn't download it to work with.`;
-              }
+              imageReplyText = `Found a reference image for "${subject}" but couldn't download it to work with.`;
             }
           }
         }
 
-        if (imagePath || multiviewPaths) {
-          // Needs exclusive use of the GPU on an 8GB card — see
-          // withGpuExclusive's comment for why and what that costs.
-          const meshResult = await withGpuExclusive(() => multiviewPaths
-            ? generateMeshWithHunyuan3DMultiview(multiviewPaths!.front, multiviewPaths!.left, multiviewPaths!.back)
-            : generateMeshWithHunyuan3D(imagePath!));
+        if (imagePath) {
+          // Explicit opt-out — an attached image or a pasted URL already
+          // forces a single seed regardless of wording, but there was no
+          // way to say "just use one image" in plain text when relying on
+          // search. Checked against the whole message, not just the
+          // extracted subject, since this is a request-shaped instruction
+          // rather than a description of what the subject is.
+          const wantsSingleImageOnly = /\b(one|single)\s+(image|photo|picture|reference)\b|\b(no|not|skip|without|don'?t)\b[^.?!]*\bmultiview\b/i.test(message);
+
+          // Needs exclusive use of the GPU — see withGpuExclusive's
+          // comment for why. Novel-view generation and multiview mesh
+          // generation both happen inside this one window rather than two
+          // separate ones, since they're two back-to-back GPU-heavy steps
+          // for the same request — no reason to pay the pause/restore cost
+          // twice.
+          const meshResult = await withGpuExclusive(async () => {
+            if (wantsSingleImageOnly) {
+              return generateMeshWithHunyuan3D(imagePath!);
+            }
+            const ts = Date.now();
+            const leftPath = path.join(IMAGE23D_TMP_DIR, `${ts}_left.jpg`);
+            const backPath = path.join(IMAGE23D_TMP_DIR, `${ts}_back.jpg`);
+            const novelViews = await generateNovelViews(imagePath!, leftPath, backPath);
+            if (novelViews.success) {
+              tempFiles.push(leftPath, backPath);
+              referenceLabel += ", with two additional angle views generated from it";
+              return generateMeshWithHunyuan3DMultiview(imagePath!, novelViews.leftPath!, novelViews.backPath!);
+            }
+            // Falls back to shape-only rather than failing the whole
+            // request — same "still produce something usable" reasoning
+            // the old search-based multiview attempt used.
+            console.error("Novel-view generation failed, falling back to shape-only:", novelViews.error);
+            return generateMeshWithHunyuan3D(imagePath!);
+          });
           if (!meshResult.success) {
             imageReplyText = `Generating a mesh for "${subject}" failed: ${meshResult.error}`;
           } else {
