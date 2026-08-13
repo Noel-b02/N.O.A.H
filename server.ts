@@ -42,6 +42,12 @@ const HUNYUAN3D_PYTHON = path.join(HUNYUAN3D_DIR, "venv", "Scripts", "python.exe
 // Reuses the Hunyuan3D-2 venv (diffusers/torch are already installed and
 // compatible) rather than a separate one — see IMAGE_GEN_ROADMAP.md.
 const NOVEL_VIEW_SCRIPT = path.join(IMAGE23D_DIR, "generate_novel_views.py");
+// Also reuses the Hunyuan3D-2 venv — SDXL + ControlNet-openpose, confirmed
+// live to peak at ~8GB VRAM and ~16-25s per generation with
+// enable_model_cpu_offload(), well within the same budget. See
+// IMAGE_GEN_ROADMAP.md for why SDXL was chosen over the initially-planned
+// Z-Image-Turbo (which didn't fit this card at usable speed).
+const POSE_SEED_SCRIPT = path.join(IMAGE23D_DIR, "generate_pose_seed.py");
 
 // Lives under public/ so express.static() serves the .glb files directly —
 // no separate file-serving endpoint needed. Kept distinct from
@@ -653,7 +659,8 @@ function unloadOllamaModels(): void {
 }
 
 // Some local generation steps (Hunyuan3D's shape stage ~6GB, Zero123++'s
-// novel-view synthesis ~5GB) need more VRAM than is comfortably free once
+// novel-view synthesis ~5GB, SDXL pose-guided seed generation ~8GB with
+// enable_model_cpu_offload) need more VRAM than is comfortably free once
 // Ollama (two resident models) and the speech service are also holding
 // their share. This frees the other two first, runs the heavy step, then
 // always restores them afterward (even on failure) via finally. Voice
@@ -661,11 +668,11 @@ function unloadOllamaModels(): void {
 // after this also pays a one-time model-reload cost.
 //
 // Deliberately kept even on a 16GB card: this doesn't guard against the
-// two generation steps contending with each other (they're separate
-// spawned processes — one's VRAM is released before the next starts), it
-// guards against Ollama/speech contending with either one, which is still
-// a real risk with a new ~5GB step added to the pipeline on top of the
-// existing ~6GB one. Revisit once there's real headroom data, not before.
+// generation steps contending with each other (they're separate spawned
+// processes — one's VRAM is released before the next starts), it guards
+// against Ollama/speech contending with any one of them, which is still a
+// real risk now that up to three back-to-back GPU-heavy steps can run in
+// one request. Revisit once there's real headroom data, not before.
 async function withGpuExclusive<T>(fn: () => Promise<T>): Promise<T> {
   unloadOllamaModels();
   stopSpeechService();
@@ -1444,6 +1451,61 @@ function generateNovelViews(seedImagePath: string, leftPath: string, backPath: s
   });
 }
 
+interface PoseGuidedSeedResult {
+  success: boolean;
+  imagePath?: string;
+  error?: string;
+}
+
+// Replaces an unreliable action-pose search photo with a clean,
+// neutral-pose image generated from text + a fixed canonical pose skeleton
+// (image23d/assets/canonical_pose.png) — see DYNAMIC_POSE_PATTERN's
+// comment below and IMAGE_GEN_ROADMAP.md for why. generateNovelViews above
+// faithfully reproduces whatever pose its seed shows, so a bad pose has to
+// be fixed before that step runs, not after.
+function generatePoseGuidedSeed(prompt: string, outputPath: string): Promise<PoseGuidedSeedResult> {
+  return new Promise((resolve) => {
+    if (!fs.existsSync(HUNYUAN3D_PYTHON)) {
+      resolve({ success: false, error: `Hunyuan3D venv not found at ${HUNYUAN3D_PYTHON}.` });
+      return;
+    }
+
+    const child = spawn(HUNYUAN3D_PYTHON, [POSE_SEED_SCRIPT, prompt, outputPath], {
+      env: { ...process.env, HF_HUB_DISABLE_XET: "1" }
+    });
+
+    let stderr = "";
+    child.stderr.on("data", (d) => { stderr += d.toString(); });
+
+    // Placeholder pending real first-run timing on a cold cache — confirmed
+    // live at ~16-25s once weights are cached, but first run also pays a
+    // multi-GB download (SDXL base + ControlNet-openpose). Same honesty as
+    // generateNovelViews' 20-minute placeholder.
+    const timeout = setTimeout(() => {
+      child.kill();
+      resolve({ success: false, error: "Pose-guided seed generation timed out after 10 minutes." });
+    }, 600000);
+
+    child.on("error", (err) => {
+      clearTimeout(timeout);
+      resolve({ success: false, error: `Failed to launch pose-guided seed generation: ${err.message}` });
+    });
+
+    child.on("exit", (code) => {
+      clearTimeout(timeout);
+      if (code !== 0) {
+        resolve({ success: false, error: stderr.trim().slice(-2000) || `Pose-guided seed generation exited with code ${code}` });
+        return;
+      }
+      if (!fs.existsSync(outputPath)) {
+        resolve({ success: false, error: "Pose-guided seed generation finished but didn't produce an output image." });
+        return;
+      }
+      resolve({ success: true, imagePath: outputPath });
+    });
+  });
+}
+
 // Feeds a seed image plus two generated angle views (see
 // generateNovelViews above) into Hunyuan3D-2mv. Downloads its own multi-GB
 // weights from tencent/Hunyuan3D-2mv on first run, on top of the
@@ -2183,6 +2245,7 @@ Now generate code for this request: "${message}"`;
         let imagePath: string | null = null;
         let referenceLabel = "";
         const tempFiles: string[] = [];
+        let dynamicPosePrompt: string | null = null;
 
         // An attached image is the most direct signal available — skip the
         // URL/search steps entirely and use exactly what was dropped in.
@@ -2214,6 +2277,18 @@ Now generate code for this request: "${message}"`;
           // ("the entire X") rather than "full-body"/"face or head", which
           // are person/creature-specific and don't fit e.g. "a car".
           const wantsPartialSubject = /\b(headbust|bust|headshot|head[\s-]?only|close-?up|closeup|portrait)\b/i.test(subject);
+
+          // "make me a 3d model of spiderman swinging" — a search photo
+          // caught mid-action (limbs overlapping/occluded/foreshortened)
+          // still passes subject-match verification below but reliably
+          // wrecks the downstream mesh (confirmed directly: detached
+          // extra-limb geometry). Rather than trust whatever pose the
+          // search photo happens to be in, a message that reads as an
+          // action/dynamic pose triggers generating a clean neutral-pose
+          // replacement instead — see generatePoseGuidedSeed. First-pass
+          // word list, not exhaustive — extend as real misses turn up.
+          const DYNAMIC_POSE_PATTERN = /\b(swing(?:s|ing)?|jump(?:s|ing)?|leap(?:s|ing)?|run(?:s|ning)?|sprint(?:s|ing)?|fly(?:s|ing)?|dive(?:s|ing)?|kick(?:s|ing)?|punch(?:es|ing)?|fight(?:s|ing)?|battl(?:e|es|ing)|attack(?:s|ing)?|danc(?:e|es|ing)|climb(?:s|ing)?|fall(?:s|ing)?|mid[\s-]?(?:air|jump|swing|flight|action)|in\s+(?:mid[\s-]?)?action|action\s+pose|dynamic\s+pose)\b/i;
+          const wantsDynamicPose = DYNAMIC_POSE_PATTERN.test(message);
 
           // Confirmed directly: without this, "spiderman" search results
           // included at least one image that wasn't Spiderman at all, not
@@ -2257,6 +2332,33 @@ Now generate code for this request: "${message}"`;
             }
           };
 
+          // Produces a short appearance/costume/color description from the
+          // verified reference photo, to ground the pose-guided generation
+          // (text + pose conditioned only, no image conditioning) in what
+          // the subject actually looks like, rather than relying on the
+          // bare subject noun phrase alone. Fails soft (null) rather than
+          // throwing — the caller falls back to the subject alone, same
+          // "still produce something usable" posture as
+          // verifyImageMatchesSubject's callers use.
+          const describeImageAppearance = async (candidatePath: string): Promise<string | null> => {
+            try {
+              const base64 = fs.readFileSync(candidatePath).toString("base64");
+              const answer = await callOllama(
+                `In one short phrase (under 15 words, no full sentence), describe this ${subject}'s visible appearance — costume/clothing, colors, and distinguishing features — for use in an image generation prompt.`,
+                200,
+                false,
+                [base64],
+                CODE_MODEL,
+                AbortSignal.timeout(60000)
+              );
+              const cleaned = answer.trim();
+              return cleaned.length > 0 ? cleaned : null;
+            } catch (err) {
+              console.error("Appearance description failed:", err);
+              return null;
+            }
+          };
+
           // Image-to-3D generation is highly sensitive to input quality —
           // a clean, isolated-subject photo produces far better geometry
           // than a random cluttered/watermarked web photo. Bias the
@@ -2278,6 +2380,12 @@ Now generate code for this request: "${message}"`;
               imagePath = downloadPath;
               referenceLabel = `this reference image: ${usedUrl}`;
               tempFiles.push(imagePath);
+              if (wantsDynamicPose) {
+                const appearance = await describeImageAppearance(imagePath);
+                dynamicPosePrompt = appearance
+                  ? `${subject}, ${appearance}, standing in a neutral pose, isolated on a plain white background`
+                  : `${subject}, standing in a neutral pose, isolated on a plain white background`;
+              }
             } else {
               imageReplyText = `Found a reference image for "${subject}" but couldn't download it to work with.`;
             }
@@ -2300,10 +2408,27 @@ Now generate code for this request: "${message}"`;
           // for the same request — no reason to pay the pause/restore cost
           // twice.
           const meshResult = await withGpuExclusive(async () => {
+            const ts = Date.now();
+
+            if (dynamicPosePrompt) {
+              const poseSeedPath = path.join(IMAGE23D_TMP_DIR, `${ts}_poseseed.jpg`);
+              const poseSeed = await generatePoseGuidedSeed(dynamicPosePrompt, poseSeedPath);
+              if (poseSeed.success) {
+                tempFiles.push(poseSeed.imagePath!);
+                referenceLabel += ", replaced with a clean neutral-pose image generated to avoid an unreliable action-pose reference photo";
+                imagePath = poseSeed.imagePath!;
+              } else {
+                // Degrade to today's behavior — a bad pose-generation run
+                // shouldn't sink a request that would have succeeded (with
+                // the original, possibly-flawed photo) before this feature
+                // existed.
+                console.error("Pose-guided seed generation failed, falling back to the raw search photo:", poseSeed.error);
+              }
+            }
+
             if (wantsSingleImageOnly) {
               return generateMeshWithHunyuan3D(imagePath!);
             }
-            const ts = Date.now();
             const leftPath = path.join(IMAGE23D_TMP_DIR, `${ts}_left.jpg`);
             const backPath = path.join(IMAGE23D_TMP_DIR, `${ts}_back.jpg`);
             const novelViews = await generateNovelViews(imagePath!, leftPath, backPath);

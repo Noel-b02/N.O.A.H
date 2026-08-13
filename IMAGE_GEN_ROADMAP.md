@@ -1,4 +1,4 @@
-# Image-generation pipeline — single-seed novel-view synthesis (implemented)
+# Image-generation pipeline — single-seed novel-view synthesis + pose-guided generation (implemented)
 
 Noah's multiview image-to-3D pipeline used to source front/side/back
 reference photos from three independent web searches. Even with subject,
@@ -18,11 +18,19 @@ including a re-run of the exact "spiderman swinging" prompt that originally
 caused the detached-legs failure (confirmed fixed: clean, coherent geometry,
 no stray limbs).
 
+A second, related bug remained even after single-seed novel-view synthesis
+shipped: a single search-sourced photo can itself show the subject mid-action
+(limbs overlapping/occluded/foreshortened), and Zero123++ faithfully
+reproduces whatever pose the seed shows — so a bad single photo still
+produced detached-limb geometry, just from a different root cause. This is
+what pose-guided seed generation (step 3 below) fixes.
+
 ## Pipeline
 
 ```
-one reference image → vision verification → generate side/back views
-(Zero123++) → Hunyuan3D-2mv (multiview) → mesh → slicer
+one reference image → vision verification → [dynamic pose? generate a
+clean neutral-pose replacement] → generate side/back views (Zero123++)
+→ Hunyuan3D-2mv (multiview) → mesh → slicer
 ```
 
 1. **Reference image**: attached image, pasted URL, or the single best web
@@ -35,7 +43,41 @@ one reference image → vision verification → generate side/back views
    too). Attached images and pasted URLs skip verification, unchanged —
    it exists to filter untrustworthy search results, not to second-guess
    an image the user explicitly chose.
-3. **Generate side/back views**: `image23d/generate_novel_views.py` runs
+3. **Pose-guided seed generation (search-sourced images only)**: if the
+   request reads as a dynamic/action pose (`DYNAMIC_POSE_PATTERN` in
+   `server.ts` — swinging, jumping, fighting, etc.), the raw search photo's
+   pose is never trusted. Instead: `describeImageAppearance` (an Ollama
+   vision call, same pattern as `verifyImageMatchesSubject`) produces a
+   short costume/appearance description from the verified photo, and
+   `image23d/generate_pose_seed.py` generates a brand-new image combining
+   that description with a **fixed canonical neutral pose** — SDXL
+   (`stabilityai/stable-diffusion-xl-base-1.0`) + ControlNet-openpose
+   (`thibaud/controlnet-openpose-sdxl-1.0`), conditioned on
+   `image23d/assets/canonical_pose.png` (a static OpenPose-style skeleton,
+   made once via `image23d/tools/make_canonical_pose_asset.py`, not
+   regenerated per request). The pose is deliberately never extracted live
+   from the search photo — doing that would just reintroduce the pose
+   reliability problem this exists to remove. This generated image replaces
+   the raw search photo as the seed for step 4; on any failure, the
+   pipeline falls back to the raw search photo (same "still produce
+   something usable" posture as the rest of this pipeline). Attached images
+   and pasted URLs are never replaced — they're the user's own real object,
+   not a generic subject.
+
+   **Model note**: SDXL was chosen over the originally-planned
+   Z-Image-Turbo after live testing. Z-Image-Turbo's 6B-parameter
+   transformer measured ~15.5GB real VRAM on this 16GB card at both full
+   bf16 and Q8_0 GGUF quantization alike (GGUF's dequantize-on-forward-pass
+   approach didn't reduce PyTorch's peak allocator footprint the way its
+   on-disk size would suggest), pushing generation past 10 minutes *per
+   diffusion step*. `enable_model_cpu_offload()`, diffusers' standard
+   low-VRAM fallback, crashed with a genuine device-mismatch bug in
+   Z-Image's `adaLN_modulation` layer — confirmed as an upstream gap in how
+   freshly Z-Image ControlNet support was added to diffusers as of the
+   installed version, not fixable from this project's side. SDXL +
+   `enable_model_cpu_offload()` measured a real ~8GB peak VRAM and
+   16-25s per generation — confirmed directly, not assumed.
+4. **Generate side/back views**: `image23d/generate_novel_views.py` runs
    the seed through [Zero123++ v1.2](https://huggingface.co/sudo-ai/zero123plus-v1.2)
    (`sudo-ai/zero123plus-v1.2`, community pipeline
    `sudo-ai/zero123plus-pipeline`), which generates 6 fixed-angle views in
@@ -57,42 +99,55 @@ one reference image → vision verification → generate side/back views
    Hub repo at runtime (`trust_remote_code=True`) — same trust category as
    any other model this project downloads from Hugging Face, but worth
    knowing it's not just weights.
-4. **Hunyuan3D-2mv**, unchanged — already expected exactly this
+5. **Hunyuan3D-2mv**, unchanged — already expected exactly this
    `{front, left, back}` input shape; `generateMeshWithHunyuan3DMultiview`
    in `server.ts` didn't need to change at all.
-5. **Slicer** (Bambu Studio) — `sliceModel()` in `server.ts` drives Bambu
+6. **Slicer** (Bambu Studio) — `sliceModel()` in `server.ts` drives Bambu
    Studio's own CLI directly, chained after mesh repair and Fusion import;
    see `PRINTER_SETUP.md`.
 
 `wantsSingleImageOnly` (opt-out phrasing like "one image only" / "no
-multiview") skips steps 3-4 entirely and goes straight to shape-only
-generation from the seed, unchanged from before. If novel-view generation
-itself fails (script crash, timeout), the pipeline falls back to shape-only
-rather than failing the request outright — same "still produce something
-usable" reasoning the old search-based multiview attempt used.
+multiview") skips steps 4-5 entirely and goes straight to shape-only
+generation from the seed, unchanged from before — pose-guided generation
+(step 3) still runs first if triggered, since a bad pose wrecks shape-only
+geometry just as much as multiview. If novel-view generation itself fails
+(script crash, timeout), the pipeline falls back to shape-only rather than
+failing the request outright — same "still produce something usable"
+reasoning the old search-based multiview attempt used.
 
 ## GPU usage
 
 `withGpuExclusive` (see `server.ts`) is kept, not removed, despite the
-16GB upgrade — this pipeline *adds* a new ~5GB generation step
-(Zero123++) on top of the existing ~6GB one (Hunyuan3D-2 shape stage), and
-Ollama's two resident models plus Whisper/Kokoro plus one 5-6GB generation
-step is still a real way to approach 16GB. The two new steps don't contend
-with each other (separate spawned processes — Zero123++'s VRAM is released
-before Hunyuan3D-2mv's process starts); the risk `withGpuExclusive` guards
-against is Ollama/speech contending with either one.
+16GB upgrade — this pipeline can now run up to three back-to-back
+GPU-heavy steps in one request: pose-guided seed generation (~8GB, SDXL +
+ControlNet, only when triggered), Zero123++ novel-view synthesis (~5GB),
+and Hunyuan3D-2 shape generation (~6GB). Ollama's two resident models plus
+Whisper/Kokoro plus any one of these generation steps is still a real way
+to approach 16GB. The generation steps don't contend with each other
+(separate spawned processes — each releases its VRAM before the next
+starts); the risk `withGpuExclusive` guards against is Ollama/speech
+contending with any one of them.
 
 ## What this fixes vs. doesn't
 
 Fixes: pose/style inconsistency across the three views (the actual root
-cause of the detached-legs failure) — by construction, not by catching it
-after the fact. Live-verified against the original failure case.
+cause of the original detached-legs failure) — by construction, not by
+catching it after the fact. Also fixes the related single-photo case: a
+search-sourced photo caught mid-action producing detached-limb geometry
+even after single-seed novel-view synthesis shipped — by generating a
+clean, neutral-pose replacement before Zero123++ ever sees the seed. Both
+live-verified against the original failure cases, including direct mesh
+inspection (single connected component, no stray limb fragments) not just
+visual/textual confirmation.
 
 Doesn't fix: the underlying shape-generation model still produces geometry
 rougher than a hand-modeled asset — that's inherent to AI shape generation,
-not a consistency problem. Bad proportions from monocular depth inference
-struggling with foreshortened/dynamic poses are a separate issue this
-pipeline doesn't touch either.
+not a consistency problem. The canonical pose skeleton is a human pose, so
+pose-guided generation only meaningfully helps humanoid subjects — a
+non-humanoid dynamic subject (e.g. "a dragon flying") isn't helped by it,
+and remains an open gap. Attached images and pasted URLs are never
+pose-corrected (they're the user's own real object) — a user-supplied photo
+in a dynamic pose can still produce the original failure mode.
 
 ## Print-quality note (Bambu Lab P2S + AMS)
 

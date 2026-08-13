@@ -16,8 +16,9 @@ This covers the **shape-only** path (what `run_shape_only.py` and
 `run_multiview.py` actually use today — no texture/color, just geometry).
 The full texture+paint pipeline needs a separately-compiled CUDA rasterizer
 and ~16GB VRAM — not yet planned in detail, tracked as future work (see
-"Known limitations" below; `IMAGE_GEN_ROADMAP.md` covers a different
-16GB-unlocked feature, novel-view synthesis, not this one).
+"Known limitations" below; `IMAGE_GEN_ROADMAP.md` covers the other
+16GB-unlocked features — novel-view synthesis and pose-guided generation —
+not this one).
 
 ## 1. Create the venv and install dependencies
 
@@ -93,16 +94,68 @@ Should produce two output images. Inspect them by eye — a correct result
 looks like plausible rotated views of the same subject, same art style and
 pose family as the input.
 
+## 5. Pose-guided seed generation (dynamic-pose fix)
+
+`image23d/generate_pose_seed.py` replaces a search-sourced photo caught
+mid-action (limbs overlapping/occluded/foreshortened — passes subject-match
+verification but reliably wrecks the downstream mesh) with a cleanly
+generated neutral-pose image, when the request reads as a dynamic/action
+pose. See `IMAGE_GEN_ROADMAP.md` for the full design and why SDXL +
+ControlNet-openpose was chosen over the originally-planned Z-Image-Turbo.
+No separate venv — reuses this one (diffusers 0.39.0 already installed here
+has everything needed).
+
+First run downloads `stabilityai/stable-diffusion-xl-base-1.0` (~7GB) and
+`thibaud/controlnet-openpose-sdxl-1.0` (~2.4GB, an older `.bin`-format
+checkpoint — diffusers falls back to it automatically with a benign
+warning, no `.safetensors` file exists in that repo). Verify it works
+standalone:
+
+```bash
+venv\Scripts\python ..\generate_pose_seed.py "spiderman, red and blue spandex suit with black web pattern, standing in a neutral pose, isolated on a plain white background" pose_test.jpg
+```
+
+Should produce one output image: a full-body figure in a clean, neutral
+standing pose matching `image23d/assets/canonical_pose.png`'s skeleton.
+Confirmed live: ~8GB peak VRAM, 16-25s per generation once weights are
+cached, with `enable_model_cpu_offload()` (already set up in the script).
+
+### One-time canonical pose asset
+
+`image23d/assets/canonical_pose.png` (committed to the repo) is a static
+OpenPose-style skeleton image, used as fixed ControlNet conditioning for
+every pose-guided generation — never extracted live from a search photo,
+since that would reintroduce the exact pose-reliability problem this
+feature exists to remove. It was made once via
+`image23d/tools/make_canonical_pose_asset.py`, which:
+
+1. Generates a source photo of a person in a clean, neutral, front-facing
+   standing pose using plain SDXL text-to-image (no ControlNet) — avoids
+   any licensing question around a sourced stock photo, and is fully
+   reproducible from the script alone.
+2. Runs [`rtmlib`](https://github.com/Tramac/rtmlib)'s whole-body pose
+   estimator (RTMPose/DWPose-based, no `mmcv`/`mmdet`/`mmpose` dependency
+   chain — just `numpy`/`opencv`/`onnxruntime`) against that photo and
+   renders an OpenPose-style colored skeleton on a blank canvas.
+
+`rtmlib` is **not** a dependency of `generate_pose_seed.py` or any other
+live-runtime script — only needed if the canonical pose ever needs to
+change. If you do need to regenerate it: `pip install rtmlib` into this
+venv (or a disposable one) and run
+`venv\Scripts\python tools\make_canonical_pose_asset.py` from
+`image23d/`.
+
 ## How Noah uses it
 
 `server.ts` spawns `run_shape_only.py` (single reference image),
-`generate_novel_views.py` + `run_multiview.py` (single seed image, two
-angle views generated from it — see `IMAGE_GEN_ROADMAP.md`), as one-off
-child processes per request rather than as a persistent service — this is
-a rarely-used, GPU-heavy step, and keeping it out-of-process means it
-doesn't hold VRAM hostage from Ollama/Kokoro the rest of the time. Runs
-under `withGpuExclusive` — see that function's comment in `server.ts` for
-why Ollama/speech get paused while these run.
+`generate_pose_seed.py` (only when a dynamic pose is detected — see
+`IMAGE_GEN_ROADMAP.md`), `generate_novel_views.py` + `run_multiview.py`
+(single seed image, two angle views generated from it), as one-off child
+processes per request rather than as a persistent service — this is a
+rarely-used, GPU-heavy step, and keeping it out-of-process means it doesn't
+hold VRAM hostage from Ollama/Kokoro the rest of the time. Runs under
+`withGpuExclusive` — see that function's comment in `server.ts` for why
+Ollama/speech get paused while these run.
 
 ## Known limitations — read before relying on this
 
@@ -132,3 +185,10 @@ why Ollama/speech get paused while these run.
   (Ollama's model can be unloaded with `ollama stop <model>`) and retry —
   `withGpuExclusive` handles this automatically for requests that go
   through Noah, but manual troubleshooting may still need it.
+- **Pose-guided generation only helps humanoid subjects.** The fixed
+  canonical pose skeleton is a human pose — a non-humanoid dynamic subject
+  ("a dragon flying") isn't helped by this feature, and can still produce
+  the original detached-limb failure. Attached images and pasted URLs are
+  never pose-corrected either (they're the user's own real object) — a
+  user-supplied photo in a dynamic pose can still hit the same failure
+  mode this feature otherwise fixes for search-sourced photos.

@@ -1,9 +1,9 @@
 # N.O.A.H.
 
 **Edition: 16GB** — runs on a 16GB card, which unlocked single-seed
-novel-view synthesis for the multiview image-to-3D pipeline (see
-`IMAGE_GEN_ROADMAP.md`). The original 8GB-constrained state (shape-only
-mesh generation, no local novel-view model) is preserved at the
+novel-view synthesis and pose-guided seed generation for the image-to-3D
+pipeline (see `IMAGE_GEN_ROADMAP.md`). The original 8GB-constrained state
+(shape-only mesh generation, no local novel-view model) is preserved at the
 `noah-8gb-edition` git tag. Hunyuan3D's full texture+paint pipeline is
 the next 16GB-unlocked feature, not yet built.
 
@@ -36,8 +36,12 @@ to a third-party API by default.
     and imports the resulting mesh — including a multiview mode that
     generates consistent side/back views from that one verified photo
     ([Zero123++](https://huggingface.co/sudo-ai/zero123plus-v1.2)) for
-    better geometry than a single angle alone. See `IMAGE_GEN_ROADMAP.md`
-    for the full pipeline and what's headed next.
+    better geometry than a single angle alone. A search-sourced photo caught
+    mid-action ("a model of spiderman swinging") gets its pose replaced
+    with a cleanly generated neutral-pose image (SDXL + ControlNet-openpose)
+    before that step, rather than feeding an unreliable action pose in
+    directly. See `IMAGE_GEN_ROADMAP.md` for the full pipeline and what's
+    headed next.
 - **3D printing**: a generated model can be repaired/validated, sliced with
   Bambu Studio, and sent to a Bambu Lab printer over the local network —
   Noah asks for explicit confirmation before anything actually prints. See
@@ -62,6 +66,8 @@ graph TD
     Noah <--> SearXNG["SearXNG<br/>local web search"]
     Noah <--> Speech["Speech service<br/>Whisper STT + Kokoro TTS"]
     Noah <--> Bridge["Fusion 360 bridge"]
+    Noah -.dynamic pose detected.-> PoseSeed["SDXL + ControlNet-openpose<br/>pose-guided seed generation"]
+    PoseSeed --> NovelView
     Noah --> NovelView["Zero123++<br/>novel-view synthesis"]
     NovelView --> Hunyuan["Hunyuan3D-2<br/>image-to-3D generation"]
 
