@@ -22,5 +22,10 @@ pipeline = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(
 # marching-cubes extraction pass, per Tencent's own multiview example.
 # Costs more extraction time, not more VRAM or generation time, so it's a
 # free-ish quality knob.
-mesh = pipeline(image=images, num_chunks=20000)[0]
+# octree_resolution=512 (max supported, default 384) — this is the actual
+# generative model's internal spatial resolution, not post-processing, so
+# it's the real lever for raw geometric detail. Left at the conservative
+# default under the 8GB constraint; bumped now that there's real VRAM
+# headroom.
+mesh = pipeline(image=images, num_chunks=20000, octree_resolution=512)[0]
 mesh.export(output_path)

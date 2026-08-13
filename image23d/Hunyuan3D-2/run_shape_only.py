@@ -16,5 +16,10 @@ rembg = BackgroundRemover()
 image = rembg(image)
 
 pipeline = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained("tencent/Hunyuan3D-2")
-mesh = pipeline(image=image)[0]
+# octree_resolution=512 (max supported, default 384) — the generative
+# model's internal spatial resolution, the real lever for raw geometric
+# detail (not post-processing). Left at the conservative default under the
+# 8GB constraint; bumped now that there's real VRAM headroom. See
+# run_multiview.py for the same change and num_chunks reasoning.
+mesh = pipeline(image=image, num_chunks=20000, octree_resolution=512)[0]
 mesh.export(output_path)

@@ -965,6 +965,7 @@ interface MeshRepairReport {
   componentsFound: number;
   componentDroppedCount: number;
   repaired: boolean;
+  remeshed: boolean;
   usable: boolean;
   reason: string | null;
 }
@@ -978,10 +979,17 @@ interface MeshRepairReport {
 // as a soft failure and fall back to the unrepaired mesh rather than
 // blocking the whole pipeline on a tooling bug. report.usable === false is
 // the actual "this mesh is too broken" verdict.
-function repairMesh(meshPath: string): Promise<{ outputPath: string; report: MeshRepairReport } | null> {
+//
+// forceRemesh triggers the voxel-remesh fallback (see repair_mesh.py) —
+// off by default since it visibly reduces detail (confirmed live) and most
+// meshes slice fine without it. Only pass true after a first slice attempt
+// on the un-remeshed output has already failed; see sliceModelWithRepairFallback.
+function repairMesh(meshPath: string, forceRemesh: boolean = false): Promise<{ outputPath: string; report: MeshRepairReport } | null> {
   return new Promise((resolve) => {
-    const repairedPath = meshPath.replace(/\.obj$/i, "_repaired.obj");
-    const child = spawn(HUNYUAN3D_PYTHON, [path.join(IMAGE23D_DIR, "repair_mesh.py"), meshPath, repairedPath]);
+    const repairedPath = meshPath.replace(/\.obj$/i, forceRemesh ? "_repaired_remeshed.obj" : "_repaired.obj");
+    const args = [path.join(IMAGE23D_DIR, "repair_mesh.py"), meshPath, repairedPath];
+    if (forceRemesh) args.push("remesh");
+    const child = spawn(HUNYUAN3D_PYTHON, args);
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", (d) => { stdout += d.toString(); });
@@ -1010,6 +1018,7 @@ function repairMesh(meshPath: string): Promise<{ outputPath: string; report: Mes
         componentsFound: parsed.components_found,
         componentDroppedCount: parsed.component_dropped_count,
         repaired: parsed.repaired,
+        remeshed: Boolean(parsed.remeshed),
         usable: parsed.usable,
         reason: parsed.reason ?? null,
       };
@@ -2368,7 +2377,22 @@ Now generate code for this request: "${message}"`;
                 // successful generation. Deliberately NOT pushed to
                 // tempFiles: the .gcode.3mf needs to survive past this
                 // request until the user confirms or cancels the print.
-                const sliceResult = await sliceModel(meshPathForImport);
+                let sliceResult = await sliceModel(meshPathForImport);
+                let detailNote = "";
+                if (!sliceResult.success) {
+                  // First attempt uses the full-detail (non-remeshed) mesh
+                  // — most meshes slice fine as-is. Only pay the voxel-
+                  // remesh detail cost (confirmed live: visibly blockier)
+                  // on the meshes that actually need it to slice at all.
+                  const remeshResult = await repairMesh(meshPathForImport, true);
+                  if (remeshResult && remeshResult.report.usable) {
+                    tempFiles.push(remeshResult.outputPath);
+                    sliceResult = await sliceModel(remeshResult.outputPath);
+                    if (sliceResult.success) {
+                      detailNote = " (Had to simplify the geometry slightly to get it to slice.)";
+                    }
+                  }
+                }
                 if (sliceResult.success && sliceResult.gcodePath) {
                   pendingPrintJob = {
                     gcodePath: sliceResult.gcodePath,
@@ -2380,7 +2404,7 @@ Now generate code for this request: "${message}"`;
                   const estimateText = sliceResult.estimatedTimeMin
                     ? ` Estimated print time: ${sliceResult.estimatedTimeMin} min${sliceResult.estimatedFilamentG ? `, ~${sliceResult.estimatedFilamentG}g filament` : ""}.`
                     : "";
-                  imageReplyText += `\n\nSliced and ready to print.${estimateText} Reply "print" to hand it off to Bambu Connect, or ignore this to skip.`;
+                  imageReplyText += `\n\nSliced and ready to print.${estimateText}${detailNote} Reply "print" to hand it off to Bambu Connect, or ignore this to skip.`;
                 } else if (sliceResult.error) {
                   imageReplyText += `\n\n(Skipped printing: ${sliceResult.error})`;
                 }
