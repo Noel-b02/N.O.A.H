@@ -5,11 +5,16 @@ only mesh generation, GPU-exclusive locking between Ollama and generation
 tasks). A 16GB edition is planned once hardware allows for the full
 texture+paint pipeline and more — see `IMAGE_GEN_ROADMAP.md`.
 
-A personal, local-first AI assistant. Runs entirely on your own hardware —
+**N.O.A.H.** (Noel's Operational AI Helper) is a local-first AI agent — not
+a chatbot wrapped around an API call. It combines conversational AI,
+persistent memory, web search, speech, CAD automation, image-to-3D
+generation, and 3D printing, plus supervised self-modification of its own
+source code, into one system that runs entirely on your own hardware:
 local LLM (via [Ollama](https://ollama.com)), local web search (via
 [SearXNG](https://github.com/searxng/searxng)), local speech-to-text and
-text-to-speech (Whisper + Kokoro), and a CAD bridge into Autodesk Fusion 360.
-Nothing is sent to a third-party API by default.
+text-to-speech (Whisper + Kokoro), a CAD bridge into Autodesk Fusion 360,
+and a generate-to-print pipeline onto a Bambu Lab printer. Nothing is sent
+to a third-party API by default.
 
 ## What it does
 
@@ -44,6 +49,23 @@ requests, calls Ollama for generation, proxies SearXNG for search, talks to
 the local speech service over HTTP, and dispatches Fusion 360 requests to a
 bridge add-in running inside Fusion itself. The frontend (`public/`) is a
 single HTML/JS page — no build step, no framework.
+
+```mermaid
+graph TD
+    You(("You")) <-->|chat / voice| Noah["N.O.A.H.<br/>server.ts"]
+
+    Noah <--> Ollama["Ollama<br/>local LLMs"]
+    Noah <--> SearXNG["SearXNG<br/>local web search"]
+    Noah <--> Speech["Speech service<br/>Whisper STT + Kokoro TTS"]
+    Noah <--> Bridge["Fusion 360 bridge"]
+    Noah --> Hunyuan["Hunyuan3D-2<br/>image-to-3D generation"]
+
+    Hunyuan --> Bridge
+    Hunyuan --> Slicer["Bambu Studio<br/>slicing"]
+    Slicer --> Connect["Bambu Connect"]
+    Connect -.you confirm.-> Printer[("Bambu Lab<br/>printer")]
+    Bridge --> Fusion["Autodesk Fusion 360"]
+```
 
 ```
 public/            chat UI (static HTML/JS)
