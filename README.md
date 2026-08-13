@@ -74,6 +74,22 @@ has its own detailed one-time setup doc:
 want day to day. `npm start` runs the compiled build (`npm run build`
 first) instead.
 
+## Security assumption
+
+Noah's server has **no authentication** — `app.listen(PORT)` accepts any
+request that reaches it. That's a deliberate trade-off for a single-user
+localhost tool, not an oversight, but it means several endpoints are more
+privileged than they might look at a glance: the Fusion 360 bridge executes
+generated code directly inside Fusion, and the self-modification
+approve/reject endpoints perform real git operations (branch, commit,
+merge) with no check on who's asking.
+
+**Noah is designed to run on `localhost`, trusted by exactly one person —
+you.** Don't expose port 3000 (or the Fusion bridge's port 9000) to your
+LAN or the internet without adding real authentication first; nothing here
+currently stops another device on your network from using either endpoint
+as if it were you.
+
 ## Hardware notes
 
 Image-to-3D generation and the full Ollama/Whisper stack are VRAM-hungry.
