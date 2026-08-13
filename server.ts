@@ -690,13 +690,18 @@ function isBambuConnectInstalled(): boolean {
 }
 
 // URL scheme is beta and undocumented beyond Bambu's own wiki page — Bambu
-// Lab could change it without notice. `start` with an empty title arg is
-// the standard way to hand a URL to whatever's registered for its protocol
-// on Windows, same as clicking a link would.
+// Lab could change it without notice. Confirmed live: launching via
+// `cmd /c start` mangles the URL — cmd.exe reinterprets '&' as a command
+// separator and '%XX' percent-encoding as environment-variable expansion,
+// so Bambu Connect ended up receiving an empty path. rundll32's
+// FileProtocolHandler hands the URL straight to Windows' registered
+// protocol handler without going through cmd.exe's parsing at all, which
+// fixed it (verified: Bambu Connect showed the correct filename after
+// switching to this).
 function launchBambuConnect(gcodePath: string, name: string): { success: boolean; error?: string } {
   const url = `bambu-connect://import-file?path=${encodeURIComponent(gcodePath)}&name=${encodeURIComponent(name)}&version=1.0.0`;
   try {
-    spawn("cmd", ["/c", "start", "", url], { detached: true, stdio: "ignore" }).unref();
+    spawn("rundll32", ["url.dll,FileProtocolHandler", url], { detached: true, stdio: "ignore" }).unref();
     return { success: true };
   } catch (err) {
     return { success: false, error: (err as Error).message };
@@ -1015,11 +1020,69 @@ interface SliceResult {
   knownCliBug?: boolean;
 }
 
+// Extracts the header of Metadata/plate_1.gcode from inside the sliced
+// .gcode.3mf (itself a zip archive) via Windows' built-in tar, which can
+// read zip entries directly — avoids adding a zip-parsing dependency for
+// two lines of text. Reads by streaming and stopping early rather than
+// buffering the whole file: a real print's gcode body can be many MB, but
+// the header lines this needs appear in the first ~20 lines. Confirmed
+// live against a real Bambu Studio CLI output: the header contains exactly
+// `; total estimated time: <Xh Ym Zs>` and
+// `; total filament weight [g] : <N>`.
+// Uses an absolute path to Windows' native tar.exe rather than relying on
+// PATH — confirmed live that Git for Windows' bundled tar (usually earlier
+// on PATH than System32) fails on Windows-style paths with a "cannot
+// connect to C: resolve failed" error, since it parses "C:" as a remote
+// host spec the way Unix tar does. System32's real tar.exe doesn't have
+// that problem.
+const WINDOWS_TAR_EXE = "C:/Windows/System32/tar.exe";
+
+function parseSliceEstimate(gcode3mfPath: string): Promise<{ estimatedTimeMin: number | null; estimatedFilamentG: number | null }> {
+  return new Promise((resolve) => {
+    const child = spawn(WINDOWS_TAR_EXE, ["-xf", gcode3mfPath, "-O", "Metadata/plate_1.gcode"]);
+    let buffer = "";
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      child.kill();
+
+      const timeMatch = buffer.match(/total estimated time:\s*([\dhms\s]+?)(?:\r?\n|$)/i);
+      let estimatedTimeMin: number | null = null;
+      if (timeMatch) {
+        const h = timeMatch[1].match(/(\d+)h/);
+        const m = timeMatch[1].match(/(\d+)m/);
+        const s = timeMatch[1].match(/(\d+)s/);
+        if (h || m || s) {
+          const totalSeconds = (h ? parseInt(h[1]) * 3600 : 0) + (m ? parseInt(m[1]) * 60 : 0) + (s ? parseInt(s[1]) : 0);
+          estimatedTimeMin = Math.round(totalSeconds / 60);
+        }
+      }
+      const weightMatch = buffer.match(/total filament weight \[g\]\s*:\s*([\d.]+)/i);
+      const estimatedFilamentG = weightMatch ? parseFloat(weightMatch[1]) : null;
+
+      resolve({ estimatedTimeMin, estimatedFilamentG });
+    };
+    // tar's own exit code isn't reliable here (confirmed live: it can exit
+    // non-zero via -O single-entry extraction while still having written
+    // valid data to stdout) — success is judged by whether the expected
+    // fields were actually found in what was read, not the exit code.
+    child.stdout.on("data", (d) => {
+      buffer += d.toString();
+      if (buffer.length > 4000) finish();
+    });
+    child.on("error", () => resolve({ estimatedTimeMin: null, estimatedFilamentG: null }));
+    child.on("close", finish);
+    setTimeout(finish, 5000);
+  });
+}
+
 // Slices a mesh via Bambu Studio's own CLI (not OrcaSlicer, not GUI
-// automation — see PRINTER_SETUP.md for why). NOTE: whether the CLI wants
-// a raw .obj or needs a .3mf wrapper first is unverified — this assumes
-// direct .obj input per the documented flag set; revisit once tested
-// against a real Bambu Studio install.
+// automation — see PRINTER_SETUP.md for why). Confirmed live: the CLI
+// accepts a raw .obj directly (no .3mf wrapper needed), and this exact
+// profile/argument combination does not trigger the known P2S
+// "nozzle_volume_type" CLI bug — that check below still guards against it
+// for other profile combinations that might.
 function sliceModel(meshPath: string): Promise<SliceResult> {
   return new Promise((resolve) => {
     if (!fs.existsSync(BAMBU_STUDIO_EXE)) {
@@ -1040,7 +1103,12 @@ function sliceModel(meshPath: string): Promise<SliceResult> {
       meshPath,
     ];
 
-    const child = spawn(BAMBU_STUDIO_EXE, args);
+    // Confirmed live: the CLI writes a result.json (slice stats) into its
+    // own working directory as a side effect of --export-3mf — without an
+    // explicit cwd it landed in the repo root. Pointing it at the same
+    // directory as the output file keeps it alongside the other
+    // already-gitignored generation artifacts instead.
+    const child = spawn(BAMBU_STUDIO_EXE, args, { cwd: path.dirname(gcodePath) });
     let stderr = "";
     let stdout = "";
     child.stdout.on("data", (d) => { stdout += d.toString(); });
@@ -1048,7 +1116,7 @@ function sliceModel(meshPath: string): Promise<SliceResult> {
     child.on("error", (err) => {
       resolve({ success: false, error: `Failed to launch Bambu Studio CLI: ${err.message}` });
     });
-    child.on("exit", (code) => {
+    child.on("exit", async (code) => {
       if (code !== 0 || !fs.existsSync(gcodePath)) {
         const combined = (stderr + stdout).slice(-2000);
         // A reported open GitHub issue on P2S CLI slicing specifically —
@@ -1064,10 +1132,13 @@ function sliceModel(meshPath: string): Promise<SliceResult> {
         });
         return;
       }
-      // Estimated time/filament parsing depends on the real output's
-      // metadata/gcode-header format, unverified until tested against an
-      // actual sliced file — left unset rather than guessed.
-      resolve({ success: true, gcodePath });
+      const estimate = await parseSliceEstimate(gcodePath);
+      resolve({
+        success: true,
+        gcodePath,
+        ...(estimate.estimatedTimeMin !== null ? { estimatedTimeMin: estimate.estimatedTimeMin } : {}),
+        ...(estimate.estimatedFilamentG !== null ? { estimatedFilamentG: estimate.estimatedFilamentG } : {}),
+      });
     });
   });
 }

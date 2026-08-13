@@ -15,6 +15,12 @@ output_path = sys.argv[2]
 # tested against an actual bad multiview output.
 DOMINANT_COMPONENT_VOLUME_THRESHOLD = 0.85
 
+# Voxels along the longest axis when remeshing (see below) — balances
+# print-relevant detail against face count/slicing speed. Not tuned
+# against real print-quality comparisons yet, just against "does the
+# slicer accept it."
+VOXEL_RESOLUTION = 128
+
 loaded = trimesh.load(mesh_path, process=False)
 # Same as scale_mesh.py — export can be a multi-geometry Scene rather than
 # a single Trimesh depending on the mesh format.
@@ -50,10 +56,27 @@ repaired = False
 watertight_after = watertight_before
 
 if usable:
+    # Confirmed live against a real Hunyuan3D-2 output: fix_normals() +
+    # fill_holes() alone can produce a mesh that reports is_watertight,
+    # is_winding_consistent, AND is_volume all True, yet still crashes
+    # Bambu Studio's CLI slicer outright with zero error output. The
+    # giveaway was euler_number being far from the expected 2 for a
+    # simple closed shape — a sign of self-intersecting/tunneling
+    # geometry that those checks don't catch. Voxelizing and rebuilding
+    # via marching cubes guarantees a clean, non-self-intersecting
+    # manifold surface, which is what actually fixed it in testing.
+    # Trade-off: this discards fine surface detail in favor of a
+    # blocky/rounded approximation — an acceptable cost since that level
+    # of detail usually wouldn't print reliably on FDM anyway.
+    extents = mesh.extents
+    max_extent = max(extents) if len(extents) else 0
+    if max_extent > 0:
+        pitch = max_extent / VOXEL_RESOLUTION
+        mesh = mesh.voxelized(pitch=pitch).fill().marching_cubes
+
     trimesh.repair.fix_normals(mesh)
-    trimesh.repair.fill_holes(mesh)
     watertight_after = bool(mesh.is_watertight)
-    repaired = watertight_after and not watertight_before
+    repaired = True
 
     mesh.export(output_path)
 

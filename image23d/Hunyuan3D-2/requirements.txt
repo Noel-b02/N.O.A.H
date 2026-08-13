@@ -26,12 +26,16 @@ pygltflib
 xatlas
 #kornia
 #facexlib
+# Needed by repair_mesh.py's voxel-remesh step (trimesh's marching_cubes) —
+# confirmed live that raw Hunyuan3D output can pass every trimesh validity
+# check yet still crash Bambu Studio's slicer; voxelizing and rebuilding
+# via marching cubes is what actually produces slicer-safe geometry.
+scikit-image
 
 # Training
 accelerate
 #pytorch_lightning
 #scikit-learn
-#scikit-image
 
 # Demo only
 gradio

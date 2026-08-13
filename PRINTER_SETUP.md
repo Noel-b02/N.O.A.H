@@ -76,15 +76,23 @@ BAMBU_FILAMENT_PROFILE=<full path to a filament profile>
 
 Ask Noah to generate a model ("make me a model of X"). If slicing
 succeeds, it'll report an estimate and ask you to reply "print" — do that
-once to confirm Noah can actually launch Bambu Connect via the
-`bambu-connect://` URL scheme and that it opens with the right file
-loaded, ideally on something small first.
+once to confirm Bambu Connect opens with the correct filename shown in
+its own "Import file" dialog, ideally on something small first.
+
+If Bambu Connect ever shows an *empty* filename instead of the real one,
+that's the exact symptom of a `cmd.exe` URL-mangling bug already found and
+fixed once during development (`cmd.exe` reinterprets `&` and `%XX` in the
+URL as its own shell syntax) — `launchBambuConnect()` in `server.ts`
+launches via `rundll32 url.dll,FileProtocolHandler` specifically to avoid
+this, so if it recurs, something about that invocation has regressed.
 
 ## How Noah uses it
 
 - `repairMesh()` (via `image23d/repair_mesh.py`) — validates/repairs the
   generated mesh before it's trusted for slicing or Fusion import.
-- `sliceModel()` — invokes Bambu Studio's CLI to slice the repaired mesh.
+- `sliceModel()` — invokes Bambu Studio's CLI to slice the repaired mesh,
+  then `parseSliceEstimate()` reads the print time/filament weight back out
+  of the sliced `.gcode.3mf`'s embedded gcode header for the chat reply.
 - `isBambuConnectInstalled()` — a quick registry check (`HKCR\bambu-connect`)
   used only for the HUD's `PRINTER` indicator.
 - `launchBambuConnect()` — used only after you reply "print" to a pending
