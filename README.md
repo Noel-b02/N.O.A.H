@@ -1,5 +1,9 @@
 # N.O.A.H.
 
+[![Edition](https://img.shields.io/badge/edition-16GB-blue)](https://github.com/Noel-b02/N.O.A.H)
+[![8GB Edition](https://img.shields.io/badge/8GB%20edition-available-lightgrey)](https://github.com/Noel-b02/N.O.A.H/tree/8gb-edition)
+[![Releases](https://img.shields.io/badge/releases-view-lightgrey)](https://github.com/Noel-b02/N.O.A.H/releases)
+
 **Edition: 16GB** — runs on a 16GB card, which unlocked novel-view
 synthesis, pose-guided seed generation (including attaching your own
 reference image to drive a specific dynamic pose), and full texture+paint
