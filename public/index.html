@@ -193,6 +193,17 @@
             <button type="button" id="image-attach-remove" class="text-rose-400 hover:text-rose-300 px-2" title="Remove attached image">✕</button>
           </div>
 
+          <!-- Attached-document chip — separate from the image one above on
+               purpose: an attached image is consumed and cleared the
+               instant a message sends, but a document needs to persist
+               across many turns until explicitly replaced/removed, so it
+               can't share that same lifecycle/state variable. -->
+          <div id="document-attach-preview" class="hidden items-center gap-2 mb-2 px-2 py-1.5 bg-slate-950/90 border border-cyan-500/20 rounded text-xs text-cyan-300 font-mono">
+            <span class="text-base">📄</span>
+            <span id="document-attach-name" class="flex-1 truncate"></span>
+            <button type="button" id="document-attach-remove" class="text-rose-400 hover:text-rose-300 px-2" title="Remove attached document">✕</button>
+          </div>
+
           <div id="chat-drop-zone" class="relative flex items-center bg-slate-950/90 border border-cyan-500/20 rounded p-2 transition-colors duration-150">
             <!-- Bracket element inside input -->
             <span class="text-cyan-500 font-mono px-2 text-sm select-none">&gt;</span>
@@ -204,6 +215,15 @@
               class="bg-cyan-950/40 hover:bg-cyan-500/15 border border-cyan-500/40 text-cyan-400 font-bold tracking-widest text-[10px] px-4 py-3 rounded uppercase transition duration-300 mr-2"
             >
               📷
+            </button>
+            <input type="file" id="document-attach-input" accept=".pdf,.docx,.txt,.md" class="hidden" />
+            <button
+              type="button"
+              id="document-attach-btn"
+              title="Attach a document (PDF/DOCX/text) — or drag & drop one here"
+              class="bg-cyan-950/40 hover:bg-cyan-500/15 border border-cyan-500/40 text-cyan-400 font-bold tracking-widest text-[10px] px-4 py-3 rounded uppercase transition duration-300 mr-2"
+            >
+              📄
             </button>
             <input
               type="text"
@@ -622,6 +642,75 @@
     imageAttachInput.addEventListener('change', () => setAttachedImage(imageAttachInput.files[0]));
     imageAttachRemove.addEventListener('click', clearAttachedImage);
 
+    // --- Document attach (drag & drop, or the 📄 button) ---
+    // Unlike attachedImage, this is NOT cleared on send — a document needs
+    // to persist across many turns until explicitly replaced or removed
+    // (mirrors currentModelId's cross-turn lifecycle), so it's uploaded
+    // and processed (extracted/chunked/embedded) immediately on attach
+    // rather than piggybacked onto the next /api/chat call.
+    const documentAttachInput = document.getElementById('document-attach-input');
+    const documentAttachBtn = document.getElementById('document-attach-btn');
+    const documentAttachPreview = document.getElementById('document-attach-preview');
+    const documentAttachName = document.getElementById('document-attach-name');
+    const documentAttachRemove = document.getElementById('document-attach-remove');
+    let currentDocumentId = null;
+
+    function showDocumentChip(text) {
+      documentAttachName.textContent = text;
+      documentAttachPreview.classList.remove('hidden');
+      documentAttachPreview.classList.add('flex');
+    }
+
+    function clearDocumentAttachment() {
+      currentDocumentId = null;
+      documentAttachInput.value = '';
+      documentAttachPreview.classList.add('hidden');
+      documentAttachPreview.classList.remove('flex');
+    }
+
+    const DOCUMENT_EXTENSION_PATTERN = /\.(pdf|docx|txt|md)$/i;
+
+    async function attachDocument(file) {
+      // A previously-attached document's server-side chunks/embeddings are
+      // no longer reachable from the chat once replaced — free them rather
+      // than leaving them to linger until MAX_ACTIVE_DOCUMENTS prunes them.
+      if (currentDocumentId) {
+        fetch(`/api/documents/${currentDocumentId}`, { method: 'DELETE' }).catch(() => {});
+      }
+      showDocumentChip(`Reading ${file.name}...`);
+      const reader = new FileReader();
+      reader.onload = async () => {
+        const dataUrl = reader.result;
+        const base64 = dataUrl.slice(dataUrl.indexOf(',') + 1);
+        try {
+          const res = await fetch('/api/documents/upload', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ base64, mimeType: file.type, fileName: file.name })
+          });
+          const data = await res.json();
+          if (data.error) {
+            showDocumentChip(`Failed: ${data.error}`);
+            currentDocumentId = null;
+            return;
+          }
+          currentDocumentId = data.documentId;
+          showDocumentChip(`${data.fileName} (${data.chunkCount} chunk${data.chunkCount === 1 ? '' : 's'})`);
+        } catch (err) {
+          showDocumentChip(`Failed: ${err.message}`);
+          currentDocumentId = null;
+        }
+      };
+      reader.readAsDataURL(file);
+    }
+
+    documentAttachBtn.addEventListener('click', () => documentAttachInput.click());
+    documentAttachInput.addEventListener('change', () => attachDocument(documentAttachInput.files[0]));
+    documentAttachRemove.addEventListener('click', () => {
+      if (currentDocumentId) fetch(`/api/documents/${currentDocumentId}`, { method: 'DELETE' }).catch(() => {});
+      clearDocumentAttachment();
+    });
+
     // Listens on `document`, not just chatDropZone — a drop anywhere else
     // on the page (the message history, the viewer panel, empty margin)
     // previously fell through to the browser's own default handling for a
@@ -645,7 +734,12 @@
     });
     document.addEventListener('drop', (e) => {
       const file = e.dataTransfer.files && e.dataTransfer.files[0];
-      if (file) setAttachedImage(file);
+      if (!file) return;
+      if (file.type.startsWith('image/')) {
+        setAttachedImage(file);
+      } else if (DOCUMENT_EXTENSION_PATTERN.test(file.name)) {
+        attachDocument(file);
+      }
     });
 
     chatForm.addEventListener('submit', async (e) => {
@@ -719,17 +813,23 @@
           body: JSON.stringify({
             message,
             ...(attachedImage ? { attachedImage: { base64: attachedImage.base64, mimeType: attachedImage.mimeType } } : {}),
-            ...(currentModelId ? { openModelId: currentModelId } : {})
+            ...(currentModelId ? { openModelId: currentModelId } : {}),
+            ...(currentDocumentId ? { currentDocumentId } : {})
           })
         });
         const data = await response.json();
-        
+
         removeMessage(loadingId);
 
         if (data.error) {
           appendMessage('system', `CRITICAL REJECT ERROR: ${data.error}`);
           setCoreState('idle');
           return;
+        }
+
+        if (data.documentNotFound) {
+          clearDocumentAttachment();
+          appendMessage('system', 'The attached document is no longer available server-side (likely a restart) — re-attach it to keep asking about it.');
         }
 
         if (data.response) {

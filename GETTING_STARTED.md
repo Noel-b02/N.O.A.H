@@ -55,13 +55,16 @@ ones):
 ```bash
 ollama pull qwen3.5:4b
 ollama pull qwen3.5:9b
+ollama pull nomic-embed-text
 ```
 
 The first is used for everyday chat, the second for more complex requests,
 Fusion 360 code generation, and — if you set up Hunyuan3D-2 — verifying
 image-to-3D reference photos. Both need to support vision input for the
 image-related features to work; substitute accordingly if you use different
-models.
+models. The third (~275MB, configurable via `OLLAMA_EMBEDDING_MODEL`) is
+only needed for document Q&A (attach a PDF/DOCX/text file in chat and ask
+questions about it) — chat itself works fine without it.
 
 ## 4. Optional subsystems
 
