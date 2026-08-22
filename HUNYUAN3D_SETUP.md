@@ -12,13 +12,13 @@ The repo is already vendored at `image23d/Hunyuan3D-2/`. It needs its own
 venv, kept separate from the speech service's — the two pull in different,
 sometimes conflicting native-dependency versions of `torch`.
 
-This covers the **shape-only** path (what `run_shape_only.py` and
-`run_multiview.py` actually use today — no texture/color, just geometry).
-The full texture+paint pipeline needs a separately-compiled CUDA rasterizer
-and ~16GB VRAM — not yet planned in detail, tracked as future work (see
-"Known limitations" below; `IMAGE_GEN_ROADMAP.md` covers the other
-16GB-unlocked features — novel-view synthesis and pose-guided generation —
-not this one).
+Covers both the **shape-only** path (`run_shape_only.py`/`run_multiview.py`)
+and the **texture+paint** path (`run_texture_paint.py`, section 6 below) —
+the latter needs two one-time-compiled native extensions, confirmed live at
+~7.2GB peak VRAM (not the ~16GB originally estimated before this was built
+and measured). `IMAGE_GEN_ROADMAP.md` covers the full pipeline design and
+the other 16GB-unlocked features (novel-view synthesis, pose-guided
+generation).
 
 ## 1. Create the venv and install dependencies
 
@@ -145,12 +145,91 @@ venv (or a disposable one) and run
 `venv\Scripts\python tools\make_canonical_pose_asset.py` from
 `image23d/`.
 
+## 6. Texture+paint pipeline (native extension compilation)
+
+`image23d/Hunyuan3D-2/hy3dgen/texgen/` ships Tencent's own complete
+`Hunyuan3DPaintPipeline` — unused until now because two native extensions
+need one-time local compilation. Both need a **VS Developer Command
+Prompt** (or `vcvarsall.bat x64` sourced first) so `nvcc`/`cl.exe` can find
+each other — confirmed directly, `cl.exe` is not on an ordinary shell's
+PATH by default even with VS Build Tools installed.
+
+**`custom_rasterizer`** (CUDA, hard requirement — `Hunyuan3DPaintPipeline`
+unconditionally imports it, no fallback):
+
+```bat
+cd image23d\Hunyuan3D-2
+venv\Scripts\activate
+set DISTUTILS_USE_SDK=1
+cd hy3dgen\texgen\custom_rasterizer
+python setup.py install
+```
+
+`DISTUTILS_USE_SDK=1` is required — without it, torch's build system
+refuses to proceed when it detects an already-activated VC environment.
+On CUDA 13.x specifically, compilation may also fail with `error C1189:
+MSVC/cl.exe with traditional preprocessor is used` — this project's copy
+of `custom_rasterizer/setup.py` already has the fix (`/Zc:preprocessor`
+added to `extra_compile_args`) baked in, confirmed live.
+
+**`differentiable_renderer`** (plain C++, not a hard blocker — a
+pure-Python/NumPy fallback for the same functions already exists in
+`mesh_processor.py`, used automatically if the compiled version is
+absent; still worth building for speed):
+
+```bat
+cd image23d\Hunyuan3D-2\hy3dgen\texgen\differentiable_renderer
+python setup.py install
+```
+
+**Verify both**, from an *ordinary* shell (not the VS prompt) — but
+`import torch` first, or the `custom_rasterizer_kernel` import will fail
+with a misleading `DLL load failed` error (confirmed directly: torch adds
+its own DLL search path on import, which the extension's dependencies
+need; this isn't a real problem, just an artifact of testing the import in
+isolation — the real pipeline always imports torch first):
+
+```bat
+venv\Scripts\python -c "import torch; import custom_rasterizer_kernel; import custom_rasterizer; print('custom_rasterizer OK')"
+venv\Scripts\python -c "import mesh_processor; print('mesh_processor OK')"
+```
+
+Also confirmed live: `hy3dgen/texgen/utils/multiview_utils.py`'s internal
+`DiffusionPipeline.from_pretrained(..., custom_pipeline=...)` call needs
+`trust_remote_code=True` on the diffusers version installed here (this
+vendored file predates that requirement) — already patched in this
+project's copy, same trust category as Zero123++'s community pipeline.
+
+First real run downloads `hunyuan3d-paint-v2-0-turbo` and
+`hunyuan3d-delight-v2-0` — confirmed live at ~26 minutes combined on this
+connection, on top of the shape weights already cached. Verify it works
+standalone — takes one or more reference images (mesh path and output path
+first, then every image; `server.ts` passes the front seed plus left/back
+novel views when available, confirmed live as a real texture-quality
+improvement over front-only):
+
+```bash
+venv\Scripts\python run_texture_paint.py <repaired-mesh.obj> output_test.glb <reference-image.jpg> [left.jpg] [back.jpg]
+```
+
+Should produce a textured `output_test.glb` — open it in any glTF viewer
+and confirm real color/costume detail, not a blank or garbled texture.
+Confirmed live: ~7.2GB peak VRAM, ~130-165s per generation once weights
+are cached, with `enable_model_cpu_offload()` (already set up in the
+script). Meshes over 500K faces are automatically simplified to 300K
+first (`trimesh.simplify_quadric_decimation`) — confirmed live as a real,
+necessary fix: an unusually complex ~1.7M-face mesh stalled the UV-unwrap
+step for 30+ minutes before this cap was added; capped meshes complete in
+~130s with no visible quality loss.
+
 ## How Noah uses it
 
 `server.ts` spawns `run_shape_only.py` (single reference image),
 `generate_pose_seed.py` (only when a dynamic pose is detected — see
 `IMAGE_GEN_ROADMAP.md`), `generate_novel_views.py` + `run_multiview.py`
-(single seed image, two angle views generated from it), as one-off child
+(single seed image, two angle views generated from it), and
+`run_texture_paint.py` (default-on, opt out with "shape only" / "no
+texture" phrasing — see `IMAGE_GEN_ROADMAP.md`), as one-off child
 processes per request rather than as a persistent service — this is a
 rarely-used, GPU-heavy step, and keeping it out-of-process means it doesn't
 hold VRAM hostage from Ollama/Kokoro the rest of the time. Runs under
@@ -168,15 +247,25 @@ Ollama/speech get paused while these run.
   model normalizes geometry into its own coordinate space, so the imported
   model can come in absurdly tiny or huge — use Fusion's Scale tool (or ask
   Noah for a specific size) after import.
-- **Geometry and texture fidelity is rough** compared to a hand-modeled
-  asset or a paid image-to-3D service — this trades quality for being
-  free/local. Fine detail, thin features, and accurate proportions on
-  complex subjects (a specific character's face, for example) are not
-  reliable.
-- **Shape-only means no color/texture** — the output is bare geometry. Fine
-  for printing, not for anything needing surface color. The full
-  texture+paint pipeline is planned next but not yet designed in detail
-  (see the note at the top of this file).
+- **Geometry fidelity is rough** compared to a hand-modeled asset or a paid
+  image-to-3D service — confirmed directly via live inspection: hands come
+  out as blobby mittens (no individual fingers), faces are essentially
+  featureless. This is a real, known ceiling of this model generation
+  (Hunyuan3D-2, aka "2.0") specifically — Hunyuan3D-2.5, which is
+  specifically trained to fix this, has no public weights and isn't usable
+  locally; Hunyuan3D-2.1 was evaluated and rejected as needing ~21-29GB
+  VRAM, more than this 16GB card has. Texture quality is now good (see
+  below); shape/geometry quality is not, and that gap isn't closing without
+  a model generation this project can't currently run.
+- **Texture generation is default-on, with an automatic fallback to bare
+  geometry on any failure** (native extension not compiled on a given
+  machine, model download failure, CUDA OOM, timeout) — never blocks a
+  request that would have succeeded before this feature existed. Opt out
+  explicitly with phrasing like "shape only" / "no texture" / "don't paint
+  it" if you want the older, faster untextured path. One known cosmetic
+  gap, confirmed live: small, isolated mesh regions (e.g. one foot on an
+  otherwise fully-textured figure) can occasionally come out untextured —
+  a texture-baking/inpainting edge case, not a functional failure.
 - **Meaningfully slower than a single-pass reconstruction model** — this is
   a diffusion model doing iterative denoising, so expect noticeably longer
   generation time even once weights are cached.

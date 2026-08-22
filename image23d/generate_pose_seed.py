@@ -29,19 +29,33 @@ from PIL import Image
 
 CANONICAL_POSE_PATH = Path(__file__).parent / "assets" / "canonical_pose.png"
 
-NEGATIVE_PROMPT = "blurry, deformed, extra limbs, missing limbs, watermark, text, cropped, worst quality, action pose, dynamic pose"
+CANONICAL_NEGATIVE_PROMPT = "blurry, deformed, extra limbs, missing limbs, watermark, text, cropped, worst quality, action pose, dynamic pose"
+# "action pose, dynamic pose" is dropped here — those exclusions only make
+# sense against the fixed neutral canonical skeleton below; a custom
+# skeleton (extract_pose_skeleton.py, already safety-checked for
+# overlapping/occluded limbs before this script is ever called with one)
+# is deliberately dynamic on purpose.
+CUSTOM_SKELETON_NEGATIVE_PROMPT = "blurry, deformed, extra limbs, missing limbs, watermark, text, cropped, worst quality"
 NUM_INFERENCE_STEPS = 30
 
 prompt = sys.argv[1]
 output_path = sys.argv[2]
+# Optional 3rd arg: a per-request pose skeleton (from extract_pose_skeleton.py)
+# to use instead of the fixed canonical one. Absent, this call is
+# byte-for-byte identical to before this arg existed.
+custom_skeleton_path = sys.argv[3] if len(sys.argv) > 3 else None
 
-if not CANONICAL_POSE_PATH.exists():
-    raise FileNotFoundError(
-        f"Canonical pose asset missing at {CANONICAL_POSE_PATH} — see "
-        "HUNYUAN3D_SETUP.md's one-time canonical-pose-asset step."
-    )
-
-control_image = Image.open(CANONICAL_POSE_PATH).convert("RGB")
+if custom_skeleton_path:
+    control_image = Image.open(custom_skeleton_path).convert("RGB")
+    negative_prompt = CUSTOM_SKELETON_NEGATIVE_PROMPT
+else:
+    if not CANONICAL_POSE_PATH.exists():
+        raise FileNotFoundError(
+            f"Canonical pose asset missing at {CANONICAL_POSE_PATH} — see "
+            "HUNYUAN3D_SETUP.md's one-time canonical-pose-asset step."
+        )
+    control_image = Image.open(CANONICAL_POSE_PATH).convert("RGB")
+    negative_prompt = CANONICAL_NEGATIVE_PROMPT
 
 controlnet = ControlNetModel.from_pretrained(
     "thibaud/controlnet-openpose-sdxl-1.0", torch_dtype=torch.float16
@@ -54,7 +68,7 @@ pipe.enable_model_cpu_offload()
 image = pipe(
     prompt,
     image=control_image,
-    negative_prompt=NEGATIVE_PROMPT,
+    negative_prompt=negative_prompt,
     controlnet_conditioning_scale=1.0,
     num_inference_steps=NUM_INFERENCE_STEPS,
     generator=torch.Generator("cuda").manual_seed(0),

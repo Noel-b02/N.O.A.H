@@ -1,11 +1,14 @@
 # N.O.A.H.
 
-**Edition: 16GB** — runs on a 16GB card, which unlocked single-seed
-novel-view synthesis and pose-guided seed generation for the image-to-3D
-pipeline (see `IMAGE_GEN_ROADMAP.md`). The original 8GB-constrained state
-(shape-only mesh generation, no local novel-view model) is preserved at the
-`noah-8gb-edition` git tag. Hunyuan3D's full texture+paint pipeline is
-the next 16GB-unlocked feature, not yet built.
+**Edition: 16GB** — runs on a 16GB card, which unlocked novel-view
+synthesis, pose-guided seed generation, and full texture+paint for the
+image-to-3D pipeline (see `IMAGE_GEN_ROADMAP.md`) — generated models are
+now genuinely colored/textured, not bare grey geometry. The original
+8GB-constrained state (shape-only mesh generation, no local novel-view
+model) is preserved at the `noah-8gb-edition` git tag. Worth knowing:
+texture quality is now good, but raw shape/geometry fidelity (fingers,
+faces) has a real, honest ceiling on this model generation — see
+`IMAGE_GEN_ROADMAP.md`'s "What this fixes vs. doesn't" for why.
 
 **N.O.A.H.** (Noel's Operational AI Helper) is a local-first AI agent — not
 a chatbot wrapped around an API call. It combines conversational AI,
@@ -40,8 +43,10 @@ to a third-party API by default.
     mid-action ("a model of spiderman swinging") gets its pose replaced
     with a cleanly generated neutral-pose image (SDXL + ControlNet-openpose)
     before that step, rather than feeding an unreliable action pose in
-    directly. See `IMAGE_GEN_ROADMAP.md` for the full pipeline and what's
-    headed next.
+    directly. Models are textured/colored by default (Hunyuan3D-2's own
+    paint pipeline) — say "shape only" or "no texture" for the older,
+    faster bare-geometry path. See `IMAGE_GEN_ROADMAP.md` for the full
+    pipeline and what's headed next.
 - **3D printing**: a generated model can be repaired/validated, sliced with
   Bambu Studio, and sent to a Bambu Lab printer over the local network —
   Noah asks for explicit confirmation before anything actually prints. See
@@ -70,6 +75,8 @@ graph TD
     PoseSeed --> NovelView
     Noah --> NovelView["Zero123++<br/>novel-view synthesis"]
     NovelView --> Hunyuan["Hunyuan3D-2<br/>image-to-3D generation"]
+    Hunyuan -.textured by default.-> TexturePaint["Hunyuan3D-2 paint<br/>texture generation"]
+    TexturePaint --> You
 
     Hunyuan --> Bridge
     Hunyuan --> Slicer["Bambu Studio<br/>slicing"]
@@ -132,5 +139,7 @@ novel-view synthesis alongside Ollama (see the `noah-8gb-edition` tag for
 that state). GPU-exclusive locking still keeps generation tasks from
 fighting Ollama for VRAM even on 16GB — see the comments around
 `withGpuExclusive` in `server.ts` for why it's kept rather than removed.
-Hunyuan3D's full texture+paint pipeline (not yet built) wants VRAM
-headroom too.
+Four generation steps can now run back-to-back in one request (shape ~6GB,
+novel-view synthesis ~5GB, pose-guided seed generation ~8GB, texture+paint
+~7.2GB — all measured live, not estimated), each releasing its VRAM before
+the next starts.

@@ -27,5 +27,8 @@ pipeline = Hunyuan3DDiTFlowMatchingPipeline.from_pretrained(
 # it's the real lever for raw geometric detail. Left at the conservative
 # default under the 8GB constraint; bumped now that there's real VRAM
 # headroom.
-mesh = pipeline(image=images, num_chunks=20000, octree_resolution=512)[0]
+# num_inference_steps=50 — Tencent's own example scripts pass this
+# explicitly rather than relying on the pipeline's undocumented default;
+# untried until now, added as a free-ish quality knob alongside the above.
+mesh = pipeline(image=images, num_chunks=20000, octree_resolution=512, num_inference_steps=50)[0]
 mesh.export(output_path)

@@ -48,6 +48,10 @@ const NOVEL_VIEW_SCRIPT = path.join(IMAGE23D_DIR, "generate_novel_views.py");
 // IMAGE_GEN_ROADMAP.md for why SDXL was chosen over the initially-planned
 // Z-Image-Turbo (which didn't fit this card at usable speed).
 const POSE_SEED_SCRIPT = path.join(IMAGE23D_DIR, "generate_pose_seed.py");
+// rtmlib (CPU-only pose estimation) is also already installed in the
+// Hunyuan3D-2 venv — see IMAGE_GEN_ROADMAP.md's custom-pose-reference
+// section.
+const SKELETON_SCRIPT = path.join(IMAGE23D_DIR, "extract_pose_skeleton.py");
 
 // Lives under public/ so express.static() serves the .glb files directly —
 // no separate file-serving endpoint needed. Kept distinct from
@@ -622,10 +626,21 @@ async function startSpeechService(): Promise<void> {
 
   console.log(`[speech] Starting speech service (${pythonPath})...`);
 
+  // detached: true (Windows: CREATE_NEW_PROCESS_GROUP) is the same
+  // convention every other background process launch in this file already
+  // uses (ollama serve, Docker Desktop, Fusion 360, Bambu Connect) — this
+  // was the one spawn that didn't have it, and the one spawn that shares
+  // the console via stdio: "inherit" rather than "ignore" (needed here so
+  // the speech service's logs show up inline, unlike those fire-and-forget
+  // launches). Without its own process group, a child sharing the parent's
+  // console on Windows sits in the same Ctrl+C signal group as the parent
+  // — and uvicorn/asyncio's own startup on Windows is a known trigger for
+  // a spurious console Ctrl+C event, which is exactly what was killing the
+  // whole `tsx watch server.ts` process right after this log line.
   speechServiceProcess = spawn(
     pythonPath,
     ["-m", "uvicorn", "server:app", "--host", "0.0.0.0", "--port", SPEECH_SERVICE_PORT],
-    { cwd: SPEECH_SERVICE_DIR, stdio: "inherit" }
+    { cwd: SPEECH_SERVICE_DIR, stdio: "inherit", detached: true }
   );
 
   speechServiceProcess.on("error", (err) => {
@@ -660,18 +675,20 @@ function unloadOllamaModels(): void {
 
 // Some local generation steps (Hunyuan3D's shape stage ~6GB, Zero123++'s
 // novel-view synthesis ~5GB, SDXL pose-guided seed generation ~8GB with
-// enable_model_cpu_offload) need more VRAM than is comfortably free once
-// Ollama (two resident models) and the speech service are also holding
-// their share. This frees the other two first, runs the heavy step, then
-// always restores them afterward (even on failure) via finally. Voice
-// input/output is unavailable for the duration; the next Ollama reply
-// after this also pays a one-time model-reload cost.
+// enable_model_cpu_offload, Hunyuan3D-2's texture+paint stage ~7.2GB also
+// with enable_model_cpu_offload — all confirmed live, not estimated) need
+// more VRAM than is comfortably free once Ollama (two resident models) and
+// the speech service are also holding their share. This frees the other
+// two first, runs the heavy step, then always restores them afterward
+// (even on failure) via finally. Voice input/output is unavailable for the
+// duration; the next Ollama reply after this also pays a one-time
+// model-reload cost.
 //
 // Deliberately kept even on a 16GB card: this doesn't guard against the
 // generation steps contending with each other (they're separate spawned
 // processes — one's VRAM is released before the next starts), it guards
 // against Ollama/speech contending with any one of them, which is still a
-// real risk now that up to three back-to-back GPU-heavy steps can run in
+// real risk now that up to four back-to-back GPU-heavy steps can run in
 // one request. Revisit once there's real headroom data, not before.
 async function withGpuExclusive<T>(fn: () => Promise<T>): Promise<T> {
   unloadOllamaModels();
@@ -908,6 +925,46 @@ function extractTargetSizeCm(message: string): number | null {
   return null;
 }
 
+// Vague scale phrasing has no exact factor, so these are reasoned
+// defaults, not measurements — "a bit" implies a smaller nudge than a
+// bare "bigger"/"smaller". An explicit number ("2x", "by 50%") always
+// wins over a vague word when both could apply.
+function extractScaleFactor(message: string): number | null {
+  const explicitMultiplier = message.match(/(\d+(?:\.\d+)?)\s*(x|times)\b/i);
+  if (explicitMultiplier) return parseFloat(explicitMultiplier[1]);
+
+  const byPercent = message.match(/by\s+(\d+(?:\.\d+)?)\s*%/i);
+  if (byPercent) {
+    const delta = parseFloat(byPercent[1]) / 100;
+    return /smaller/i.test(message) ? 1 - delta : 1 + delta;
+  }
+
+  if (/twice|double/i.test(message)) return 2.0;
+  if (/half/i.test(message)) return 0.5;
+  if (/\bbit\b.*bigger|bigger.*\bbit\b|\bbit\b.*larger|larger.*\bbit\b/i.test(message)) return 1.2;
+  if (/\bbit\b.*smaller|smaller.*\bbit\b/i.test(message)) return 0.8;
+  if (/bigger|larger/i.test(message)) return 1.5;
+  if (/smaller/i.test(message)) return 0.67;
+  return null;
+}
+
+function extractMirrorAxis(message: string): "x" | "y" | "z" {
+  if (/vertical|top[\s-]?to[\s-]?bottom|up[\s-]?down/i.test(message)) return "y";
+  if (/depth|front[\s-]?to[\s-]?back/i.test(message)) return "z";
+  // Left-right is both the default and the most common request — mirror
+  // patterns like "flip it"/"mirror it" alone give no axis hint at all.
+  return "x";
+}
+
+function extractSimplifyPercent(message: string): number {
+  const explicit = message.match(/by\s+(\d+(?:\.\d+)?)\s*%/i);
+  if (explicit) return 100 - parseFloat(explicit[1]);
+  if (/half/i.test(message)) return 50;
+  // No percent mentioned at all — 50% is a reasonable, visible-but-not-
+  // destructive default reduction.
+  return 50;
+}
+
 // Rescales the generated mesh (via trimesh, already installed for
 // Hunyuan3D-2) so its largest bounding-box dimension matches the requested
 // size, before it ever reaches Fusion — sidesteps relying on Fusion's own
@@ -958,6 +1015,37 @@ function convertMeshToGlb(meshPath: string, outputPath: string): Promise<boolean
     child.on("exit", (code) => {
       if (code !== 0 || !fs.existsSync(outputPath)) {
         console.error("GLB conversion step failed:", stderr.trim().slice(-1000));
+        resolve(false);
+        return;
+      }
+      resolve(true);
+    });
+  });
+}
+
+// Runs a single-mesh edit operation (scale-factor/mirror/simplify) via
+// edit_mesh.py. Writes to a separate output file — never overwrites the
+// input — same reasoning as scaleMeshToTargetSize/repairMesh: a failed
+// edit must leave the original mesh intact.
+function editMesh(
+  meshPath: string,
+  outputPath: string,
+  operation: "scale-factor" | "mirror" | "simplify" | "simplify-percent",
+  param?: string
+): Promise<boolean> {
+  return new Promise((resolve) => {
+    const args = [path.join(IMAGE23D_DIR, "edit_mesh.py"), meshPath, outputPath, operation];
+    if (param !== undefined) args.push(param);
+    const child = spawn(HUNYUAN3D_PYTHON, args);
+    let stderr = "";
+    child.stderr.on("data", (d) => { stderr += d.toString(); });
+    child.on("error", (err) => {
+      console.error("Failed to launch mesh edit step:", err.message);
+      resolve(false);
+    });
+    child.on("exit", (code) => {
+      if (code !== 0 || !fs.existsSync(outputPath)) {
+        console.error("Mesh edit step failed:", stderr.trim().slice(-1000));
         resolve(false);
         return;
       }
@@ -1232,6 +1320,41 @@ function registerGeneratedModel(subject: string, filename: string): GeneratedMod
   return entry;
 }
 
+// Resolves "the model"/"it" in a mesh-edit request to a real registry
+// entry. Prefers whichever model the frontend says is currently open in
+// the preview panel (openModelId) — the most reliable signal, since it's
+// exactly what the user is looking at — and falls back to the most
+// recently created entry when nothing is open (e.g. the user says "make
+// it bigger" right after a generation, before ever opening the panel).
+function resolveEditTargetModel(openModelId?: string | null): GeneratedModelEntry | null {
+  const entries = loadModelsIndex();
+  if (openModelId) {
+    const explicit = entries.find(e => e.id === openModelId);
+    if (explicit) return explicit;
+  }
+  if (entries.length === 0) return null;
+  return entries.reduce((newest, e) => (e.createdAt > newest.createdAt ? e : newest));
+}
+
+// Swaps a registry entry's file after a successful edit — same id, new
+// filename — so SAVE/DISCARD and the viewer panel's "always refetch by
+// id" pattern (openModelViewerPanelById) keep working with zero frontend
+// changes. Deletes the pre-edit file only after the new one is confirmed
+// on disk. saved/id/subject are left untouched, so an already-saved model
+// stays saved through an edit.
+function replaceGeneratedModelFile(id: string, newAbsolutePath: string): GeneratedModelEntry | null {
+  const entries = loadModelsIndex();
+  const entry = entries.find(e => e.id === id);
+  if (!entry) return null;
+  const oldFilename = entry.filename;
+  const newFilename = `${Date.now()}.glb`;
+  fs.renameSync(newAbsolutePath, path.join(MODELS_DIR, newFilename));
+  entry.filename = newFilename;
+  saveModelsIndex(entries);
+  fs.rm(path.join(MODELS_DIR, oldFilename), { force: true }, () => {});
+  return entry;
+}
+
 // SearXNG's image category, used to find a reference photo for a named
 // subject before running it through the local image-to-3D model.
 async function webImageSearch(query: string): Promise<string[]> {
@@ -1463,14 +1586,20 @@ interface PoseGuidedSeedResult {
 // comment below and IMAGE_GEN_ROADMAP.md for why. generateNovelViews above
 // faithfully reproduces whatever pose its seed shows, so a bad pose has to
 // be fixed before that step runs, not after.
-function generatePoseGuidedSeed(prompt: string, outputPath: string): Promise<PoseGuidedSeedResult> {
+// customSkeletonPath (from extractPoseSkeleton below) swaps in a per-request
+// pose instead of the fixed canonical one — see IMAGE_GEN_ROADMAP.md's
+// custom-pose-reference section. Omitted, this call is unchanged from
+// before that feature existed.
+function generatePoseGuidedSeed(prompt: string, outputPath: string, customSkeletonPath?: string | null): Promise<PoseGuidedSeedResult> {
   return new Promise((resolve) => {
     if (!fs.existsSync(HUNYUAN3D_PYTHON)) {
       resolve({ success: false, error: `Hunyuan3D venv not found at ${HUNYUAN3D_PYTHON}.` });
       return;
     }
 
-    const child = spawn(HUNYUAN3D_PYTHON, [POSE_SEED_SCRIPT, prompt, outputPath], {
+    const args = [POSE_SEED_SCRIPT, prompt, outputPath];
+    if (customSkeletonPath) args.push(customSkeletonPath);
+    const child = spawn(HUNYUAN3D_PYTHON, args, {
       env: { ...process.env, HF_HUB_DISABLE_XET: "1" }
     });
 
@@ -1502,6 +1631,62 @@ function generatePoseGuidedSeed(prompt: string, outputPath: string): Promise<Pos
         return;
       }
       resolve({ success: true, imagePath: outputPath });
+    });
+  });
+}
+
+interface PoseSkeletonReport {
+  usable: boolean;
+  reason: string | null;
+  maxPairwiseOverlap: number;
+}
+
+// Extracts a live pose skeleton from a user-attached reference image (via
+// extract_pose_skeleton.py's rtmlib pose estimator), for use as
+// generatePoseGuidedSeed's customSkeletonPath instead of the fixed
+// canonical pose — see IMAGE_GEN_ROADMAP.md's custom-pose-reference
+// section. report.usable === false means the pose looked too
+// occluded/overlapping to trust (the same failure mode the fixed
+// canonical pose exists to avoid) — callers should fall back to the
+// canonical pose, not fail the request. Returns null (not a report) if the
+// extraction step itself couldn't run — same soft-failure posture as
+// repairMesh: "couldn't check" isn't the same as "confirmed risky".
+function extractPoseSkeleton(referenceImagePath: string, outputSkeletonPath: string): Promise<{ skeletonPath: string; report: PoseSkeletonReport } | null> {
+  return new Promise((resolve) => {
+    const child = spawn(HUNYUAN3D_PYTHON, [SKELETON_SCRIPT, referenceImagePath, outputSkeletonPath]);
+    let stdout = "";
+    let stderr = "";
+    child.stdout.on("data", (d) => { stdout += d.toString(); });
+    child.stderr.on("data", (d) => { stderr += d.toString(); });
+    child.on("error", (err) => {
+      console.error("Failed to launch pose skeleton extraction:", err.message);
+      resolve(null);
+    });
+    child.on("exit", (code) => {
+      if (code !== 0) {
+        console.error("Pose skeleton extraction failed:", stderr.trim().slice(-1000));
+        resolve(null);
+        return;
+      }
+      let parsed: any;
+      try {
+        parsed = JSON.parse(stdout.trim().split("\n").pop() || "");
+      } catch {
+        console.error("Pose skeleton extraction produced unparseable output:", stdout.trim().slice(-1000));
+        resolve(null);
+        return;
+      }
+      if (!fs.existsSync(outputSkeletonPath)) {
+        console.error("Pose skeleton extraction reported success but wrote no skeleton file:", outputSkeletonPath);
+        resolve(null);
+        return;
+      }
+      const report: PoseSkeletonReport = {
+        usable: Boolean(parsed.usable),
+        reason: parsed.reason ?? null,
+        maxPairwiseOverlap: parsed.max_pairwise_overlap ?? 0,
+      };
+      resolve({ skeletonPath: outputSkeletonPath, report });
     });
   });
 }
@@ -1551,6 +1736,68 @@ function generateMeshWithHunyuan3DMultiview(frontPath: string, leftPath: string,
         return;
       }
       resolve({ success: true, meshPath: outputPath });
+    });
+  });
+}
+
+interface TexturePaintResult {
+  success: boolean;
+  glbPath?: string;
+  error?: string;
+}
+
+// Texture+paint stage (Hunyuan3DPaintPipeline) — takes the repaired mesh
+// plus one or more reference images and produces a textured .glb directly,
+// replacing the plain untextured GLB conversion step in the image-fusion
+// branch (see that branch's comment for why this runs post-repair).
+// imagePaths should include the left/back novel-view images when
+// available, not just the front seed — confirmed directly: the paint
+// pipeline accepts a list and genuinely uses it (real back-of-costume
+// texture instead of near-blank guesswork), with no front-quality cost.
+// enable_model_cpu_offload() is set inside run_texture_paint.py itself,
+// not passed as a flag here — confirmed live, peak VRAM is ~7.2GB,
+// comfortable on this 16GB card.
+function generateTexturedGlb(meshPath: string, imagePaths: string[], outputPath: string): Promise<TexturePaintResult> {
+  return new Promise((resolve) => {
+    if (!fs.existsSync(HUNYUAN3D_PYTHON)) {
+      resolve({ success: false, error: `Hunyuan3D venv not found at ${HUNYUAN3D_PYTHON}.` });
+      return;
+    }
+
+    const child = spawn(HUNYUAN3D_PYTHON, ["run_texture_paint.py", meshPath, outputPath, ...imagePaths], {
+      cwd: HUNYUAN3D_DIR,
+      env: { ...process.env, HF_HUB_DISABLE_XET: "1" }
+    });
+
+    let stderr = "";
+    child.stderr.on("data", (d) => { stderr += d.toString(); });
+
+    // First run also downloads hunyuan3d-paint-v2-0-turbo AND
+    // hunyuan3d-delight-v2-0 — confirmed live at ~26 minutes combined on
+    // this connection. Generation itself is fast once cached (confirmed
+    // live: ~163s), so 40 minutes leaves real margin rather than being a
+    // guess.
+    const timeout = setTimeout(() => {
+      child.kill();
+      resolve({ success: false, error: "Texture generation timed out after 40 minutes." });
+    }, 2400000);
+
+    child.on("error", (err) => {
+      clearTimeout(timeout);
+      resolve({ success: false, error: `Failed to launch texture generation: ${err.message}` });
+    });
+
+    child.on("exit", (code) => {
+      clearTimeout(timeout);
+      if (code !== 0) {
+        resolve({ success: false, error: stderr.trim().slice(-2000) || `Texture generation exited with code ${code}` });
+        return;
+      }
+      if (!fs.existsSync(outputPath)) {
+        resolve({ success: false, error: "Texture generation finished but no .glb file was produced." });
+        return;
+      }
+      resolve({ success: true, glbPath: outputPath });
     });
   });
 }
@@ -1740,9 +1987,10 @@ app.post('/api/speak', async (req, res) => {
 
 // API: Send chat prompt to the assistant
 app.post('/api/chat', async (req, res) => {
-  const { message, attachedImage } = req.body as {
+  const { message, attachedImage, openModelId } = req.body as {
     message: string;
     attachedImage?: { base64: string; mimeType: string } | null;
+    openModelId?: string | null;
   };
   const hasAttachedImage = !!attachedImage?.base64;
 
@@ -1814,13 +2062,32 @@ app.post('/api/chat', async (req, res) => {
   const personality = loadFile(PERSONALITY_FILE);
   const memory = loadMemory();
 
+  // "make it bigger", "mirror it", "simplify it", "fill the holes" all
+  // contain words (edit/change/update) that wantsModification's own regex
+  // below would otherwise swallow, misrouting a mesh-edit request into the
+  // self-modification (personality.txt/memory.json patch) flow — confirmed
+  // directly. Computed first so wantsModification can exclude it, same
+  // "gate against something with a broader net" pattern as
+  // NEGATED_MODIFICATION_PATTERN just below.
+  const MESH_SCALE_PATTERN = /\b(make it|scale it|resize it|scale the (model|mesh)|resize the (model|mesh))\s+(\d+(\.\d+)?\s*(x|times)|(a\s+)?(bit\s+)?(bigger|larger|smaller|(twice|half)( as (big|large))?)|by\s+\d+%)\b/i;
+  const MESH_MIRROR_PATTERN = /\b(mirror|flip)\s+(it|the (model|mesh))\b/i;
+  const MESH_SIMPLIFY_PATTERN = /\b(simplify|decimate|reduce the (poly|polygon|face)( ?count)?|lower the (poly|polygon|detail)( ?count| level)?|fewer (polygons|faces|triangles))\b.{0,20}\b(it|the (model|mesh))?\b/i;
+  const MESH_FILL_HOLES_PATTERN = /\b(fill|patch|close)\s+(the\s+)?(holes?|gaps?)\b/i;
+  const looksLikeMeshEditRequest = (
+    MESH_SCALE_PATTERN.test(message) ||
+    MESH_MIRROR_PATTERN.test(message) ||
+    MESH_SIMPLIFY_PATTERN.test(message) ||
+    MESH_FILL_HOLES_PATTERN.test(message)
+  );
+  console.log("LOOKS LIKE MESH EDIT REQUEST:", looksLikeMeshEditRequest);
+
   // "No changes to your personality" / "I didn't change anything" mention the
   // keyword while explicitly saying nothing should happen — without this,
   // they trip wantsModification just as wrongly as "do you remember" tripped
   // it on the word "remember" (see REMEMBER_QUESTION_PATTERN above).
   const NEGATED_MODIFICATION_PATTERN = /\b(no|not|don'?t|didn'?t|without|never)\s+(\w+\s+){0,2}(changes?|modif(y|ication)|updates?)\b/i;
 
-  const wantsModification = !NEGATED_MODIFICATION_PATTERN.test(message) && (
+  const wantsModification = !looksLikeMeshEditRequest && !NEGATED_MODIFICATION_PATTERN.test(message) && (
     (REMEMBER_QUESTION_PATTERN.test(message) || FORGETFUL_STATEMENT_PATTERN.test(message))
       ? /(modify|change|rewrite|update|edit|improve|refactor|memorize|store|save)/i.test(message)
       : /(modify|change|rewrite|update|edit|improve|refactor|remember|memorize|store|save)/i.test(message)
@@ -1863,7 +2130,7 @@ app.post('/api/chat', async (req, res) => {
   // a creation verb — kept deliberately narrow since this triggers real code
   // execution inside a running Fusion 360 session, not just a chat response.
   const FUSION_TRIGGER_PATTERN = /\b(create|make|generate|build|design|remove|delete|clear)\b.{0,40}\b(3d models?|3d shapes?|cad models?|in fusion(?: ?360)?)\b/i;
-  const looksLikeFusionRequest = !wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeStatusQuery && !looksLikeHeadlinesQuery && !looksLikeSearchQuery && !isStickySearchFollowup && FUSION_TRIGGER_PATTERN.test(message);
+  const looksLikeFusionRequest = !looksLikeMeshEditRequest && !wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeStatusQuery && !looksLikeHeadlinesQuery && !looksLikeSearchQuery && !isStickySearchFollowup && FUSION_TRIGGER_PATTERN.test(message);
 
   // A Fusion request either describes explicit parametric geometry (shape
   // words, dimensions) — handled by the existing code-generation path — or
@@ -1902,7 +2169,7 @@ app.post('/api/chat', async (req, res) => {
   // they need to reliably produce structured JSON output.
   const wordCount = message.trim().split(/\s+/).length;
 
-  const isComplex = wantsModification || isRecallQuery || isStickyRecallFollowup || looksLikeStatusQuery || looksLikeHeadlinesQuery || looksLikeSearchQuery || isStickySearchFollowup || looksLikeFusionRequest || (
+  const isComplex = wantsModification || isRecallQuery || isStickyRecallFollowup || looksLikeStatusQuery || looksLikeHeadlinesQuery || looksLikeSearchQuery || isStickySearchFollowup || looksLikeFusionRequest || looksLikeMeshEditRequest || (
     wordCount > 5 && /(typescript|javascript|debug|refactor|git|branch)/i.test(message)
   );
 
@@ -2246,6 +2513,40 @@ Now generate code for this request: "${message}"`;
         let referenceLabel = "";
         const tempFiles: string[] = [];
         let dynamicPosePrompt: string | null = null;
+        // Set when an attached image is accepted as a live pose reference
+        // (see wantsPoseReference below) — threaded into
+        // generatePoseGuidedSeed so it swaps in for the fixed canonical
+        // skeleton. Stays null (falling back to the canonical neutral
+        // pose, same as today) if extraction fails or the pose looks too
+        // occluded to trust.
+        let customPoseSkeletonPath: string | null = null;
+        // Which route produced customPoseSkeletonPath — an attached image
+        // vs. a pose photo found via search below — since the reply text
+        // needs to say something different for each. Null whenever
+        // customPoseSkeletonPath itself is null.
+        let poseSkeletonSource: "attached" | "search" | null = null;
+        // Set only on a reject/no-candidate path, purely for the reply text.
+        let poseRejectedReason: string | null = null;
+        // Hoisted out of the withGpuExclusive callback below so texture
+        // generation (which runs later, after repair/import) can reuse
+        // them as additional reference images — confirmed directly: giving
+        // the paint pipeline real left/back views instead of just the
+        // front produces a real, coherent back-of-costume texture instead
+        // of blank/near-white guesswork, with no visible front-quality
+        // cost. Null when novel-view generation didn't run or failed.
+        let novelViewLeftPath: string | null = null;
+        let novelViewBackPath: string | null = null;
+
+        // "attach a pose reference + 'in this pose'" is a different intent
+        // than "attach a photo to reconstruct as-is" below — a flat
+        // silhouette/pose sketch has no color/texture to reconstruct
+        // literally, but not every attached image is a pose reference
+        // (plain object photos are the existing, more common case), so
+        // this needs explicit phrasing rather than guessing from image
+        // content. First-pass wording, same posture as DYNAMIC_POSE_PATTERN
+        // below it.
+        const POSE_REFERENCE_PATTERN = /\b(?:in|use|using|like|matching|copy(?:ing)?)\s+(?:this|that|the attached|the reference)\s+pose\b/i;
+        const wantsPoseReference = hasAttachedImage && POSE_REFERENCE_PATTERN.test(message);
 
         // An attached image is the most direct signal available — skip the
         // URL/search steps entirely and use exactly what was dropped in.
@@ -2253,9 +2554,36 @@ Now generate code for this request: "${message}"`;
         // before) — verification exists to filter untrustworthy SEARCH
         // results, not to second-guess an image the user explicitly chose.
         if (hasAttachedImage) {
-          imagePath = saveBase64ImageToFile(attachedImage!.base64, attachedImage!.mimeType);
-          referenceLabel = "the image you attached";
-          tempFiles.push(imagePath);
+          const attachedPath = saveBase64ImageToFile(attachedImage!.base64, attachedImage!.mimeType);
+          tempFiles.push(attachedPath);
+
+          if (wantsPoseReference) {
+            // Pose only, not appearance — a silhouette/sketch has no real
+            // costume/color detail to describe, and describeImageAppearance
+            // exists for verified real photos, not this. Subject text alone
+            // (built below into dynamicPosePrompt) grounds the appearance;
+            // getting the exact suit colors/logo right is a separate,
+            // already-scoped-out prompting problem, not this feature's job.
+            imagePath = attachedPath;
+            referenceLabel = "the pose from the image you attached";
+
+            const skeletonPath = path.join(IMAGE23D_TMP_DIR, `${Date.now()}_poseskeleton.png`);
+            const extraction = await extractPoseSkeleton(attachedPath, skeletonPath);
+            if (extraction && extraction.report.usable) {
+              tempFiles.push(extraction.skeletonPath);
+              customPoseSkeletonPath = extraction.skeletonPath;
+              poseSkeletonSource = "attached";
+              dynamicPosePrompt = `${subject}, in a dynamic action pose, isolated on a plain white background`;
+            } else {
+              poseRejectedReason = extraction
+                ? extraction.report.reason
+                : "couldn't detect a clear pose in the attached image";
+              dynamicPosePrompt = `${subject}, standing in a neutral pose, isolated on a plain white background`;
+            }
+          } else {
+            imagePath = attachedPath;
+            referenceLabel = "the image you attached";
+          }
         } else if (userSuppliedImageUrl) {
           const downloadPath = path.join(IMAGE23D_TMP_DIR, `${Date.now()}.jpg`);
           const downloaded = await downloadImageToFile(userSuppliedImageUrl, downloadPath);
@@ -2381,10 +2709,51 @@ Now generate code for this request: "${message}"`;
               referenceLabel = `this reference image: ${usedUrl}`;
               tempFiles.push(imagePath);
               if (wantsDynamicPose) {
-                const appearance = await describeImageAppearance(imagePath);
-                dynamicPosePrompt = appearance
-                  ? `${subject}, ${appearance}, standing in a neutral pose, isolated on a plain white background`
-                  : `${subject}, standing in a neutral pose, isolated on a plain white background`;
+                // Try to find a real photo actually showing the pose
+                // first, reusing extractPoseSkeleton's confidence/overlap
+                // safety check (the same one a user-attached pose
+                // reference goes through) so a risky candidate — occluded/
+                // overlapping limbs, the actual failure mode this whole
+                // system exists to avoid — never gets used just because it
+                // matched the subject. A separate, pose-focused search
+                // query from the appearance-reference one above, since
+                // "isolated on white background" biases toward neutral
+                // studio shots, the opposite of what's wanted here. Falls
+                // back to today's neutral-pose substitution if no
+                // candidate passes or the search finds nothing — same
+                // "still produce something usable" posture as every other
+                // fallback in this pipeline.
+                const posePhotoUrls = await webImageSearch(`${subject} action pose`);
+                if (posePhotoUrls.length > 0) {
+                  const poseDownloadPath = path.join(IMAGE23D_TMP_DIR, `${Date.now()}_posecandidate.jpg`);
+                  const attemptedSkeletonPaths: string[] = [];
+                  let acceptedSkeletonPath: string | null = null;
+                  const verifyPoseCandidate = async (candidatePath: string): Promise<boolean> => {
+                    const skeletonPath = path.join(IMAGE23D_TMP_DIR, `${Date.now()}_searchposeskeleton.png`);
+                    attemptedSkeletonPaths.push(skeletonPath);
+                    const extraction = await extractPoseSkeleton(candidatePath, skeletonPath);
+                    if (extraction && extraction.report.usable) {
+                      acceptedSkeletonPath = extraction.skeletonPath;
+                      return true;
+                    }
+                    return false;
+                  };
+                  await downloadFirstAvailableImage(posePhotoUrls, poseDownloadPath, verifyPoseCandidate);
+                  tempFiles.push(...attemptedSkeletonPaths);
+                  if (acceptedSkeletonPath) {
+                    tempFiles.push(poseDownloadPath);
+                    customPoseSkeletonPath = acceptedSkeletonPath;
+                    poseSkeletonSource = "search";
+                    dynamicPosePrompt = `${subject}, in a dynamic action pose, isolated on a plain white background`;
+                  }
+                }
+
+                if (!customPoseSkeletonPath) {
+                  const appearance = await describeImageAppearance(imagePath);
+                  dynamicPosePrompt = appearance
+                    ? `${subject}, ${appearance}, standing in a neutral pose, isolated on a plain white background`
+                    : `${subject}, standing in a neutral pose, isolated on a plain white background`;
+                }
               }
             } else {
               imageReplyText = `Found a reference image for "${subject}" but couldn't download it to work with.`;
@@ -2401,6 +2770,11 @@ Now generate code for this request: "${message}"`;
           // rather than a description of what the subject is.
           const wantsSingleImageOnly = /\b(one|single)\s+(image|photo|picture|reference)\b|\b(no|not|skip|without|don'?t)\b[^.?!]*\bmultiview\b/i.test(message);
 
+          // Explicit opt-out from the new textured/colored default —
+          // mirrors wantsSingleImageOnly above but for the texture+paint
+          // stage. Checked against the whole message, same reasoning.
+          const wantsShapeOnly = /\b(shape|geometry)\s+only\b|\b(no|not|skip|without|don'?t)\b[^.?!]*\b(textur(?:e|ing)?|colou?r(?:ed|ing)?|paint(?:ed|ing)?)\b/i.test(message);
+
           // Needs exclusive use of the GPU — see withGpuExclusive's
           // comment for why. Novel-view generation and multiview mesh
           // generation both happen inside this one window rather than two
@@ -2412,10 +2786,16 @@ Now generate code for this request: "${message}"`;
 
             if (dynamicPosePrompt) {
               const poseSeedPath = path.join(IMAGE23D_TMP_DIR, `${ts}_poseseed.jpg`);
-              const poseSeed = await generatePoseGuidedSeed(dynamicPosePrompt, poseSeedPath);
+              const poseSeed = await generatePoseGuidedSeed(dynamicPosePrompt, poseSeedPath, customPoseSkeletonPath);
               if (poseSeed.success) {
                 tempFiles.push(poseSeed.imagePath!);
-                referenceLabel += ", replaced with a clean neutral-pose image generated to avoid an unreliable action-pose reference photo";
+                referenceLabel += poseSkeletonSource === "attached"
+                  ? ", generated in the pose from the image you attached"
+                  : poseSkeletonSource === "search"
+                    ? ", generated in a dynamic pose found from a separate reference search"
+                    : poseRejectedReason
+                      ? `, replaced with a clean neutral-pose image — the pose in your attached image looked too risky to use (${poseRejectedReason}), so I used a safe default pose instead`
+                      : ", replaced with a clean neutral-pose image generated to avoid an unreliable action-pose reference photo";
                 imagePath = poseSeed.imagePath!;
               } else {
                 // Degrade to today's behavior — a bad pose-generation run
@@ -2435,6 +2815,8 @@ Now generate code for this request: "${message}"`;
             if (novelViews.success) {
               tempFiles.push(leftPath, backPath);
               referenceLabel += ", with two additional angle views generated from it";
+              novelViewLeftPath = novelViews.leftPath!;
+              novelViewBackPath = novelViews.backPath!;
               return generateMeshWithHunyuan3DMultiview(imagePath!, novelViews.leftPath!, novelViews.backPath!);
             }
             // Falls back to shape-only rather than failing the whole
@@ -2493,9 +2875,47 @@ Now generate code for this request: "${message}"`;
               if (importResult.success) {
                 const glbFilename = `${Date.now()}.glb`;
                 const glbPath = path.join(MODELS_DIR, glbFilename);
-                if (await convertMeshToGlb(meshPathForImport, glbPath)) {
+
+                // Textured preview is the default — texture generation
+                // produces the preview .glb directly rather than running
+                // alongside a separate untextured conversion. On any
+                // failure (extension not compiled on this machine, OOM
+                // stacking a 4th heavy step, timeout, model download
+                // failure) this falls back to the plain untextured
+                // conversion — a texture failure must never sink a request
+                // that would have succeeded before this feature existed.
+                // Own withGpuExclusive window: the one wrapping shape/
+                // novel-view/pose-seed generation has already closed by
+                // this point (repair/import happen outside it) — texture
+                // generation is a new GPU-heavy step, so it gets its own
+                // pause/restore rather than holding Ollama/speech paused
+                // across the entire repair+import sequence unnecessarily.
+                let textureNote = "";
+                let gotPreview = false;
+                if (!wantsShapeOnly) {
+                  // Front seed always included; left/back novel views
+                  // folded in when available (see novelViewLeftPath's
+                  // comment above) for real back-of-costume texture
+                  // instead of near-blank guesswork.
+                  const textureImages = [imagePath!];
+                  if (novelViewLeftPath) textureImages.push(novelViewLeftPath);
+                  if (novelViewBackPath) textureImages.push(novelViewBackPath);
+                  const textureResult = await withGpuExclusive(() =>
+                    generateTexturedGlb(meshPathForImport, textureImages, glbPath)
+                  );
+                  if (textureResult.success) {
+                    generatedModel = registerGeneratedModel(subject, glbFilename);
+                    gotPreview = true;
+                    textureNote = " Textured/colored.";
+                  } else {
+                    console.error("Texture generation failed, falling back to untextured preview:", textureResult.error);
+                    textureNote = " (Couldn't generate color/texture, so this is bare geometry — see the console log for why.)";
+                  }
+                }
+                if (!gotPreview && await convertMeshToGlb(meshPathForImport, glbPath)) {
                   generatedModel = registerGeneratedModel(subject, glbFilename);
                 }
+                imageReplyText += textureNote;
 
                 // Best-effort, same reasoning as the GLB preview above — a
                 // failed/unconfigured slicer shouldn't sink an otherwise
@@ -2552,6 +2972,75 @@ Now generate code for this request: "${message}"`;
           modelId: generatedModel.id,
           modelUrl: `/generated-models/${generatedModel.filename}`,
           modelSubject: generatedModel.subject
+        } : {})
+      });
+    }
+
+    // Edits an already-generated model in place — scale/mirror/simplify/
+    // fill-holes on whichever model is open in the viewer panel (or the
+    // most recent one if none is open — see resolveEditTargetModel).
+    // Preview-only: doesn't re-run Fusion import or slicing, same posture
+    // as scaleMeshToTargetSize/repairMesh being pure mesh-to-mesh steps
+    // with no side effects of their own.
+    if (looksLikeMeshEditRequest) {
+      const target = resolveEditTargetModel(openModelId);
+      let editReplyText: string;
+      let updatedModel: GeneratedModelEntry | null = null;
+
+      if (!target) {
+        editReplyText = "There's no generated model to edit yet — generate one first, or open one from the viewer.";
+      } else {
+        const sourcePath = path.join(MODELS_DIR, target.filename);
+        fs.mkdirSync(IMAGE23D_TMP_DIR, { recursive: true });
+        const tmpOut = path.join(IMAGE23D_TMP_DIR, `${Date.now()}_edited.glb`);
+
+        let ok = false;
+        let note = "";
+        if (MESH_FILL_HOLES_PATTERN.test(message)) {
+          const repairResult = await repairMesh(sourcePath);
+          ok = !!repairResult?.report.usable;
+          if (ok) fs.copyFileSync(repairResult!.outputPath, tmpOut);
+        } else if (MESH_MIRROR_PATTERN.test(message)) {
+          ok = await editMesh(sourcePath, tmpOut, "mirror", extractMirrorAxis(message));
+        } else if (MESH_SIMPLIFY_PATTERN.test(message)) {
+          ok = await editMesh(sourcePath, tmpOut, "simplify-percent", String(extractSimplifyPercent(message)));
+          // Confirmed directly: simplify_quadric_decimation strips UV/
+          // material data — a textured mesh comes out visibly blank/noisy,
+          // not just lower-detail. Warn rather than silently degrade.
+          if (ok) note = " Note: simplifying removes color/texture — the model will look bare afterward.";
+        } else if (MESH_SCALE_PATTERN.test(message)) {
+          const sizeCm = extractTargetSizeCm(message);
+          if (sizeCm !== null) {
+            const scaled = await scaleMeshToTargetSize(sourcePath, sizeCm);
+            ok = !!scaled;
+            if (ok) fs.copyFileSync(scaled!, tmpOut);
+          } else {
+            const factor = extractScaleFactor(message);
+            ok = factor !== null && await editMesh(sourcePath, tmpOut, "scale-factor", String(factor));
+          }
+        }
+
+        if (ok) {
+          updatedModel = replaceGeneratedModelFile(target.id, tmpOut);
+          editReplyText = updatedModel
+            ? `Done — updated "${updatedModel.subject}".${note} This is a preview-only change — re-import or re-slice separately if you want to print it.`
+            : "The edit succeeded but the registry update failed — the model may be out of sync.";
+        } else {
+          editReplyText = "Couldn't apply that edit — the original model is unchanged.";
+        }
+      }
+
+      conversationHistory.push(`Assistant: ${editReplyText}`);
+      saveHistory();
+      clearTimeout(timeout);
+
+      return res.json({
+        response: editReplyText,
+        hasProposedChanges: false,
+        ...(updatedModel ? {
+          modelId: updatedModel.id,
+          modelUrl: `/generated-models/${updatedModel.filename}`,
+          modelSubject: updatedModel.subject
         } : {})
       });
     }
