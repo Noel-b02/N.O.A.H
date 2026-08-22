@@ -415,6 +415,63 @@ neutral-pose path with the same prompt. Worth rechecking with a real
 reference photo before relying on this for consistently clean texture
 output on dynamic poses.
 
+## Text-to-image generation (implemented)
+
+A standalone capability, separate from everything above: "generate an
+image of X" produces a picture shown inline in the chat, with no 3D
+pipeline involved at all. Scoped deliberately narrow — text-to-image
+only, no editing/img2img of an attached photo (that would make attaching
+an image a 3-way ambiguity against the existing "reconstruct as 3D
+model" / "use as pose reference" meanings) — and images are persisted
+(save/discard), mirroring the 3D model registry rather than being
+ephemeral.
+
+1. **Reuses proven infrastructure end to end.** `image23d/generate_image.py`
+   is a plain `StableDiffusionXLPipeline` (no ControlNet) — the same SDXL
+   base and Hunyuan3D-2 venv already used for pose-guided generation, just
+   without the pose-conditioning machinery. No fixed seed (unlike the
+   pose-seed script, which fixes one intentionally for a reproducible
+   downstream base) — confirmed live that two runs of the identical
+   prompt produce genuinely different images, which is the point here.
+
+2. **A parallel registry, not a shared one.** `GeneratedImageEntry` /
+   `IMAGES_DIR` / `loadImagesIndex()` / `saveImagesIndex()` /
+   `registerGeneratedImage()` mirror the 3D model registry's shape
+   exactly, including the same oldest-unsaved-first pruning — kept as its
+   own separate structure rather than a generalized "asset registry",
+   matching this codebase's existing preference for small parallel pieces
+   over shared abstractions. Three REST endpoints
+   (`GET`/`POST .../save`/`DELETE` on `/api/images/:id`) mirror
+   `/api/models/:id` exactly, down to reusing the same `slugify()` for
+   the save-rename.
+
+3. **New chat surface, not a new panel.** Unlike 3D models (which get a
+   dedicated viewer panel), a generated image renders directly inline in
+   the assistant's chat bubble via a new optional `image` param on
+   `appendMessage()`, with small SAVE/DISCARD buttons underneath —
+   deliberately lightweight, since an image doesn't need the model
+   viewer's dedicated UI surface.
+
+4. **Trigger correctly excludes the existing 3D pipeline.**
+   `IMAGE_GEN_TRIGGER_PATTERN` requires an image/picture/photo/
+   illustration/artwork/drawing/painting/wallpaper noun, checked against
+   every other trigger pattern in the file with no vocabulary overlap —
+   verified directly (not just assumed) against realistic phrasings
+   including the tricky edge case "make me a 3d model based on this
+   picture", which contains both an image noun and a 3D-model phrase:
+   the existing `!looksLikeFusionRequest` gate correctly keeps this
+   routed to the 3D pipeline, not image generation.
+
+5. **Live-verified, full path.** A real request ("a fox sitting in an
+   autumn forest") generated a genuine SDXL image, rendered correctly
+   inline in the chat bubble (confirmed via the actual running app, not
+   just the API response), SAVE renamed the file to
+   `fox-sitting-in-an-autumn-forest.png` and persisted it, and DISCARD on
+   a second generated image removed it from both the DOM and disk.
+   Confirmed regressions: a plain weather/chat question is entirely
+   unaffected, and the 3D-model trigger patterns remain mutually
+   exclusive with the new one under direct testing.
+
 ## What's next
 
 All three of this session's 16GB-unlocked features are now built:

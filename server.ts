@@ -52,6 +52,9 @@ const POSE_SEED_SCRIPT = path.join(IMAGE23D_DIR, "generate_pose_seed.py");
 // Hunyuan3D-2 venv — see IMAGE_GEN_ROADMAP.md's custom-pose-reference
 // section.
 const SKELETON_SCRIPT = path.join(IMAGE23D_DIR, "extract_pose_skeleton.py");
+// Plain SDXL text-to-image, no ControlNet — same venv/model as
+// POSE_SEED_SCRIPT, just without the pose-conditioning machinery.
+const IMAGE_GEN_SCRIPT = path.join(IMAGE23D_DIR, "generate_image.py");
 
 // Lives under public/ so express.static() serves the .glb files directly —
 // no separate file-serving endpoint needed. Kept distinct from
@@ -66,6 +69,15 @@ const MODELS_INDEX_FILE = path.join(MODELS_DIR, ".index.json");
 // Cap on UNSAVED models specifically — anything explicitly saved via the
 // UI is exempt, so this only prunes the rolling "recent, not saved" set.
 const MAX_UNSAVED_MODELS = 20;
+
+// Parallel registry for plain generated images (see the image-generation
+// section of /api/chat) — same shape as the model registry above, kept as
+// its own separate structure rather than a shared "asset registry", same
+// posture as this codebase's mesh scripts being separate small files
+// instead of one generalized script.
+const IMAGES_DIR = path.join(__dirname, "public", "generated-images");
+const IMAGES_INDEX_FILE = path.join(IMAGES_DIR, ".index.json");
+const MAX_UNSAVED_IMAGES = 30;
 
 const PERSONALITY_FILE = "personality.txt";
 const MEMORY_FILE = "memories/memory.json";
@@ -905,6 +917,27 @@ function extractFusionSubject(message: string): string {
   return cleaned && !/^(this|that|it)$/i.test(cleaned) ? cleaned : "the provided reference image";
 }
 
+// Plain "generate an image of X" is a different intent than a 3D-model
+// request: FUSION_TRIGGER_PATTERN (below, in /api/chat) requires an
+// explicit "3d model"/"cad model"/"in fusion" phrase, this one requires an
+// image/picture noun instead, so the two are disjoint by construction for
+// any normal message. Top-level (not handler-local, unlike most other
+// trigger patterns) since extractImageGenPrompt below also needs it.
+const IMAGE_GEN_TRIGGER_PATTERN = /\b(create|make|generate|draw|paint|design)\b.{0,40}\b(image|picture|photo|illustration|artwork|drawing|painting|wallpaper)\b/i;
+
+// Pulls the descriptive part out of an image-generation request.
+// Deliberately simpler than extractFusionSubject: image prompts are
+// free-form ("a cyberpunk city at night, neon lights, rain") rather than a
+// short named subject, so the full "of ..." tail is kept as-is and used
+// directly as both the SDXL prompt and the registry/reply subject — no
+// size-clause or 3d-model trigger-word stripping needed since none of that
+// vocabulary applies here.
+function extractImageGenPrompt(message: string): string {
+  const ofMatch = message.match(/\bof\s+(?:a|an|the)\s+(.+)$/i) ?? message.match(/\bof\s+(.+)$/i);
+  const raw = ofMatch ? ofMatch[1] : message.replace(IMAGE_GEN_TRIGGER_PATTERN, "").trim();
+  return raw.replace(/[?.!]+$/, "").trim() || "the requested scene";
+}
+
 // Looks for a "<number> <unit>" size mention (e.g. "5cm", "2 inches", "10mm
 // tall") and converts it to centimeters — the unit the Fusion import step
 // already treats the generated mesh's raw output numbers as. Requires the unit to
@@ -1320,6 +1353,57 @@ function registerGeneratedModel(subject: string, filename: string): GeneratedMod
   return entry;
 }
 
+interface GeneratedImageEntry {
+  id: string;
+  subject: string;
+  filename: string;
+  createdAt: string;
+  saved: boolean;
+}
+
+function loadImagesIndex(): GeneratedImageEntry[] {
+  try {
+    return JSON.parse(fs.readFileSync(IMAGES_INDEX_FILE, "utf8"));
+  } catch {
+    return [];
+  }
+}
+
+function saveImagesIndex(entries: GeneratedImageEntry[]): void {
+  fs.mkdirSync(IMAGES_DIR, { recursive: true });
+  fs.writeFileSync(IMAGES_INDEX_FILE, JSON.stringify(entries, null, 2));
+}
+
+// Same pruning shape as registerGeneratedModel — oldest UNSAVED entries
+// beyond MAX_UNSAVED_IMAGES get deleted; saved images are exempt.
+function registerGeneratedImage(subject: string, filename: string): GeneratedImageEntry {
+  const entries = loadImagesIndex();
+  const entry: GeneratedImageEntry = {
+    id: randomUUID(),
+    subject,
+    filename,
+    createdAt: new Date().toISOString(),
+    saved: false
+  };
+  entries.push(entry);
+
+  const unsaved = entries.filter(e => !e.saved);
+  if (unsaved.length > MAX_UNSAVED_IMAGES) {
+    const toPrune = unsaved
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt))
+      .slice(0, unsaved.length - MAX_UNSAVED_IMAGES);
+    const pruneIds = new Set(toPrune.map(e => e.id));
+    for (const old of toPrune) {
+      fs.rm(path.join(IMAGES_DIR, old.filename), { force: true }, () => {});
+    }
+    saveImagesIndex(entries.filter(e => !pruneIds.has(e.id)));
+  } else {
+    saveImagesIndex(entries);
+  }
+
+  return entry;
+}
+
 // Resolves "the model"/"it" in a mesh-edit request to a real registry
 // entry. Prefers whichever model the frontend says is currently open in
 // the preview panel (openModelId) — the most reliable signal, since it's
@@ -1635,6 +1719,53 @@ function generatePoseGuidedSeed(prompt: string, outputPath: string, customSkelet
   });
 }
 
+interface GeneratedImageResult {
+  success: boolean;
+  imagePath?: string;
+  error?: string;
+}
+
+// Plain text-to-image generation — same spawn shape as
+// generatePoseGuidedSeed above, just no customSkeletonPath/ControlNet.
+function generateImage(prompt: string, outputPath: string): Promise<GeneratedImageResult> {
+  return new Promise((resolve) => {
+    if (!fs.existsSync(HUNYUAN3D_PYTHON)) {
+      resolve({ success: false, error: `Hunyuan3D venv not found at ${HUNYUAN3D_PYTHON}.` });
+      return;
+    }
+
+    const child = spawn(HUNYUAN3D_PYTHON, [IMAGE_GEN_SCRIPT, prompt, outputPath], {
+      env: { ...process.env, HF_HUB_DISABLE_XET: "1" }
+    });
+
+    let stderr = "";
+    child.stderr.on("data", (d) => { stderr += d.toString(); });
+
+    const timeout = setTimeout(() => {
+      child.kill();
+      resolve({ success: false, error: "Image generation timed out after 10 minutes." });
+    }, 600000);
+
+    child.on("error", (err) => {
+      clearTimeout(timeout);
+      resolve({ success: false, error: `Failed to launch image generation: ${err.message}` });
+    });
+
+    child.on("exit", (code) => {
+      clearTimeout(timeout);
+      if (code !== 0) {
+        resolve({ success: false, error: stderr.trim().slice(-2000) || `Image generation exited with code ${code}` });
+        return;
+      }
+      if (!fs.existsSync(outputPath)) {
+        resolve({ success: false, error: "Image generation finished but didn't produce an output image." });
+        return;
+      }
+      resolve({ success: true, imagePath: outputPath });
+    });
+  });
+}
+
 interface PoseSkeletonReport {
   usable: boolean;
   reason: string | null;
@@ -1918,6 +2049,57 @@ app.delete('/api/models/:id', (req, res) => {
   res.json({ success: true });
 });
 
+app.get('/api/images/:id', (req, res) => {
+  const entry = loadImagesIndex().find(e => e.id === req.params.id);
+  if (!entry) return res.status(404).json({ success: false, error: "Image not found — it may already have been pruned or discarded." });
+  res.json({ success: true, id: entry.id, subject: entry.subject, url: `/generated-images/${entry.filename}`, saved: entry.saved });
+});
+
+// API: exempts a generated image from the MAX_UNSAVED_IMAGES rotation —
+// the "SAVE" button under a generated image in chat. Same rename-to-slug
+// behavior as the model save endpoint, same reasoning.
+app.post('/api/images/:id/save', (req, res) => {
+  const entries = loadImagesIndex();
+  const entry = entries.find(e => e.id === req.params.id);
+  if (!entry) return res.status(404).json({ success: false, error: "Image not found — it may already have been pruned or discarded." });
+
+  const baseSlug = slugify(entry.subject);
+  let newFilename = `${baseSlug}.png`;
+  let suffix = 2;
+  while (
+    entries.some(e => e.id !== entry.id && e.filename === newFilename) ||
+    (newFilename !== entry.filename && fs.existsSync(path.join(IMAGES_DIR, newFilename)))
+  ) {
+    newFilename = `${baseSlug}-${suffix}.png`;
+    suffix++;
+  }
+
+  if (newFilename !== entry.filename) {
+    try {
+      fs.renameSync(path.join(IMAGES_DIR, entry.filename), path.join(IMAGES_DIR, newFilename));
+      entry.filename = newFilename;
+    } catch (err: any) {
+      console.error("Failed to rename saved image file:", err.message);
+    }
+  }
+
+  entry.saved = true;
+  saveImagesIndex(entries);
+  res.json({ success: true, url: `/generated-images/${entry.filename}` });
+});
+
+// API: immediately deletes a generated image — the "DISCARD" button.
+app.delete('/api/images/:id', (req, res) => {
+  const entries = loadImagesIndex();
+  const entry = entries.find(e => e.id === req.params.id);
+  if (!entry) return res.status(404).json({ success: false, error: "Image not found — it may already have been pruned or discarded." });
+  fs.rm(path.join(IMAGES_DIR, entry.filename), { force: true }, (err) => {
+    if (err) console.error("Failed to delete discarded image file:", entry.filename, err.message);
+  });
+  saveImagesIndex(entries.filter(e => e.id !== req.params.id));
+  res.json({ success: true });
+});
+
 // API: Speech-to-text — forwards recorded audio to the local Whisper service
 // and returns the transcribed text. Uses express.raw() scoped to just this
 // route since the body here is binary audio, not JSON.
@@ -2148,6 +2330,15 @@ app.post('/api/chat', async (req, res) => {
   const looksLikeImageFusionRequest = looksLikeFusionRequest && !REMOVAL_VERB_PATTERN.test(message) && !SHAPE_WORD_PATTERN.test(message);
   const looksLikeParametricFusionRequest = looksLikeFusionRequest && !looksLikeImageFusionRequest;
 
+  // Checked against every other trigger pattern in this file
+  // (FUSION_TRIGGER_PATTERN, SEARCH_TRIGGER_PATTERN, HEADLINES_TRIGGER_PATTERN,
+  // STATUS_TRIGGER_PATTERN, POSE_REFERENCE_PATTERN) — no overlapping
+  // vocabulary, so !looksLikeFusionRequest below is just the same "exclude
+  // everything computed before it" convention every flag here follows, not
+  // a sign of real collision risk.
+  const looksLikeImageGenRequest = !looksLikeMeshEditRequest && !wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeStatusQuery && !looksLikeHeadlinesQuery && !looksLikeSearchQuery && !isStickySearchFollowup && !looksLikeFusionRequest && IMAGE_GEN_TRIGGER_PATTERN.test(message);
+  console.log("LOOKS LIKE IMAGE GEN REQUEST:", looksLikeImageGenRequest);
+
   // Ollama's "thinking" mode measurably improves how carefully the model reasons through a request, but costs ~10-15+ seconds of extra latency
   // per response (tested directly: a trivial one-sentence question took
   // 15.5s with it on vs ~1-2s off) — far too slow to enable by default, but worth it when the user explicitly asks for more thoroughness.
@@ -2169,7 +2360,7 @@ app.post('/api/chat', async (req, res) => {
   // they need to reliably produce structured JSON output.
   const wordCount = message.trim().split(/\s+/).length;
 
-  const isComplex = wantsModification || isRecallQuery || isStickyRecallFollowup || looksLikeStatusQuery || looksLikeHeadlinesQuery || looksLikeSearchQuery || isStickySearchFollowup || looksLikeFusionRequest || looksLikeMeshEditRequest || (
+  const isComplex = wantsModification || isRecallQuery || isStickyRecallFollowup || looksLikeStatusQuery || looksLikeHeadlinesQuery || looksLikeSearchQuery || isStickySearchFollowup || looksLikeFusionRequest || looksLikeMeshEditRequest || looksLikeImageGenRequest || (
     wordCount > 5 && /(typescript|javascript|debug|refactor|git|branch)/i.test(message)
   );
 
@@ -2297,7 +2488,7 @@ app.post('/api/chat', async (req, res) => {
   // conversations) and their "I have no record of that day" replies would
   // otherwise false-positive as uncertainty below — the search fallback only
   // makes sense for genuine open-ended chat turns, not those paths.
-  const isPlainChatTurn = !wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeStatusQuery && !looksLikeHeadlinesQuery && !looksLikeSearchQuery && !isStickySearchFollowup && !looksLikeFusionRequest;
+  const isPlainChatTurn = !wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeStatusQuery && !looksLikeHeadlinesQuery && !looksLikeSearchQuery && !isStickySearchFollowup && !looksLikeFusionRequest && !looksLikeImageGenRequest;
 
   const searchInstructions = isPlainChatTurn ? `
   If answering requires current or real-world information you don't already know — release dates, sports results, news, prices, "when does X come out", "who won Y" — do not guess or make something up. Instead, respond with EXACTLY this and nothing else, no other words:
@@ -3041,6 +3232,43 @@ Now generate code for this request: "${message}"`;
           modelId: updatedModel.id,
           modelUrl: `/generated-models/${updatedModel.filename}`,
           modelSubject: updatedModel.subject
+        } : {})
+      });
+    }
+
+    // Plain text-to-image generation — no ControlNet, no 3D pipeline, no
+    // Fusion involved. Explicitly does NOT support editing/img2img of an
+    // attached photo (deferred; see IMAGE_GEN_ROADMAP.md) — this is
+    // prompt-only, same posture as generatePoseGuidedSeed's canonical-pose
+    // path but standalone.
+    if (looksLikeImageGenRequest) {
+      const imageGenPrompt = extractImageGenPrompt(message);
+      const filename = `${Date.now()}.png`;
+      const outputPath = path.join(IMAGES_DIR, filename);
+      fs.mkdirSync(IMAGES_DIR, { recursive: true });
+
+      const genResult = await withGpuExclusive(() => generateImage(imageGenPrompt, outputPath));
+
+      let imageReplyText: string;
+      let generatedImage: GeneratedImageEntry | null = null;
+      if (genResult.success) {
+        generatedImage = registerGeneratedImage(imageGenPrompt, filename);
+        imageReplyText = `Here's ${imageGenPrompt}.`;
+      } else {
+        imageReplyText = `Something went wrong generating that image: ${genResult.error}`;
+      }
+
+      conversationHistory.push(`Assistant: ${imageReplyText}`);
+      saveHistory();
+      clearTimeout(timeout);
+
+      return res.json({
+        response: imageReplyText,
+        hasProposedChanges: false,
+        ...(generatedImage ? {
+          imageId: generatedImage.id,
+          generatedImageUrl: `/generated-images/${generatedImage.filename}`,
+          imageSubject: generatedImage.subject
         } : {})
       });
     }
