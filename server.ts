@@ -21,6 +21,10 @@ const SPEECH_SERVICE_URL = process.env.SPEECH_SERVICE_URL ?? "http://localhost:5
 
 const CHAT_MODEL = process.env.OLLAMA_CHAT_MODEL ?? "qwen3.5:4b";
 const CODE_MODEL = process.env.OLLAMA_CODE_MODEL ?? "qwen3.5:9b";
+// Only needed for document Q&A (see extractDocumentText/chunkText below) —
+// chat itself works fine without this model ever being pulled.
+const EMBEDDING_MODEL = process.env.OLLAMA_EMBEDDING_MODEL ?? "nomic-embed-text";
+const EMBEDDINGS_URL = OLLAMA_URL.replace(/\/api\/generate$/, "/api/embeddings");
 
 const SEARXNG_URL = process.env.SEARXNG_URL ?? "http://localhost:8080";
 const FUSION_BRIDGE_URL = process.env.FUSION_BRIDGE_URL ?? "http://localhost:9000";
@@ -880,6 +884,126 @@ function extractFusionSubject(message: string): string {
   return cleaned && !/^(this|that|it)$/i.test(cleaned) ? cleaned : "the provided reference image";
 }
 
+// Extracts plain text from an uploaded document. PDF/DOCX libraries are
+// require()'d lazily inside here rather than imported at module load,
+// simply so this file doesn't pay their load cost unless a document is
+// actually attached.
+async function extractDocumentText(base64: string, mimeType: string, fileName: string): Promise<string> {
+  const buffer = Buffer.from(base64, "base64");
+  const ext = path.extname(fileName).toLowerCase();
+
+  if (mimeType === "application/pdf" || ext === ".pdf") {
+    // pdf-parse v2's API is class-based (new PDFParse({data}).getText()),
+    // not the plain callable-function API older v1 examples show —
+    // confirmed directly against the installed version (2.4.5).
+    const { PDFParse } = require("pdf-parse");
+    const parser = new PDFParse({ data: buffer });
+    const result = await parser.getText();
+    await parser.destroy();
+    return result.text;
+  }
+  if (ext === ".docx" || mimeType.includes("officedocument.wordprocessingml")) {
+    const mammoth = require("mammoth");
+    return (await mammoth.extractRawText({ buffer })).value;
+  }
+  return buffer.toString("utf8"); // .txt / .md / anything else
+}
+
+// Rejects absurdly large uploads outright rather than silently generating
+// hundreds of embedding calls for something that was probably attached by
+// mistake — roughly the length of a long novel.
+const MAX_DOCUMENT_CHARS = 600000;
+
+// Simple paragraph-aware greedy packing, not a tokenizer — good enough for
+// chunk boundaries that roughly track topic shifts, without pulling in a
+// tokenizing dependency for it. CHUNK_OVERLAP carries a little of the
+// previous chunk forward so a fact split across a chunk boundary isn't
+// lost to retrieval entirely.
+const CHUNK_SIZE = 1200;
+const CHUNK_OVERLAP = 150;
+
+function chunkText(text: string): string[] {
+  const paragraphs = text.replace(/\r\n/g, "\n").split(/\n{2,}/).map(p => p.trim()).filter(Boolean);
+  const chunks: string[] = [];
+  let current = "";
+
+  for (const para of paragraphs) {
+    if (para.length > CHUNK_SIZE) {
+      if (current) { chunks.push(current); current = ""; }
+      for (let i = 0; i < para.length; i += CHUNK_SIZE - CHUNK_OVERLAP) {
+        chunks.push(para.slice(i, i + CHUNK_SIZE));
+      }
+      continue;
+    }
+    if (current && (current.length + para.length + 2) > CHUNK_SIZE) {
+      chunks.push(current);
+      current = current.slice(-CHUNK_OVERLAP) + "\n\n" + para;
+    } else {
+      current = current ? current + "\n\n" + para : para;
+    }
+  }
+  if (current) chunks.push(current);
+  return chunks;
+}
+
+// Mirrors callOllama's shape but hits Ollama's separate /api/embeddings
+// endpoint (not /api/generate) with the embedding model rather than a chat
+// model.
+async function getEmbedding(text: string): Promise<number[]> {
+  const res = await fetch(EMBEDDINGS_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model: EMBEDDING_MODEL, prompt: text })
+  });
+  if (!res.ok) {
+    throw new Error(`Embedding request failed: ${res.status} ${await res.text().catch(() => "")}`);
+  }
+  const data = await res.json();
+  return data.embedding;
+}
+
+function cosineSimilarity(a: number[], b: number[]): number {
+  let dot = 0, normA = 0, normB = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i];
+    normA += a[i] * a[i];
+    normB += b[i] * b[i];
+  }
+  const denom = Math.sqrt(normA) * Math.sqrt(normB);
+  return denom > 0 ? dot / denom : 0;
+}
+
+interface DocumentEntry {
+  id: string;
+  fileName: string;
+  chunks: { text: string; embedding: number[] }[];
+  createdAt: string;
+}
+
+// In-memory only, deliberately not written to disk — the source file the
+// user attached still exists untouched on their machine, so re-attaching
+// after a restart is cheap. Unlike conversationHistory (irreplaceable),
+// there's no real data-loss case to protect against here.
+const documentStore = new Map<string, DocumentEntry>();
+// Soft cap on how many documents stay active in memory at once — same
+// "prune oldest" idea as MAX_UNSAVED_MODELS, just against a Map instead of
+// a JSON-backed index.
+const MAX_ACTIVE_DOCUMENTS = 5;
+
+// Brute-force cosine similarity over a document's chunks — this is a
+// single-user local app with at most a few hundred chunks per document, so
+// a real vector database would be pure overhead for no measurable benefit.
+async function retrieveRelevantChunks(documentId: string, query: string, topK: number = 5): Promise<string[]> {
+  const doc = documentStore.get(documentId);
+  if (!doc) return [];
+  const queryEmbedding = await getEmbedding(query);
+  return doc.chunks
+    .map(c => ({ text: c.text, score: cosineSimilarity(queryEmbedding, c.embedding) }))
+    .sort((a, b) => b.score - a.score)
+    .slice(0, topK)
+    .map(c => c.text);
+}
+
 // Looks for a "<number> <unit>" size mention (e.g. "5cm", "2 inches", "10mm
 // tall") and converts it to centimeters — the unit the Fusion import step
 // already treats the generated mesh's raw output numbers as. Requires the unit to
@@ -1654,6 +1778,56 @@ app.delete('/api/models/:id', (req, res) => {
   res.json({ success: true });
 });
 
+// API: extracts, chunks, and embeds an attached document, storing it in
+// documentStore for cross-turn Q&A (see looksLikeDocumentQuestion in
+// /api/chat). Base64-in-JSON, matching the existing image-attach
+// convention, rather than adding multipart/multer handling for this one
+// endpoint.
+app.post('/api/documents/upload', async (req, res) => {
+  const { base64, mimeType, fileName } = req.body ?? {};
+  if (!base64 || !fileName) {
+    return res.status(400).json({ error: "Missing file data." });
+  }
+
+  try {
+    const text = await extractDocumentText(base64, mimeType, fileName);
+    if (!text.trim()) {
+      return res.status(400).json({ error: "No extractable text found in that file." });
+    }
+    if (text.length > MAX_DOCUMENT_CHARS) {
+      return res.status(400).json({ error: `Document is too large (${text.length} characters, limit ${MAX_DOCUMENT_CHARS}).` });
+    }
+
+    const chunkStrings = chunkText(text);
+    const chunks: { text: string; embedding: number[] }[] = [];
+    for (const t of chunkStrings) {
+      chunks.push({ text: t, embedding: await getEmbedding(t) });
+    }
+
+    const id = randomUUID();
+    documentStore.set(id, { id, fileName, chunks, createdAt: new Date().toISOString() });
+
+    if (documentStore.size > MAX_ACTIVE_DOCUMENTS) {
+      const oldest = [...documentStore.values()].sort((a, b) => a.createdAt.localeCompare(b.createdAt))[0];
+      documentStore.delete(oldest.id);
+    }
+
+    res.json({ documentId: id, fileName, chunkCount: chunks.length });
+  } catch (err: any) {
+    res.status(500).json({ error: `Failed to read document: ${err.message}` });
+  }
+});
+
+// API: immediately frees a document's in-memory chunks/embeddings — the
+// frontend's "remove attached document" affordance.
+app.delete('/api/documents/:id', (req, res) => {
+  if (!documentStore.has(req.params.id)) {
+    return res.status(404).json({ success: false, error: "Document not found — it may already have been removed." });
+  }
+  documentStore.delete(req.params.id);
+  res.json({ success: true });
+});
+
 // API: Speech-to-text — forwards recorded audio to the local Whisper service
 // and returns the transcribed text. Uses express.raw() scoped to just this
 // route since the body here is binary audio, not JSON.
@@ -1723,12 +1897,17 @@ app.post('/api/speak', async (req, res) => {
 
 // API: Send chat prompt to the assistant
 app.post('/api/chat', async (req, res) => {
-  const { message, attachedImage, openModelId } = req.body as {
+  const { message, attachedImage, openModelId, currentDocumentId } = req.body as {
     message: string;
     attachedImage?: { base64: string; mimeType: string } | null;
     openModelId?: string | null;
+    currentDocumentId?: string | null;
   };
   const hasAttachedImage = !!attachedImage?.base64;
+  // False both when nothing is attached and when the id is stale (e.g. the
+  // server restarted since the frontend last uploaded a document) — either
+  // way, there's no in-memory chunk/embedding state to answer from.
+  const hasActiveDocument = !!currentDocumentId && documentStore.has(currentDocumentId);
 
   if (!message) {
     return res.status(400).json({ error: "Message is required." });
@@ -1905,7 +2084,16 @@ app.post('/api/chat', async (req, res) => {
   // they need to reliably produce structured JSON output.
   const wordCount = message.trim().split(/\s+/).length;
 
-  const isComplex = wantsModification || isRecallQuery || isStickyRecallFollowup || looksLikeStatusQuery || looksLikeHeadlinesQuery || looksLikeSearchQuery || isStickySearchFollowup || looksLikeFusionRequest || looksLikeMeshEditRequest || (
+  // Same negation chain isPlainChatTurn uses further down (it can't be
+  // referenced directly here — isComplex, which needs this, is computed
+  // before isPlainChatTurn exists) — a document question is exactly a
+  // plain chat turn that also happens to have a document active, so it
+  // sits at the bottom of the same priority cascade and can't collide
+  // with anything above it.
+  const looksLikeDocumentQuestion = hasActiveDocument && !wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeStatusQuery && !looksLikeHeadlinesQuery && !looksLikeSearchQuery && !isStickySearchFollowup && !looksLikeFusionRequest;
+  console.log("LOOKS LIKE DOCUMENT QUESTION:", looksLikeDocumentQuestion);
+
+  const isComplex = wantsModification || isRecallQuery || isStickyRecallFollowup || looksLikeStatusQuery || looksLikeHeadlinesQuery || looksLikeSearchQuery || isStickySearchFollowup || looksLikeFusionRequest || looksLikeMeshEditRequest || looksLikeDocumentQuestion || (
     wordCount > 5 && /(typescript|javascript|debug|refactor|git|branch)/i.test(message)
   );
 
@@ -2752,6 +2940,21 @@ Now generate code for this request: "${message}"`;
       stickySearchTurnsRemaining--;
 
       console.log("USING STICKY SEARCH CONTEXT, turns left after this:", stickySearchTurnsRemaining);
+    } else if (looksLikeDocumentQuestion) {
+      const activeDocument = documentStore.get(currentDocumentId!)!;
+      const relevantChunks = await retrieveRelevantChunks(currentDocumentId!, message, 5);
+
+      console.log("RETRIEVING FROM DOCUMENT:", activeDocument.fileName, "| chunks found:", relevantChunks.length);
+
+      recallContext = relevantChunks.length > 0
+        ? `--- RELEVANT EXCERPTS FROM "${activeDocument.fileName}" ---\n` +
+          relevantChunks.map((c, i) => `[Excerpt ${i + 1}]\n${c}`).join("\n\n") +
+          `\n--- END EXCERPTS ---\n` +
+          // Explicit and blunt on purpose, same reasoning as the vision
+          // prompt above: this model has a trained habit of reflexively
+          // denying capabilities it actually has in this exact turn.
+          `Answer the user's question using these excerpts from the attached document — you have direct access to them, this is not secondhand information. Never claim you can't read documents or don't have access to it; that would be false here. If the excerpts don't actually answer the question, say so honestly instead of guessing.\n\n`
+        : `--- NOTE: No relevant excerpts were found in "${activeDocument.fileName}" for this question. ---\n\n`;
     }
 
     const fullPrompt = wantsModification ? `System Instruction:\n${metaSystemInstruction}\n\n` + `User Request:\n${message}`: `System Instruction:\n${metaSystemInstruction}\n\n` + recallContext + `Conversation History:\n${recentHistory}\n\n` + `User Request:\n${message}`;
@@ -3016,7 +3219,11 @@ Now generate code for this request: "${message}"`;
       response: cleanText || (hasProposedChanges ? "I have drafted the requested changes for your review." : ""),
       commit: pendingCommit,
       hasProposedChanges,
-      diff: gitDiff
+      diff: gitDiff,
+      // Lets the frontend clear a stale chip and prompt re-attachment
+      // instead of silently resending a dead id forever (e.g. after a
+      // server restart, since documentStore is in-memory only).
+      ...(currentDocumentId && !hasActiveDocument ? { documentNotFound: true } : {})
     });
 
   } catch (err: any) {
