@@ -1,14 +1,23 @@
 # N.O.A.H.
 
 **Edition: 16GB** — runs on a 16GB card, which unlocked novel-view
-synthesis, pose-guided seed generation, and full texture+paint for the
-image-to-3D pipeline (see `IMAGE_GEN_ROADMAP.md`) — generated models are
-now genuinely colored/textured, not bare grey geometry. The original
-8GB-constrained state (shape-only mesh generation, no local novel-view
-model) is preserved at the `noah-8gb-edition` git tag. Worth knowing:
-texture quality is now good, but raw shape/geometry fidelity (fingers,
-faces) has a real, honest ceiling on this model generation — see
-`IMAGE_GEN_ROADMAP.md`'s "What this fixes vs. doesn't" for why.
+synthesis, pose-guided seed generation (including attaching your own
+reference image to drive a specific dynamic pose), and full texture+paint
+for the image-to-3D pipeline (see `IMAGE_GEN_ROADMAP.md`) — generated
+models are now genuinely colored/textured, not bare grey geometry. Worth
+knowing: texture quality is now good, but raw shape/geometry fidelity
+(fingers, faces) has a real, honest ceiling on this model generation —
+see `IMAGE_GEN_ROADMAP.md`'s "What this fixes vs. doesn't" for why.
+
+The 8GB-constrained state (shape-only mesh generation, no local
+novel-view model) is preserved at the `noah-8gb-edition` git tag —
+`git checkout noah-8gb-edition` for that edition. It's not a frozen
+snapshot: VRAM-independent fixes and features (chat-driven mesh editing —
+scale/mirror/simplify/fill-holes on a generated model — plus general bug
+fixes) get backported there too, since there's no reason to withhold
+those from an 8GB card. Only the genuinely 16GB-hungry generation stages
+above are excluded. The `8gb-edition` branch is where that backporting
+happens; the tag marks its latest released state.
 
 **N.O.A.H.** (Noel's Operational AI Helper) is a local-first AI agent — not
 a chatbot wrapped around an API call. It combines conversational AI,
