@@ -609,10 +609,21 @@ async function startSpeechService(): Promise<void> {
 
   console.log(`[speech] Starting speech service (${pythonPath})...`);
 
+  // detached: true (Windows: CREATE_NEW_PROCESS_GROUP) is the same
+  // convention every other background process launch in this file already
+  // uses (ollama serve, Docker Desktop, Fusion 360, Bambu Connect) — this
+  // was the one spawn that didn't have it, and the one spawn that shares
+  // the console via stdio: "inherit" rather than "ignore" (needed here so
+  // the speech service's logs show up inline, unlike those fire-and-forget
+  // launches). Without its own process group, a child sharing the parent's
+  // console on Windows sits in the same Ctrl+C signal group as the parent
+  // — and uvicorn/asyncio's own startup on Windows is a known trigger for
+  // a spurious console Ctrl+C event, which is exactly what was killing the
+  // whole `tsx watch server.ts` process right after this log line.
   speechServiceProcess = spawn(
     pythonPath,
     ["-m", "uvicorn", "server:app", "--host", "0.0.0.0", "--port", SPEECH_SERVICE_PORT],
-    { cwd: SPEECH_SERVICE_DIR, stdio: "inherit" }
+    { cwd: SPEECH_SERVICE_DIR, stdio: "inherit", detached: true }
   );
 
   speechServiceProcess.on("error", (err) => {
@@ -889,6 +900,46 @@ function extractTargetSizeCm(message: string): number | null {
   return null;
 }
 
+// Vague scale phrasing has no exact factor, so these are reasoned
+// defaults, not measurements — "a bit" implies a smaller nudge than a
+// bare "bigger"/"smaller". An explicit number ("2x", "by 50%") always
+// wins over a vague word when both could apply.
+function extractScaleFactor(message: string): number | null {
+  const explicitMultiplier = message.match(/(\d+(?:\.\d+)?)\s*(x|times)\b/i);
+  if (explicitMultiplier) return parseFloat(explicitMultiplier[1]);
+
+  const byPercent = message.match(/by\s+(\d+(?:\.\d+)?)\s*%/i);
+  if (byPercent) {
+    const delta = parseFloat(byPercent[1]) / 100;
+    return /smaller/i.test(message) ? 1 - delta : 1 + delta;
+  }
+
+  if (/twice|double/i.test(message)) return 2.0;
+  if (/half/i.test(message)) return 0.5;
+  if (/\bbit\b.*bigger|bigger.*\bbit\b|\bbit\b.*larger|larger.*\bbit\b/i.test(message)) return 1.2;
+  if (/\bbit\b.*smaller|smaller.*\bbit\b/i.test(message)) return 0.8;
+  if (/bigger|larger/i.test(message)) return 1.5;
+  if (/smaller/i.test(message)) return 0.67;
+  return null;
+}
+
+function extractMirrorAxis(message: string): "x" | "y" | "z" {
+  if (/vertical|top[\s-]?to[\s-]?bottom|up[\s-]?down/i.test(message)) return "y";
+  if (/depth|front[\s-]?to[\s-]?back/i.test(message)) return "z";
+  // Left-right is both the default and the most common request — mirror
+  // patterns like "flip it"/"mirror it" alone give no axis hint at all.
+  return "x";
+}
+
+function extractSimplifyPercent(message: string): number {
+  const explicit = message.match(/by\s+(\d+(?:\.\d+)?)\s*%/i);
+  if (explicit) return 100 - parseFloat(explicit[1]);
+  if (/half/i.test(message)) return 50;
+  // No percent mentioned at all — 50% is a reasonable, visible-but-not-
+  // destructive default reduction.
+  return 50;
+}
+
 // Rescales the generated mesh (via trimesh, already installed for
 // Hunyuan3D-2) so its largest bounding-box dimension matches the requested
 // size, before it ever reaches Fusion — sidesteps relying on Fusion's own
@@ -939,6 +990,37 @@ function convertMeshToGlb(meshPath: string, outputPath: string): Promise<boolean
     child.on("exit", (code) => {
       if (code !== 0 || !fs.existsSync(outputPath)) {
         console.error("GLB conversion step failed:", stderr.trim().slice(-1000));
+        resolve(false);
+        return;
+      }
+      resolve(true);
+    });
+  });
+}
+
+// Runs a single-mesh edit operation (scale-factor/mirror/simplify) via
+// edit_mesh.py. Writes to a separate output file — never overwrites the
+// input — same reasoning as scaleMeshToTargetSize/repairMesh: a failed
+// edit must leave the original mesh intact.
+function editMesh(
+  meshPath: string,
+  outputPath: string,
+  operation: "scale-factor" | "mirror" | "simplify" | "simplify-percent",
+  param?: string
+): Promise<boolean> {
+  return new Promise((resolve) => {
+    const args = [path.join(IMAGE23D_DIR, "edit_mesh.py"), meshPath, outputPath, operation];
+    if (param !== undefined) args.push(param);
+    const child = spawn(HUNYUAN3D_PYTHON, args);
+    let stderr = "";
+    child.stderr.on("data", (d) => { stderr += d.toString(); });
+    child.on("error", (err) => {
+      console.error("Failed to launch mesh edit step:", err.message);
+      resolve(false);
+    });
+    child.on("exit", (code) => {
+      if (code !== 0 || !fs.existsSync(outputPath)) {
+        console.error("Mesh edit step failed:", stderr.trim().slice(-1000));
         resolve(false);
         return;
       }
@@ -1201,6 +1283,41 @@ function registerGeneratedModel(subject: string, filename: string): GeneratedMod
     saveModelsIndex(entries);
   }
 
+  return entry;
+}
+
+// Resolves "the model"/"it" in a mesh-edit request to a real registry
+// entry. Prefers whichever model the frontend says is currently open in
+// the preview panel (openModelId) — the most reliable signal, since it's
+// exactly what the user is looking at — and falls back to the most
+// recently created entry when nothing is open (e.g. the user says "make
+// it bigger" right after a generation, before ever opening the panel).
+function resolveEditTargetModel(openModelId?: string | null): GeneratedModelEntry | null {
+  const entries = loadModelsIndex();
+  if (openModelId) {
+    const explicit = entries.find(e => e.id === openModelId);
+    if (explicit) return explicit;
+  }
+  if (entries.length === 0) return null;
+  return entries.reduce((newest, e) => (e.createdAt > newest.createdAt ? e : newest));
+}
+
+// Swaps a registry entry's file after a successful edit — same id, new
+// filename — so SAVE/DISCARD and the viewer panel's "always refetch by
+// id" pattern (openModelViewerPanelById) keep working with zero frontend
+// changes. Deletes the pre-edit file only after the new one is confirmed
+// on disk. saved/id/subject are left untouched, so an already-saved model
+// stays saved through an edit.
+function replaceGeneratedModelFile(id: string, newAbsolutePath: string): GeneratedModelEntry | null {
+  const entries = loadModelsIndex();
+  const entry = entries.find(e => e.id === id);
+  if (!entry) return null;
+  const oldFilename = entry.filename;
+  const newFilename = `${Date.now()}.glb`;
+  fs.renameSync(newAbsolutePath, path.join(MODELS_DIR, newFilename));
+  entry.filename = newFilename;
+  saveModelsIndex(entries);
+  fs.rm(path.join(MODELS_DIR, oldFilename), { force: true }, () => {});
   return entry;
 }
 
@@ -1606,9 +1723,10 @@ app.post('/api/speak', async (req, res) => {
 
 // API: Send chat prompt to the assistant
 app.post('/api/chat', async (req, res) => {
-  const { message, attachedImage } = req.body as {
+  const { message, attachedImage, openModelId } = req.body as {
     message: string;
     attachedImage?: { base64: string; mimeType: string } | null;
+    openModelId?: string | null;
   };
   const hasAttachedImage = !!attachedImage?.base64;
 
@@ -1680,13 +1798,32 @@ app.post('/api/chat', async (req, res) => {
   const personality = loadFile(PERSONALITY_FILE);
   const memory = loadMemory();
 
+  // "make it bigger", "mirror it", "simplify it", "fill the holes" all
+  // contain words (edit/change/update) that wantsModification's own regex
+  // below would otherwise swallow, misrouting a mesh-edit request into the
+  // self-modification (personality.txt/memory.json patch) flow — confirmed
+  // directly. Computed first so wantsModification can exclude it, same
+  // "gate against something with a broader net" pattern as
+  // NEGATED_MODIFICATION_PATTERN just below.
+  const MESH_SCALE_PATTERN = /\b(make it|scale it|resize it|scale the (model|mesh)|resize the (model|mesh))\s+(\d+(\.\d+)?\s*(x|times)|(a\s+)?(bit\s+)?(bigger|larger|smaller|(twice|half)( as (big|large))?)|by\s+\d+%)\b/i;
+  const MESH_MIRROR_PATTERN = /\b(mirror|flip)\s+(it|the (model|mesh))\b/i;
+  const MESH_SIMPLIFY_PATTERN = /\b(simplify|decimate|reduce the (poly|polygon|face)( ?count)?|lower the (poly|polygon|detail)( ?count| level)?|fewer (polygons|faces|triangles))\b.{0,20}\b(it|the (model|mesh))?\b/i;
+  const MESH_FILL_HOLES_PATTERN = /\b(fill|patch|close)\s+(the\s+)?(holes?|gaps?)\b/i;
+  const looksLikeMeshEditRequest = (
+    MESH_SCALE_PATTERN.test(message) ||
+    MESH_MIRROR_PATTERN.test(message) ||
+    MESH_SIMPLIFY_PATTERN.test(message) ||
+    MESH_FILL_HOLES_PATTERN.test(message)
+  );
+  console.log("LOOKS LIKE MESH EDIT REQUEST:", looksLikeMeshEditRequest);
+
   // "No changes to your personality" / "I didn't change anything" mention the
   // keyword while explicitly saying nothing should happen — without this,
   // they trip wantsModification just as wrongly as "do you remember" tripped
   // it on the word "remember" (see REMEMBER_QUESTION_PATTERN above).
   const NEGATED_MODIFICATION_PATTERN = /\b(no|not|don'?t|didn'?t|without|never)\s+(\w+\s+){0,2}(changes?|modif(y|ication)|updates?)\b/i;
 
-  const wantsModification = !NEGATED_MODIFICATION_PATTERN.test(message) && (
+  const wantsModification = !looksLikeMeshEditRequest && !NEGATED_MODIFICATION_PATTERN.test(message) && (
     (REMEMBER_QUESTION_PATTERN.test(message) || FORGETFUL_STATEMENT_PATTERN.test(message))
       ? /(modify|change|rewrite|update|edit|improve|refactor|memorize|store|save)/i.test(message)
       : /(modify|change|rewrite|update|edit|improve|refactor|remember|memorize|store|save)/i.test(message)
@@ -1729,7 +1866,7 @@ app.post('/api/chat', async (req, res) => {
   // a creation verb — kept deliberately narrow since this triggers real code
   // execution inside a running Fusion 360 session, not just a chat response.
   const FUSION_TRIGGER_PATTERN = /\b(create|make|generate|build|design|remove|delete|clear)\b.{0,40}\b(3d models?|3d shapes?|cad models?|in fusion(?: ?360)?)\b/i;
-  const looksLikeFusionRequest = !wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeStatusQuery && !looksLikeHeadlinesQuery && !looksLikeSearchQuery && !isStickySearchFollowup && FUSION_TRIGGER_PATTERN.test(message);
+  const looksLikeFusionRequest = !looksLikeMeshEditRequest && !wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeStatusQuery && !looksLikeHeadlinesQuery && !looksLikeSearchQuery && !isStickySearchFollowup && FUSION_TRIGGER_PATTERN.test(message);
 
   // A Fusion request either describes explicit parametric geometry (shape
   // words, dimensions) — handled by the existing code-generation path — or
@@ -1768,7 +1905,7 @@ app.post('/api/chat', async (req, res) => {
   // they need to reliably produce structured JSON output.
   const wordCount = message.trim().split(/\s+/).length;
 
-  const isComplex = wantsModification || isRecallQuery || isStickyRecallFollowup || looksLikeStatusQuery || looksLikeHeadlinesQuery || looksLikeSearchQuery || isStickySearchFollowup || looksLikeFusionRequest || (
+  const isComplex = wantsModification || isRecallQuery || isStickyRecallFollowup || looksLikeStatusQuery || looksLikeHeadlinesQuery || looksLikeSearchQuery || isStickySearchFollowup || looksLikeFusionRequest || looksLikeMeshEditRequest || (
     wordCount > 5 && /(typescript|javascript|debug|refactor|git|branch)/i.test(message)
   );
 
@@ -2398,6 +2535,75 @@ Now generate code for this request: "${message}"`;
           modelId: generatedModel.id,
           modelUrl: `/generated-models/${generatedModel.filename}`,
           modelSubject: generatedModel.subject
+        } : {})
+      });
+    }
+
+    // Edits an already-generated model in place — scale/mirror/simplify/
+    // fill-holes on whichever model is open in the viewer panel (or the
+    // most recent one if none is open — see resolveEditTargetModel).
+    // Preview-only: doesn't re-run Fusion import or slicing, same posture
+    // as scaleMeshToTargetSize/repairMesh being pure mesh-to-mesh steps
+    // with no side effects of their own.
+    if (looksLikeMeshEditRequest) {
+      const target = resolveEditTargetModel(openModelId);
+      let editReplyText: string;
+      let updatedModel: GeneratedModelEntry | null = null;
+
+      if (!target) {
+        editReplyText = "There's no generated model to edit yet — generate one first, or open one from the viewer.";
+      } else {
+        const sourcePath = path.join(MODELS_DIR, target.filename);
+        fs.mkdirSync(IMAGE23D_TMP_DIR, { recursive: true });
+        const tmpOut = path.join(IMAGE23D_TMP_DIR, `${Date.now()}_edited.glb`);
+
+        let ok = false;
+        let note = "";
+        if (MESH_FILL_HOLES_PATTERN.test(message)) {
+          const repairResult = await repairMesh(sourcePath);
+          ok = !!repairResult?.report.usable;
+          if (ok) fs.copyFileSync(repairResult!.outputPath, tmpOut);
+        } else if (MESH_MIRROR_PATTERN.test(message)) {
+          ok = await editMesh(sourcePath, tmpOut, "mirror", extractMirrorAxis(message));
+        } else if (MESH_SIMPLIFY_PATTERN.test(message)) {
+          ok = await editMesh(sourcePath, tmpOut, "simplify-percent", String(extractSimplifyPercent(message)));
+          // Confirmed directly: simplify_quadric_decimation strips UV/
+          // material data — a textured mesh comes out visibly blank/noisy,
+          // not just lower-detail. Warn rather than silently degrade.
+          if (ok) note = " Note: simplifying removes color/texture — the model will look bare afterward.";
+        } else if (MESH_SCALE_PATTERN.test(message)) {
+          const sizeCm = extractTargetSizeCm(message);
+          if (sizeCm !== null) {
+            const scaled = await scaleMeshToTargetSize(sourcePath, sizeCm);
+            ok = !!scaled;
+            if (ok) fs.copyFileSync(scaled!, tmpOut);
+          } else {
+            const factor = extractScaleFactor(message);
+            ok = factor !== null && await editMesh(sourcePath, tmpOut, "scale-factor", String(factor));
+          }
+        }
+
+        if (ok) {
+          updatedModel = replaceGeneratedModelFile(target.id, tmpOut);
+          editReplyText = updatedModel
+            ? `Done — updated "${updatedModel.subject}".${note} This is a preview-only change — re-import or re-slice separately if you want to print it.`
+            : "The edit succeeded but the registry update failed — the model may be out of sync.";
+        } else {
+          editReplyText = "Couldn't apply that edit — the original model is unchanged.";
+        }
+      }
+
+      conversationHistory.push(`Assistant: ${editReplyText}`);
+      saveHistory();
+      clearTimeout(timeout);
+
+      return res.json({
+        response: editReplyText,
+        hasProposedChanges: false,
+        ...(updatedModel ? {
+          modelId: updatedModel.id,
+          modelUrl: `/generated-models/${updatedModel.filename}`,
+          modelSubject: updatedModel.subject
         } : {})
       });
     }

@@ -622,19 +622,28 @@
     imageAttachInput.addEventListener('change', () => setAttachedImage(imageAttachInput.files[0]));
     imageAttachRemove.addEventListener('click', clearAttachedImage);
 
+    // Listens on `document`, not just chatDropZone — a drop anywhere else
+    // on the page (the message history, the viewer panel, empty margin)
+    // previously fell through to the browser's own default handling for a
+    // dropped file, which is to navigate the tab to it. preventDefault()
+    // on every dragover/drop at the document level closes that off
+    // entirely, and handling the actual drop here too means the whole
+    // page is a valid target, not just the narrow input row — the visual
+    // highlight still only lights up chatDropZone, since that's the part
+    // that visibly reacts either way.
     ['dragover', 'dragenter'].forEach(evt => {
-      chatDropZone.addEventListener(evt, (e) => {
+      document.addEventListener(evt, (e) => {
         e.preventDefault();
         chatDropZone.classList.add('border-cyan-400', 'bg-cyan-500/5');
       });
     });
     ['dragleave', 'drop'].forEach(evt => {
-      chatDropZone.addEventListener(evt, (e) => {
+      document.addEventListener(evt, (e) => {
         e.preventDefault();
         chatDropZone.classList.remove('border-cyan-400', 'bg-cyan-500/5');
       });
     });
-    chatDropZone.addEventListener('drop', (e) => {
+    document.addEventListener('drop', (e) => {
       const file = e.dataTransfer.files && e.dataTransfer.files[0];
       if (file) setAttachedImage(file);
     });
@@ -709,7 +718,8 @@
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             message,
-            ...(attachedImage ? { attachedImage: { base64: attachedImage.base64, mimeType: attachedImage.mimeType } } : {})
+            ...(attachedImage ? { attachedImage: { base64: attachedImage.base64, mimeType: attachedImage.mimeType } } : {}),
+            ...(currentModelId ? { openModelId: currentModelId } : {})
           })
         });
         const data = await response.json();
