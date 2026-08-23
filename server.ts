@@ -2168,27 +2168,36 @@ app.post('/api/chat', async (req, res) => {
   const STATUS_TRIGGER_PATTERN = /\b(core integrity|neural load|model temp|diverg(ence)?[\s_-]?buf(fer)?|system status|what'?s down|which service|is (everything|anything) (down|broken|working|up)|are you (down|working|online)|health check)\b/i;
   const looksLikeStatusQuery = !wantsModification && !isRecallQuery && !isStickyRecallFollowup && STATUS_TRIGGER_PATTERN.test(message);
 
+  // "Who showed up" / "who's there" needs the vision service's actual
+  // current camera state, not a guess — without this, the model has nothing
+  // grounded to answer from beyond a proactive greeting that may already be
+  // out of its context window, and (confirmed directly) will fabricate an
+  // answer rather than say it doesn't know. Same "fetch real data, inject it,
+  // let the model phrase the answer" pattern as looksLikeStatusQuery above.
+  const VISION_STATUS_TRIGGER_PATTERN = /\b(who('?s| is| was) (there|here|around|present|watching)|who (just )?(showed up|showing up|walked in|appeared|arrived)|who did you see|is (anyone|someone) (there|here)|who'?s in (the (room|frame|view)))\b/i;
+  const looksLikeVisionStatusQuery = !wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeStatusQuery && VISION_STATUS_TRIGGER_PATTERN.test(message);
+
   // "Give me today's headlines" is a news-digest request, not a factual
   // lookup — it gets its own trigger and its own fetch path (SearXNG's news
   // category + day filter) rather than a plain web search, which just
   // surfaces static homepages for a bare term like "headlines".
   const HEADLINES_TRIGGER_PATTERN = /\b(headlines|breaking news|today'?s news|news today|on the news|what'?s (been )?reported|happening in the world)\b/i;
-  const looksLikeHeadlinesQuery = !wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeStatusQuery && HEADLINES_TRIGGER_PATTERN.test(message);
+  const looksLikeHeadlinesQuery = !wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeStatusQuery && !looksLikeVisionStatusQuery && HEADLINES_TRIGGER_PATTERN.test(message);
 
   const SEARCH_TRIGGER_PATTERN = /\b(latest news|who won|release date|launch date|premiere date|when('s| is| does| will).{0,30}(come out|coming out|releas(e|ing)|drop(ping)?|launch(ing)?|premier(e|ing))|current (weather|price|score|exchange rate)|how much (is|does|would)|price of|what'?s the weather|weather (today|forecast|right now))\b/i;
-  const looksLikeSearchQuery = !wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeStatusQuery && !looksLikeHeadlinesQuery && SEARCH_TRIGGER_PATTERN.test(message);
+  const looksLikeSearchQuery = !wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeStatusQuery && !looksLikeVisionStatusQuery && !looksLikeHeadlinesQuery && SEARCH_TRIGGER_PATTERN.test(message);
 
   // A follow-up on an already-answered search or headlines request (e.g.
   // "give me the link to the sites you used", "which one said that") —
   // needs the same results (with real URLs) rather than the model
   // improvising from its own summary.
-  const isStickySearchFollowup = !wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeStatusQuery && !looksLikeHeadlinesQuery && !looksLikeSearchQuery && stickySearchTurnsRemaining > 0;
+  const isStickySearchFollowup = !wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeStatusQuery && !looksLikeVisionStatusQuery && !looksLikeHeadlinesQuery && !looksLikeSearchQuery && stickySearchTurnsRemaining > 0;
 
   // Requires an explicit "3d model"/"cad model"/"in fusion" mention alongside
   // a creation verb — kept deliberately narrow since this triggers real code
   // execution inside a running Fusion 360 session, not just a chat response.
   const FUSION_TRIGGER_PATTERN = /\b(create|make|generate|build|design|remove|delete|clear)\b.{0,40}\b(3d models?|3d shapes?|cad models?|in fusion(?: ?360)?)\b/i;
-  const looksLikeFusionRequest = !looksLikeMeshEditRequest && !wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeStatusQuery && !looksLikeHeadlinesQuery && !looksLikeSearchQuery && !isStickySearchFollowup && FUSION_TRIGGER_PATTERN.test(message);
+  const looksLikeFusionRequest = !looksLikeMeshEditRequest && !wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeStatusQuery && !looksLikeVisionStatusQuery && !looksLikeHeadlinesQuery && !looksLikeSearchQuery && !isStickySearchFollowup && FUSION_TRIGGER_PATTERN.test(message);
 
   // A Fusion request either describes explicit parametric geometry (shape
   // words, dimensions) — handled by the existing code-generation path — or
@@ -2215,6 +2224,7 @@ app.post('/api/chat', async (req, res) => {
   console.log("IS RECALL QUERY:", isRecallQuery);
   console.log("IS STICKY RECALL FOLLOWUP:", isStickyRecallFollowup, "| turns remaining:", stickyRecallTurnsRemaining);
   console.log("LOOKS LIKE STATUS QUERY:", looksLikeStatusQuery);
+  console.log("LOOKS LIKE VISION STATUS QUERY:", looksLikeVisionStatusQuery);
   console.log("LOOKS LIKE HEADLINES QUERY:", looksLikeHeadlinesQuery);
   console.log("LOOKS LIKE SEARCH QUERY:", looksLikeSearchQuery);
   console.log("IS STICKY SEARCH FOLLOWUP:", isStickySearchFollowup, "| turns remaining:", stickySearchTurnsRemaining);
@@ -2233,10 +2243,10 @@ app.post('/api/chat', async (req, res) => {
   // plain chat turn that also happens to have a document active, so it
   // sits at the bottom of the same priority cascade and can't collide
   // with anything above it.
-  const looksLikeDocumentQuestion = hasActiveDocument && !wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeStatusQuery && !looksLikeHeadlinesQuery && !looksLikeSearchQuery && !isStickySearchFollowup && !looksLikeFusionRequest;
+  const looksLikeDocumentQuestion = hasActiveDocument && !wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeStatusQuery && !looksLikeVisionStatusQuery && !looksLikeHeadlinesQuery && !looksLikeSearchQuery && !isStickySearchFollowup && !looksLikeFusionRequest;
   console.log("LOOKS LIKE DOCUMENT QUESTION:", looksLikeDocumentQuestion);
 
-  const isComplex = wantsModification || isRecallQuery || isStickyRecallFollowup || looksLikeStatusQuery || looksLikeHeadlinesQuery || looksLikeSearchQuery || isStickySearchFollowup || looksLikeFusionRequest || looksLikeMeshEditRequest || looksLikeDocumentQuestion || (
+  const isComplex = wantsModification || isRecallQuery || isStickyRecallFollowup || looksLikeStatusQuery || looksLikeVisionStatusQuery || looksLikeHeadlinesQuery || looksLikeSearchQuery || isStickySearchFollowup || looksLikeFusionRequest || looksLikeMeshEditRequest || looksLikeDocumentQuestion || (
     wordCount > 5 && /(typescript|javascript|debug|refactor|git|branch)/i.test(message)
   );
 
@@ -2364,7 +2374,7 @@ app.post('/api/chat', async (req, res) => {
   // conversations) and their "I have no record of that day" replies would
   // otherwise false-positive as uncertainty below — the search fallback only
   // makes sense for genuine open-ended chat turns, not those paths.
-  const isPlainChatTurn = !wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeStatusQuery && !looksLikeHeadlinesQuery && !looksLikeSearchQuery && !isStickySearchFollowup && !looksLikeFusionRequest;
+  const isPlainChatTurn = !wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeStatusQuery && !looksLikeVisionStatusQuery && !looksLikeHeadlinesQuery && !looksLikeSearchQuery && !isStickySearchFollowup && !looksLikeFusionRequest;
 
   const searchInstructions = isPlainChatTurn ? `
   If answering requires current or real-world information you don't already know — release dates, sports results, news, prices, "when does X come out", "who won Y" — do not guess or make something up. Instead, respond with EXACTLY this and nothing else, no other words:
@@ -3066,6 +3076,29 @@ Now generate code for this request: "${message}"`;
         `Answer the user's question using this real, current status data. If any service is DOWN, name it specifically. Do not guess or make up different numbers.\n\n`;
 
       console.log("LIVE STATUS CONTEXT:");
+      console.log(recallContext);
+    } else if (looksLikeVisionStatusQuery) {
+      console.log("FETCHING LIVE VISION STATUS");
+      let visionStatusFact: string;
+      try {
+        const visionRes = await fetch(`${VISION_SERVICE_URL}/status`, { signal: AbortSignal.timeout(1500) });
+        if (!visionRes.ok) throw new Error(`vision service returned ${visionRes.status}`);
+        const { identity, camera_ok } = await visionRes.json() as { identity: string | null; camera_ok: boolean };
+        visionStatusFact = !camera_ok
+          ? "The camera itself can't currently be accessed (it may be in use by another application, like the Windows Camera app, or physically disconnected) — there's no live view to report on."
+          : identity === null
+            ? "The camera does not currently see anyone in view."
+            : identity === "unknown"
+              ? "The camera currently sees someone in view, but their face isn't one that's been enrolled/recognized."
+              : `The camera currently sees ${identity} in view.`;
+      } catch {
+        visionStatusFact = "The vision service isn't currently running or reachable, so there's no live camera data available right now.";
+      }
+
+      recallContext = `--- LIVE VISION STATUS ---\n${visionStatusFact}\n--- END LIVE VISION STATUS ---\n` +
+        `Answer the user's question using this real, current camera data, and nothing else — do not blend it with guesses or unrelated conversation history. These are three distinct, mutually exclusive situations; say specifically which one applies, in your own words: (1) the camera itself is inaccessible right now (e.g. blocked by another app) — this is NOT the same as nobody being there, say explicitly that the camera can't be reached; (2) the camera works and currently sees nobody; (3) the camera works and sees someone (named, or unrecognized). Do not invent a name.\n\n`;
+
+      console.log("LIVE VISION STATUS CONTEXT:");
       console.log(recallContext);
     } else if (looksLikeHeadlinesQuery) {
       console.log("FETCHING TODAY'S HEADLINES");
