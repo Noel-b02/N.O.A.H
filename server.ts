@@ -3163,7 +3163,20 @@ Now generate code for this request: "${message}"`;
         : `--- NOTE: No relevant excerpts were found in "${activeDocument.fileName}" for this question. ---\n\n`;
     }
 
-    const fullPrompt = wantsModification ? `System Instruction:\n${metaSystemInstruction}\n\n` + `User Request:\n${message}`: `System Instruction:\n${metaSystemInstruction}\n\n` + recallContext + `Conversation History:\n${recentHistory}\n\n` + `User Request:\n${message}`;
+    // A "live status" answer is defined entirely by current state, not by
+    // consistency with what was said before — but recentHistory gets baked
+    // into every other prompt unconditionally, and confirmed directly: after
+    // several turns of the camera genuinely being blocked, the model kept
+    // repeating "camera inaccessible" even once given a fresh fact saying it
+    // now works, anchoring on its own prior answers over the live data. For
+    // these two intents specifically, omit history so the fresh fact is the
+    // only thing in the room.
+    const isFreshLiveStatusQuery = looksLikeStatusQuery || looksLikeVisionStatusQuery;
+    const fullPrompt = wantsModification
+      ? `System Instruction:\n${metaSystemInstruction}\n\n` + `User Request:\n${message}`
+      : isFreshLiveStatusQuery
+        ? `System Instruction:\n${metaSystemInstruction}\n\n` + recallContext + `User Request:\n${message}`
+        : `System Instruction:\n${metaSystemInstruction}\n\n` + recallContext + `Conversation History:\n${recentHistory}\n\n` + `User Request:\n${message}`;
     
     console.log("WANTS MODIFICATION:", wantsModification);
     console.log("PROMPT SENT TO MODEL:");
