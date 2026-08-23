@@ -1188,6 +1188,30 @@ function extractMirrorAxis(message: string): "x" | "y" | "z" {
   return "x";
 }
 
+// Confirmed live: real phrasing for face enrollment varies a lot more than
+// a single "remember this face AS X" construction covers — "name is X",
+// "this is X", "it's X", "called X" are all natural ways to say the same
+// thing, and a request phrased that way was silently swallowed by plain
+// chat before (the model just improvised a friendly-sounding
+// acknowledgment without ever actually calling /enroll). Tries each
+// construction in turn and returns the first name found; capped at two
+// words (first + last name) to limit how much of a run-on sentence a
+// missing comma could pull in.
+function extractEnrollName(message: string): string | null {
+  const NAME = "([A-Za-z][A-Za-z'-]*(?:\\s+[A-Za-z][A-Za-z'-]*){0,1})";
+  const patterns = [
+    new RegExp(`\\bas\\s+${NAME}`, "i"),
+    new RegExp(`\\bname(?:'s| is)\\s+${NAME}`, "i"),
+    new RegExp(`\\b(?:this is|it'?s|it is|he'?s|he is|she'?s|she is)\\s+${NAME}`, "i"),
+    new RegExp(`\\bcalled\\s+${NAME}`, "i")
+  ];
+  for (const pattern of patterns) {
+    const match = message.match(pattern);
+    if (match) return match[1].trim();
+  }
+  return null;
+}
+
 function extractSimplifyPercent(message: string): number {
   const explicit = message.match(/by\s+(\d+(?:\.\d+)?)\s*%/i);
   if (explicit) return 100 - parseFloat(explicit[1]);
@@ -2456,7 +2480,15 @@ app.post('/api/vision/enroll', async (req, res) => {
     const response = await fetch(`${VISION_SERVICE_URL}/enroll`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name, base64, mimeType: mimeType ?? "" })
+      body: JSON.stringify({ name, base64, mimeType: mimeType ?? "" }),
+      // Face detection is CPU-bound and blocks the vision service's event
+      // loop for its duration — under contention (e.g. the background scan
+      // loop mid-tick) confirmed directly that this can run slow. Without a
+      // timeout, a slow/stuck vision service would hang this fetch
+      // indefinitely, which locks the shared requestInFlight flag on
+      // /api/chat's own enrollment branch below and blocks every other
+      // message until it resolves.
+      signal: AbortSignal.timeout(10000)
     });
 
     const data = await response.json().catch(() => ({}));
@@ -2580,10 +2612,17 @@ app.post('/api/chat', async (req, res) => {
   // patch) flow — same collision, same fix pattern as looksLikeMeshEditRequest
   // above. Gated on hasAttachedImage since enrollment is meaningless without
   // a photo to enroll.
-  const ENROLL_FACE_PATTERN = /\bremember (?:this|that|him|her|them) (?:face|person)? ?as\s+([a-z][a-z\s'-]{0,40})\b/i;
-  const faceEnrollMatch = hasAttachedImage ? message.match(ENROLL_FACE_PATTERN) : null;
-  const looksLikeFaceEnrollRequest = !!faceEnrollMatch;
-  console.log("LOOKS LIKE FACE ENROLL REQUEST:", looksLikeFaceEnrollRequest);
+  // Deliberately loose on the trigger (just "remember [this/that/him/her/
+  // them] ... face/person" somewhere nearby) — the actual name is pulled
+  // out separately by extractEnrollName, which tries several natural
+  // phrasings ("as X", "name is X", "this is X", "called X"). Confirmed
+  // live: requiring the name to immediately follow "as" missed "remember
+  // this face, name is Joshua" entirely, silently falling through to plain
+  // chat instead of enrolling anything.
+  const ENROLL_FACE_TRIGGER_PATTERN = /\bremember (?:this|that|him|her|them)\b[\s\S]{0,20}\b(?:face|person)\b/i;
+  const faceEnrollName = hasAttachedImage && ENROLL_FACE_TRIGGER_PATTERN.test(message) ? extractEnrollName(message) : null;
+  const looksLikeFaceEnrollRequest = faceEnrollName !== null;
+  console.log("LOOKS LIKE FACE ENROLL REQUEST:", looksLikeFaceEnrollRequest, "| name:", faceEnrollName);
 
   // "No changes to your personality" / "I didn't change anything" mention the
   // keyword while explicitly saying nothing should happen — without this,
@@ -2909,13 +2948,18 @@ app.post('/api/chat', async (req, res) => {
     // needs first refusal on any attached image, same "most specific wins
     // first" ordering already used for pose-reference disambiguation.
     if (looksLikeFaceEnrollRequest) {
-      const enrollName = faceEnrollMatch![1].trim();
+      const enrollName = faceEnrollName!;
       let enrollReplyText: string;
       try {
         const enrollRes = await fetch(`${VISION_SERVICE_URL}/enroll`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ name: enrollName, base64: attachedImage!.base64, mimeType: attachedImage!.mimeType })
+          body: JSON.stringify({ name: enrollName, base64: attachedImage!.base64, mimeType: attachedImage!.mimeType }),
+          // See the /api/vision/enroll proxy above — same reasoning, but
+          // more important here specifically: this fetch runs inside the
+          // /api/chat handler under the shared requestInFlight lock, so a
+          // hung vision service would block every other chat message too.
+          signal: AbortSignal.timeout(10000)
         });
         const enrollData = await enrollRes.json().catch(() => ({})) as { success?: boolean; detail?: string };
         enrollReplyText = enrollRes.ok
