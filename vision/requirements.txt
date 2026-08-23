@@ -1,0 +1,7 @@
+fastapi
+uvicorn
+python-dotenv
+opencv-python
+insightface
+onnxruntime
+numpy

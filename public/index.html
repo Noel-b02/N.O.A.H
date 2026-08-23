@@ -553,6 +553,17 @@
           document.getElementById('telemetry-load').textContent = 'N/A';
           document.getElementById('telemetry-temp').textContent = 'N/A';
         }
+
+        // A proactive greeting from the vision service (someone just showed
+        // up on camera) rides this same 3-second poll rather than a
+        // dedicated push channel — this app has no WebSocket/SSE anywhere,
+        // and hud-metrics already fires every 3s regardless. Bypasses
+        // /api/chat entirely since this isn't a reply to a user message;
+        // already logged into conversationHistory server-side.
+        if (data.proactiveGreeting) {
+          appendMessage('assistant', data.proactiveGreeting);
+          speakReply(data.proactiveGreeting);
+        }
       } catch (err) {
         console.error('Telemetry fetch failed:', err);
         setServiceDot('svc-ollama', false);

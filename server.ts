@@ -18,6 +18,7 @@ app.use(express.static(path.join(__dirname, 'public')));
 
 const OLLAMA_URL = process.env.OLLAMA_URL ?? "http://localhost:11434/api/generate";
 const SPEECH_SERVICE_URL = process.env.SPEECH_SERVICE_URL ?? "http://localhost:5001";
+const VISION_SERVICE_URL = process.env.VISION_SERVICE_URL ?? "http://localhost:5002";
 
 const CHAT_MODEL = process.env.OLLAMA_CHAT_MODEL ?? "qwen3.5:4b";
 const CODE_MODEL = process.env.OLLAMA_CODE_MODEL ?? "qwen3.5:9b";
@@ -600,10 +601,10 @@ const SPEECH_SERVICE_AUTOSTART = (process.env.SPEECH_SERVICE_AUTOSTART ?? "true"
 
 let speechServiceProcess: ChildProcess | null = null;
 
-function getVenvPythonPath(): string {
+function getVenvPythonPath(baseDir: string): string {
   const isWindows = process.platform === "win32";
   return path.join(
-    SPEECH_SERVICE_DIR,
+    baseDir,
     "venv",
     isWindows ? "Scripts" : "bin",
     isWindows ? "python.exe" : "python"
@@ -630,7 +631,7 @@ async function startSpeechService(): Promise<void> {
     return;
   }
 
-  const pythonPath = getVenvPythonPath();
+  const pythonPath = getVenvPythonPath(SPEECH_SERVICE_DIR);
 
   if (!fs.existsSync(pythonPath)) {
     console.warn(
@@ -674,6 +675,79 @@ function stopSpeechService(): void {
   if (speechServiceProcess && !speechServiceProcess.killed) {
     console.log("[speech] Stopping speech service...");
     speechServiceProcess.kill();
+  }
+}
+
+// --- Vision service (camera + facial recognition) auto-start ---
+// CPU-only end to end (insightface/onnxruntime), so unlike speech there's no
+// VRAM contention to worry about — this never needs withGpuExclusive().
+// Defaults to NOT auto-starting, inverted from speech's default-on: a
+// continuously-active webcam is a materially more visible trust surface than
+// an on-demand mic, and this repo is public — nobody who clones it should
+// get a webcam silently activated by an unrelated git pull + restart. See
+// VISION_SETUP.md.
+const VISION_SERVICE_DIR = process.env.VISION_SERVICE_DIR ?? path.join(process.cwd(), "vision");
+const VISION_SERVICE_PORT = process.env.VISION_SERVICE_PORT ?? "5002";
+const VISION_SERVICE_AUTOSTART = (process.env.VISION_SERVICE_AUTOSTART ?? "false").toLowerCase() === "true";
+
+let visionServiceProcess: ChildProcess | null = null;
+
+async function isVisionServiceRunning(): Promise<boolean> {
+  try {
+    const res = await fetch(`${VISION_SERVICE_URL}/health`, { signal: AbortSignal.timeout(1500) });
+    return res.ok;
+  } catch {
+    return false;
+  }
+}
+
+async function startVisionService(): Promise<void> {
+  if (!VISION_SERVICE_AUTOSTART) {
+    console.log("[vision] Auto-start disabled (default — set VISION_SERVICE_AUTOSTART=true to enable).");
+    return;
+  }
+
+  if (await isVisionServiceRunning()) {
+    console.log("[vision] Vision service already running on its own — skipping auto-start.");
+    return;
+  }
+
+  const pythonPath = getVenvPythonPath(VISION_SERVICE_DIR);
+
+  if (!fs.existsSync(pythonPath)) {
+    console.warn(
+      `[vision] No venv Python found at ${pythonPath} — facial recognition will be unavailable ` +
+      `until the vision service venv is set up (see vision/requirements.txt) or started manually.`
+    );
+    return;
+  }
+
+  console.log(`[vision] Starting vision service (${pythonPath})...`);
+
+  // detached: true from the start — a missing detached: true on the speech
+  // service's original spawn caused a spurious console Ctrl+C to kill the
+  // whole tsx watch process group on Windows (see startSpeechService above).
+  visionServiceProcess = spawn(
+    pythonPath,
+    ["-m", "uvicorn", "server:app", "--host", "0.0.0.0", "--port", VISION_SERVICE_PORT],
+    { cwd: VISION_SERVICE_DIR, stdio: "inherit", detached: true }
+  );
+
+  visionServiceProcess.on("error", (err) => {
+    console.warn(`[vision] Failed to start vision service: ${err.message}`);
+    visionServiceProcess = null;
+  });
+
+  visionServiceProcess.on("exit", (code, signal) => {
+    console.log(`[vision] Vision service process exited (code=${code}, signal=${signal})`);
+    visionServiceProcess = null;
+  });
+}
+
+function stopVisionService(): void {
+  if (visionServiceProcess && !visionServiceProcess.killed) {
+    console.log("[vision] Stopping vision service...");
+    visionServiceProcess.kill();
   }
 }
 
@@ -722,6 +796,7 @@ async function withGpuExclusive<T>(fn: () => Promise<T>): Promise<T> {
 }
 
 startSpeechService();
+startVisionService();
 
 // --- Bambu Connect (official print handoff) ---
 // See PRINTER_SETUP.md. Bambu Lab's own desktop relay app — chosen over a
@@ -2104,13 +2179,35 @@ app.get('/api/hud-metrics', async (_, res) => {
   const healthyCount = Object.values(services).filter(Boolean).length;
   const coreIntegrityPercent = (healthyCount / Object.keys(services).length) * 100;
 
+  // Soft-fail, same as every health check above — if the vision service is
+  // down or disabled (its default), this endpoint must not break the HUD.
+  // The greeting text is built here, not on the frontend, so it's identical
+  // whether it ends up spoken, displayed, or read back from history later.
+  let proactiveGreeting: string | null = null;
+  try {
+    const eventRes = await fetch(`${VISION_SERVICE_URL}/pending-event`, { signal: AbortSignal.timeout(1500) });
+    if (eventRes.ok) {
+      const event = await eventRes.json() as { type: "known" | "unknown"; name: string | null } | null;
+      if (event) {
+        proactiveGreeting = event.type === "known"
+          ? `Welcome back, ${event.name}!`
+          : "Someone I don't recognize just showed up.";
+        conversationHistory.push(`Assistant: ${proactiveGreeting}`);
+        saveHistory();
+      }
+    }
+  } catch {
+    // Vision service unreachable — nothing to announce this tick.
+  }
+
   res.json({
     coreIntegrityPercent,
     generating: gpuExclusiveTaskRunning,
     fusionAvailable: fusionHealthy,
     services,
     printer: { installed: isBambuConnectInstalled() },
-    gpu: getGpuStats()
+    gpu: getGpuStats(),
+    proactiveGreeting
   });
 });
 
@@ -2341,6 +2438,41 @@ app.post('/api/speak', async (req, res) => {
   }
 });
 
+// API: Enroll a face for facial recognition — forwards straight through to
+// the vision service as JSON, same proxying convention as /api/transcribe
+// and /api/speak above. No temp file involved (unlike saveBase64ImageToFile,
+// used elsewhere for handing a path to file-based CLI tools) since this
+// never leaves JSON/HTTP on either side.
+app.post('/api/vision/enroll', async (req, res) => {
+  const { name, base64, mimeType } = req.body as { name?: string; base64?: string; mimeType?: string };
+  if (!name || !name.trim()) {
+    return res.status(400).json({ error: "name is required." });
+  }
+  if (!base64) {
+    return res.status(400).json({ error: "An attached photo is required to enroll a face." });
+  }
+
+  try {
+    const response = await fetch(`${VISION_SERVICE_URL}/enroll`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, base64, mimeType: mimeType ?? "" })
+    });
+
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      return res.status(response.status).json({ error: (data as any).detail || "Face enrollment failed." });
+    }
+
+    res.json(data);
+  } catch (err: any) {
+    console.error("Face enrollment failed:", err.message);
+    res.status(500).json({
+      error: `Could not reach the vision service: ${err.message}. Is it running (VISION_SERVICE_AUTOSTART)?`
+    });
+  }
+});
+
 // API: Send chat prompt to the assistant
 app.post('/api/chat', async (req, res) => {
   const { message, attachedImage, openModelId, currentDocumentId } = req.body as {
@@ -2442,13 +2574,24 @@ app.post('/api/chat', async (req, res) => {
   );
   console.log("LOOKS LIKE MESH EDIT REQUEST:", looksLikeMeshEditRequest);
 
+  // "Remember this face as Noel" contains "remember," which
+  // wantsModification's own regex below would otherwise swallow, misrouting
+  // face enrollment into the self-modification (personality.txt/memory.json
+  // patch) flow — same collision, same fix pattern as looksLikeMeshEditRequest
+  // above. Gated on hasAttachedImage since enrollment is meaningless without
+  // a photo to enroll.
+  const ENROLL_FACE_PATTERN = /\bremember (?:this|that|him|her|them) (?:face|person)? ?as\s+([a-z][a-z\s'-]{0,40})\b/i;
+  const faceEnrollMatch = hasAttachedImage ? message.match(ENROLL_FACE_PATTERN) : null;
+  const looksLikeFaceEnrollRequest = !!faceEnrollMatch;
+  console.log("LOOKS LIKE FACE ENROLL REQUEST:", looksLikeFaceEnrollRequest);
+
   // "No changes to your personality" / "I didn't change anything" mention the
   // keyword while explicitly saying nothing should happen — without this,
   // they trip wantsModification just as wrongly as "do you remember" tripped
   // it on the word "remember" (see REMEMBER_QUESTION_PATTERN above).
   const NEGATED_MODIFICATION_PATTERN = /\b(no|not|don'?t|didn'?t|without|never)\s+(\w+\s+){0,2}(changes?|modif(y|ication)|updates?)\b/i;
 
-  const wantsModification = !looksLikeMeshEditRequest && !NEGATED_MODIFICATION_PATTERN.test(message) && (
+  const wantsModification = !looksLikeMeshEditRequest && !looksLikeFaceEnrollRequest && !NEGATED_MODIFICATION_PATTERN.test(message) && (
     (REMEMBER_QUESTION_PATTERN.test(message) || FORGETFUL_STATEMENT_PATTERN.test(message))
       ? /(modify|change|rewrite|update|edit|improve|refactor|memorize|store|save)/i.test(message)
       : /(modify|change|rewrite|update|edit|improve|refactor|remember|memorize|store|save)/i.test(message)
@@ -2747,6 +2890,36 @@ app.post('/api/chat', async (req, res) => {
       if (!res.ok) throw new Error(`Ollama connection failed: HTTP ${res.status} ${await res.text().catch(() => "")}`.trim());
       const data = await res.json() as { response: string };
       return data.response;
+    }
+
+    // Face enrollment is its own early-return path, checked before the
+    // Fusion/pose-reference/general-vision-query attached-image branches
+    // below — "remember this face as X" is a much more specific phrasing
+    // than a plain object photo or a "reconstruct this as 3D" request, so it
+    // needs first refusal on any attached image, same "most specific wins
+    // first" ordering already used for pose-reference disambiguation.
+    if (looksLikeFaceEnrollRequest) {
+      const enrollName = faceEnrollMatch![1].trim();
+      let enrollReplyText: string;
+      try {
+        const enrollRes = await fetch(`${VISION_SERVICE_URL}/enroll`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name: enrollName, base64: attachedImage!.base64, mimeType: attachedImage!.mimeType })
+        });
+        const enrollData = await enrollRes.json().catch(() => ({})) as { success?: boolean; detail?: string };
+        enrollReplyText = enrollRes.ok
+          ? `Got it — I'll remember ${enrollName}'s face.`
+          : `Couldn't enroll that face: ${enrollData.detail || "unknown error"}`;
+      } catch (err: any) {
+        enrollReplyText = `Couldn't reach the vision service to enroll that face: ${err.message}. Is it running (VISION_SERVICE_AUTOSTART)?`;
+      }
+
+      conversationHistory.push(`Assistant: ${enrollReplyText}`);
+      saveHistory();
+      clearTimeout(timeout);
+
+      return res.json({ response: enrollReplyText, hasProposedChanges: false });
     }
 
     // Fusion 360 model generation is handled as its own early-return path —
@@ -4002,6 +4175,7 @@ function shutdown(signal: string) {
   console.log(`\nReceived ${signal}, archiving session before exit...`);
   archiveSession("manual");
   stopSpeechService();
+  stopVisionService();
   process.exit(0);
 }
 
