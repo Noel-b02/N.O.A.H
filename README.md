@@ -41,6 +41,11 @@ to a third-party API by default.
 - **Self-modification**: Noah can propose changes to its own source code,
   staged as a draft git branch/commit for you to review and approve or
   discard before anything touches `master`.
+- **Vision** (off by default): point a webcam at Noah and he can notice when
+  someone familiar — or unfamiliar — shows up, and say something about it.
+  Enrollment is chat-driven: attach a photo and say "remember this face as
+  X." Runs entirely locally and CPU-only. See `VISION_SETUP.md`, especially
+  its Privacy section, before enabling.
 
 ## Architecture
 
@@ -71,6 +76,7 @@ graph TD
 public/            chat UI (static HTML/JS)
 server.ts          main server — routing, Ollama calls, all the pipelines
 speech/            local Whisper (STT) + Kokoro (TTS) service
+vision/            local camera + facial recognition service (off by default)
 fusion-bridge/      Fusion 360 add-in (NoahFusionBridge) — executes CAD code
 image23d/          Hunyuan3D-2, vendored, for image-to-3D generation; also
                    mesh repair (repair_mesh.py) ahead of Fusion import/print
@@ -91,6 +97,7 @@ has its own detailed one-time setup doc:
 3. [`FUSION_SETUP.md`](FUSION_SETUP.md) — the Fusion 360 add-in
 4. [`HUNYUAN3D_SETUP.md`](HUNYUAN3D_SETUP.md) — the Hunyuan3D-2 venv
 5. [`PRINTER_SETUP.md`](PRINTER_SETUP.md) — slicing + printing on a Bambu Lab printer
+6. [`VISION_SETUP.md`](VISION_SETUP.md) — camera-based facial recognition (off by default — read its Privacy section first)
 
 `npm run dev` uses `tsx watch` and auto-reloads on file changes — what you
 want day to day. `npm start` runs the compiled build (`npm run build`

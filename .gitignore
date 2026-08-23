@@ -13,5 +13,8 @@ image23d/Hunyuan3D-2/__pycache__/
 image23d/Hunyuan3D-2/hy3dgen.egg-info/
 image23d/Hunyuan3D-2/output_test.*
 image23d/tmp/
+vision/venv/
+vision/__pycache__/
+vision/faces.json
 fusion-bridge/NoahFusionBridge/__pycache__/
 public/generated-models/
