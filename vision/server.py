@@ -87,6 +87,12 @@ _state_lock = threading.Lock()
 _pending_events = []
 _current_identity = None  # None | "unknown" | a known name
 _last_announced = {}  # name-or-"unknown" -> unix timestamp
+# Tracks whether the last scan tick could actually open the camera, separate
+# from _current_identity being None (which also means "nobody's there") —
+# without this, a camera the OS won't hand over (confirmed directly: the
+# Windows Camera app holds it exclusively and blocks DirectShow entirely)
+# looks identical to a genuinely empty room to anything reading /status.
+_camera_reachable = True
 
 
 def capture_one_frame():
@@ -106,7 +112,7 @@ def capture_one_frame():
 
 
 def scan_loop():
-    global _current_identity
+    global _current_identity, _camera_reachable
     while True:
         try:
             frame = capture_one_frame()
@@ -121,6 +127,7 @@ def scan_loop():
                     identity = matched_name if matched_name else "unknown"
 
             with _state_lock:
+                _camera_reachable = frame is not None
                 if identity != _current_identity:
                     _current_identity = identity
                     if identity is not None:
@@ -157,6 +164,15 @@ async def pending_event():
         if _pending_events:
             return _pending_events.pop(0)
     return None
+
+
+@app.get("/status")
+async def status():
+    # Unlike /pending-event (pop-once, for the proactive-greeting poll), this
+    # is read-only — for a direct "who's there right now" style question,
+    # which shouldn't consume/clear the event queue as a side effect.
+    with _state_lock:
+        return {"identity": _current_identity, "camera_ok": _camera_reachable}
 
 
 @app.post("/enroll")
