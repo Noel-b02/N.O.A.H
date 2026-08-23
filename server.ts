@@ -3516,3 +3516,16 @@ function shutdown(signal: string) {
 
 process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("SIGTERM", () => shutdown("SIGTERM"));
+// Node documents that Windows delivers SIGHUP when the console window itself
+// is closed (as opposed to Ctrl+C, which is SIGINT) — without this, closing
+// the terminal window leaves the speech/vision child processes running as
+// orphans (camera and mic still active) even though the main server is gone.
+process.on("SIGHUP", () => shutdown("SIGHUP"));
+// Last-resort backstop for any other exit path (an uncaught exception, or
+// something elsewhere calling process.exit() directly without going through
+// shutdown() above) — kill() is fire-and-forget, so it's safe to call here
+// even though 'exit' handlers can't do async work.
+process.on("exit", () => {
+  stopSpeechService();
+  stopVisionService();
+});
