@@ -2,6 +2,7 @@ import json
 import os
 import threading
 import time
+from collections import deque
 
 import cv2
 import numpy as np
@@ -23,11 +24,17 @@ load_dotenv()
 # produced a correct detection + embedding on the first real test.
 FACE_MODEL_NAME = os.environ.get("VISION_FACE_MODEL", "buffalo_l")
 CAMERA_INDEX = int(os.environ.get("VISION_CAMERA_INDEX", "0"))
-SCAN_INTERVAL_SECONDS = float(os.environ.get("VISION_SCAN_INTERVAL_SECONDS", "4"))
+SCAN_INTERVAL_SECONDS = float(os.environ.get("VISION_SCAN_INTERVAL_SECONDS", "2"))
 # ArcFace/buffalo_l's typical practical operating point for cosine
 # similarity on webcam-quality images — not a universal constant, hence an
 # env var override rather than a hardcoded assumption.
 MATCH_THRESHOLD = float(os.environ.get("VISION_MATCH_THRESHOLD", "0.4"))
+# A single scan tick is a coin flip against a bad angle/lighting moment —
+# confirmed live: the same enrolled person flickered between their name and
+# "unknown" across consecutive ticks. Rather than trusting one frame,
+# identity is now decided from the last N ticks: a match in even one of
+# them counts, so a brief bad frame doesn't erase an otherwise-solid read.
+RECOGNITION_WINDOW = int(os.environ.get("VISION_RECOGNITION_WINDOW", "5"))
 # Long enough that stepping out of frame briefly (e.g. to grab coffee)
 # doesn't retrigger a greeting; short enough that a genuinely new visit
 # later the same day does.
@@ -87,6 +94,10 @@ _state_lock = threading.Lock()
 _pending_events = []
 _current_identity = None  # None | "unknown" | a known name
 _last_announced = {}  # name-or-"unknown" -> unix timestamp
+# Raw per-tick reads (only appended when the camera actually produced a
+# frame) — _current_identity is derived from this window, not from any
+# single tick. See compute_effective_identity below.
+_recent_identities = deque(maxlen=RECOGNITION_WINDOW)
 # Tracks whether the last scan tick could actually open the camera, separate
 # from _current_identity being None (which also means "nobody's there") —
 # without this, a camera the OS won't hand over (confirmed directly: the
@@ -111,12 +122,24 @@ def capture_one_frame():
         cap.release()
 
 
+def compute_effective_identity(window):
+    # Most recent named match wins over anything else in the window — a
+    # solid recognition a couple of ticks ago should survive one bad-angle
+    # "unknown" frame in between, not get erased by it.
+    for identity in reversed(window):
+        if identity is not None and identity != "unknown":
+            return identity
+    if "unknown" in window:
+        return "unknown"
+    return None
+
+
 def scan_loop():
     global _current_identity, _camera_reachable
     while True:
         try:
             frame = capture_one_frame()
-            identity = None
+            raw_identity = None
             if frame is not None:
                 faces = face_app.get(frame)
                 if faces:
@@ -124,10 +147,16 @@ def scan_loop():
                     # feature doesn't need — just take the largest face.
                     largest = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
                     matched_name = best_match(largest.embedding)
-                    identity = matched_name if matched_name else "unknown"
+                    raw_identity = matched_name if matched_name else "unknown"
 
             with _state_lock:
                 _camera_reachable = frame is not None
+                # A failed capture isn't evidence of anything — skip it
+                # rather than let it count as a "nobody's there" vote.
+                if frame is not None:
+                    _recent_identities.append(raw_identity)
+                identity = compute_effective_identity(_recent_identities)
+
                 if identity != _current_identity:
                     _current_identity = identity
                     if identity is not None:
