@@ -4,6 +4,7 @@ import { execFileSync, spawn, ChildProcess } from 'child_process';
 import path from 'path';
 import dotenv from 'dotenv';
 import { randomUUID } from 'crypto';
+import { startTelegramBot } from './telegram';
 
 dotenv.config();
 
@@ -801,6 +802,7 @@ async function withGpuExclusive<T>(fn: () => Promise<T>): Promise<T> {
 
 startSpeechService();
 startVisionService();
+startTelegramBot();
 
 // --- Bambu Connect (official print handoff) ---
 // See PRINTER_SETUP.md. Bambu Lab's own desktop relay app — chosen over a
@@ -1000,12 +1002,24 @@ function extractFusionSubject(message: string): string {
   return cleaned && !/^(this|that|it)$/i.test(cleaned) ? cleaned : "the provided reference image";
 }
 
+// Requires an explicit "3d model"/"cad model"/"in fusion" mention alongside
+// a creation verb — kept deliberately narrow since this triggers real code
+// execution inside a running Fusion 360 session, not just a chat response.
+// Top-level (moved out of the handler) so isStickySearchFollowup can test
+// against it directly — confirmed live that a sticky search/headlines
+// follow-up window swallowed an unrelated, clearly-distinct request ("make
+// me an image of X" right after a headlines exchange) before it ever
+// reached its own trigger pattern, since isStickySearchFollowup is computed
+// before looksLikeFusionRequest/looksLikeImageGenRequest exist as
+// variables and couldn't previously exclude either of them.
+const FUSION_TRIGGER_PATTERN = /\b(create|make|generate|build|design|remove|delete|clear)\b.{0,40}\b(3d models?|3d shapes?|cad models?|in fusion(?: ?360)?)\b/i;
+
 // Plain "generate an image of X" is a different intent than a 3D-model
-// request: FUSION_TRIGGER_PATTERN (below, in /api/chat) requires an
-// explicit "3d model"/"cad model"/"in fusion" phrase, this one requires an
-// image/picture noun instead, so the two are disjoint by construction for
-// any normal message. Top-level (not handler-local, unlike most other
-// trigger patterns) since extractImageGenPrompt below also needs it.
+// request: FUSION_TRIGGER_PATTERN above requires an explicit "3d model"/
+// "cad model"/"in fusion" phrase, this one requires an image/picture noun
+// instead, so the two are disjoint by construction for any normal message.
+// Top-level (not handler-local, unlike most other trigger patterns) since
+// extractImageGenPrompt below and isStickySearchFollowup both need it.
 const IMAGE_GEN_TRIGGER_PATTERN = /\b(create|make|generate|draw|paint|design)\b.{0,40}\b(image|picture|photo|illustration|artwork|drawing|painting|wallpaper)\b/i;
 
 // Restyling an attached photo via SDXL img2img — "make this look like a
@@ -2557,7 +2571,7 @@ app.post('/api/transcribe', express.raw({ type: '*/*', limit: '25mb' }), async (
 // API: Text-to-speech — forwards text to the local Piper service and streams
 // back the resulting WAV audio.
 app.post('/api/speak', async (req, res) => {
-  const { text } = req.body;
+  const { text, format } = req.body as { text?: string; format?: "wav" | "ogg" };
   if (!text || !text.trim()) {
     return res.status(400).json({ error: "text is required." });
   }
@@ -2566,7 +2580,7 @@ app.post('/api/speak', async (req, res) => {
     const response = await fetch(`${SPEECH_SERVICE_URL}/speak`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text })
+      body: JSON.stringify({ text, ...(format ? { format } : {}) })
     });
 
     if (!response.ok) {
@@ -2575,7 +2589,10 @@ app.post('/api/speak', async (req, res) => {
     }
 
     const audioBuffer = Buffer.from(await response.arrayBuffer());
-    res.set('Content-Type', 'audio/wav');
+    // Defaults to wav (existing web UI behavior, unchanged) — must match
+    // whatever format was actually requested, since Telegram voice notes
+    // need an accurate audio/ogg label, not a hardcoded audio/wav one.
+    res.set('Content-Type', format === 'ogg' ? 'audio/ogg' : 'audio/wav');
     res.send(audioBuffer);
   } catch (err: any) {
     console.error("Speech synthesis failed:", err.message);
@@ -2783,7 +2800,10 @@ app.post('/api/chat', async (req, res) => {
   );
 
   // A follow-up on an already-answered recall query (e.g. "give me specifics", "quote it") — doesn't re-trigger isRecallQuery on its own, but should still get the archived context and the smarter model.
-  const isStickyRecallFollowup = !wantsModification && !isRecallQuery && stickyRecallTurnsRemaining > 0;
+  // Same exclusions as isStickySearchFollowup below and for the same
+  // confirmed-live reason — an unrelated, clearly-distinct request landing
+  // during this sticky window shouldn't get swallowed by it either.
+  const isStickyRecallFollowup = !wantsModification && !isRecallQuery && !looksLikeMeshEditRequest && !looksLikeFaceEnrollRequest && !looksLikeImageEditRequest && !FUSION_TRIGGER_PATTERN.test(message) && !IMAGE_GEN_TRIGGER_PATTERN.test(message) && stickyRecallTurnsRemaining > 0;
 
   // "What does core integrity mean" is answered fine from the general explanation now in personality.txt — but "why isn't it 100%" or "what's down" needs the actual live health state, which the model has no way to
   // know on its own. This always fetches fresh (no sticky reuse): unlike a search result, service health can flip within seconds, so reusing stale
@@ -2813,13 +2833,19 @@ app.post('/api/chat', async (req, res) => {
   // A follow-up on an already-answered search or headlines request (e.g.
   // "give me the link to the sites you used", "which one said that") —
   // needs the same results (with real URLs) rather than the model
-  // improvising from its own summary.
-  const isStickySearchFollowup = !wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeStatusQuery && !looksLikeVisionStatusQuery && !looksLikeHeadlinesQuery && !looksLikeSearchQuery && stickySearchTurnsRemaining > 0;
+  // improvising from its own summary. Confirmed live: without the explicit
+  // mesh-edit/face-enroll/image-edit/fusion/image-gen exclusions below, an
+  // unrelated request landing right after a search/headlines exchange (e.g.
+  // "make me an image of a cyberpunk diner" a couple of turns after asking
+  // for headlines) got swallowed into this sticky-followup path instead of
+  // ever reaching its own, much more specific trigger pattern. The first
+  // three flags are already computed by this point in the file and can be
+  // referenced directly; FUSION_TRIGGER_PATTERN/IMAGE_GEN_TRIGGER_PATTERN
+  // are tested directly (not via looksLikeFusionRequest/looksLikeImageGenRequest,
+  // which aren't computed yet) for the same TDZ-ordering reason
+  // looksLikeImageEditRequest carries its own self-contained exclusion above.
+  const isStickySearchFollowup = !wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeStatusQuery && !looksLikeVisionStatusQuery && !looksLikeHeadlinesQuery && !looksLikeSearchQuery && !looksLikeMeshEditRequest && !looksLikeFaceEnrollRequest && !looksLikeImageEditRequest && !FUSION_TRIGGER_PATTERN.test(message) && !IMAGE_GEN_TRIGGER_PATTERN.test(message) && stickySearchTurnsRemaining > 0;
 
-  // Requires an explicit "3d model"/"cad model"/"in fusion" mention alongside
-  // a creation verb — kept deliberately narrow since this triggers real code
-  // execution inside a running Fusion 360 session, not just a chat response.
-  const FUSION_TRIGGER_PATTERN = /\b(create|make|generate|build|design|remove|delete|clear)\b.{0,40}\b(3d models?|3d shapes?|cad models?|in fusion(?: ?360)?)\b/i;
   const looksLikeFusionRequest = !looksLikeMeshEditRequest && !wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeStatusQuery && !looksLikeVisionStatusQuery && !looksLikeHeadlinesQuery && !looksLikeSearchQuery && !isStickySearchFollowup && FUSION_TRIGGER_PATTERN.test(message);
 
   // A Fusion request either describes explicit parametric geometry (shape

@@ -77,6 +77,11 @@ to a third-party API by default.
   Enrollment is chat-driven: attach a photo and say "remember this face as
   X." Runs entirely locally and CPU-only. See `VISION_SETUP.md`, especially
   its Privacy section, before enabling.
+- **Telegram bot**: text or send voice notes to Noah from anywhere, not just
+  the local web UI, and get text + voice-note replies back — the bridge
+  reuses Noah's real chat handler, so it can do everything the web UI can.
+  Uses long-polling, so no public internet exposure is needed. See
+  `TELEGRAM_SETUP.md`.
 
 ## Architecture
 
@@ -113,6 +118,7 @@ public/            chat UI (static HTML/JS)
 server.ts          main server — routing, Ollama calls, all the pipelines
 speech/            local Whisper (STT) + Kokoro (TTS) service
 vision/            local camera + facial recognition service (off by default)
+telegram.ts        Telegram bot bridge — long-polling, no public exposure
 fusion-bridge/      Fusion 360 add-in (NoahFusionBridge) — executes CAD code
 image23d/          Hunyuan3D-2, vendored, for image-to-3D generation; also
                    mesh repair (repair_mesh.py) ahead of Fusion import/print
@@ -134,6 +140,7 @@ has its own detailed one-time setup doc:
 4. [`HUNYUAN3D_SETUP.md`](HUNYUAN3D_SETUP.md) — the Hunyuan3D-2 venv
 5. [`PRINTER_SETUP.md`](PRINTER_SETUP.md) — slicing + printing on a Bambu Lab printer
 6. [`VISION_SETUP.md`](VISION_SETUP.md) — camera-based facial recognition (off by default — read its Privacy section first)
+7. [`TELEGRAM_SETUP.md`](TELEGRAM_SETUP.md) — text/voice-note chat with Noah from anywhere
 
 `npm run dev` uses `tsx watch` and auto-reloads on file changes — what you
 want day to day. `npm start` runs the compiled build (`npm run build`

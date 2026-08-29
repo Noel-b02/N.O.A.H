@@ -13,3 +13,8 @@ faster-whisper
 kokoro>=0.9.4
 soundfile
 numpy
+# Already installed transitively via faster-whisper (it bundles its own
+# FFmpeg libs for audio decoding), but declared explicitly here since /speak
+# now also uses it directly to encode Ogg/Opus voice notes for Telegram —
+# an undeclared transitive dependency is too fragile to build a feature on.
+av
