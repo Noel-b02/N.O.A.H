@@ -419,12 +419,13 @@ output on dynamic poses.
 
 A standalone capability, separate from everything above: "generate an
 image of X" produces a picture shown inline in the chat, with no 3D
-pipeline involved at all. Scoped deliberately narrow — text-to-image
-only, no editing/img2img of an attached photo (that would make attaching
-an image a 3-way ambiguity against the existing "reconstruct as 3D
-model" / "use as pose reference" meanings) — and images are persisted
-(save/discard), mirroring the 3D model registry rather than being
-ephemeral.
+pipeline involved at all. Scoped deliberately narrow at the time —
+text-to-image only, no editing/img2img of an attached photo (that would
+make attaching an image a 3-way ambiguity against the existing
+"reconstruct as 3D model" / "use as pose reference" meanings; a fourth
+meaning was added later, see "Image editing / restyling" below) — and
+images are persisted (save/discard), mirroring the 3D model registry
+rather than being ephemeral.
 
 1. **Reuses proven infrastructure end to end.** `image23d/generate_image.py`
    is a plain `StableDiffusionXLPipeline` (no ControlNet) — the same SDXL
@@ -471,6 +472,66 @@ ephemeral.
    Confirmed regressions: a plain weather/chat question is entirely
    unaffected, and the 3D-model trigger patterns remain mutually
    exclusive with the new one under direct testing.
+
+## Image editing / restyling (implemented)
+
+The fourth meaning of "attach an image": broad restyling of an attached
+photo ("make this look like a watercolor painting", "make it darker and
+moodier"), via SDXL img2img rather than a dedicated instruction-based
+edit model — a deliberate scope choice (precise, localized edits like
+"change the car to red" would need the latter) that let this reuse the
+existing SDXL infrastructure with zero new model download.
+
+1. **`image23d/edit_image.py`, mirroring `generate_image.py`.** Same
+   venv, same `stabilityai/stable-diffusion-xl-base-1.0` weights (already
+   cached locally) — `StableDiffusionXLImg2ImgPipeline` shares the base
+   pipeline's unet/vae/text-encoders, confirmed no new download needed.
+   Input photos are fit within a 1024x1024 box preserving aspect ratio
+   (never hard-cropped to a square) and rounded to a multiple of 8 for
+   the VAE.
+
+2. **A bare style name doesn't work — confirmed live, this took real
+   iteration to find.** "a watercolor painting" alone, at any strength
+   tested, at best did nothing and at worst still looked fully
+   photorealistic. Neither a stronger negative prompt (explicitly
+   discouraging "photograph, realistic") nor generic quality boosters
+   ("highly detailed") fixed this. Only concrete medium/texture language
+   did ("soft brushstrokes, visible paint texture, color bleeding").
+   `IMAGE_EDIT_STYLE_EXPANSIONS` in `server.ts` maps every style/mood
+   keyword `IMAGE_EDIT_TRIGGER_PATTERN` recognizes to language confirmed
+   to actually work, via `buildImageEditPrompt()` — the SDXL prompt is
+   never the raw user message.
+
+3. **No fixed seed means outcome quality is genuinely random per run,
+   independent of the prompt** — confirmed directly: the *identical*
+   prompt and strength (0.7) produced a clear, convincing watercolor
+   restyle on one run and a near-untouched photorealistic result on the
+   next, repeatedly. This is a real, known limitation of this approach,
+   not a bug to chase further right now: 0.6 was consistently too subtle
+   regardless of seed; 0.8 (the current default) was clearly more
+   consistent across many repeated runs, but not bulletproof — expect an
+   occasional run that comes back only weakly restyled. Fixing this
+   properly would mean either accepting heavier identity drift from a
+   higher strength, or a more involved change (e.g. detecting a
+   too-similar-to-source result and automatically retrying).
+
+4. **Two required collision fixes**, not just a new trigger pattern.
+   `wantsModification`'s regex already matches the literal word "edit" —
+   "edit this photo to look like a painting" would otherwise misroute
+   into the self-modification flow, the same failure class already fixed
+   once for mesh editing and face enrollment. Separately,
+   `IMAGE_GEN_TRIGGER_PATTERN`'s "make ... photo" genuinely matches "make
+   this photo darker," so `looksLikeImageGenRequest` needed an explicit
+   exclusion too, confirmed via direct testing, not just added
+   defensively.
+
+5. **Live-verified**, including the specific failure mode this was built
+   to avoid: "can you edit this photo to look like a painting" correctly
+   restyles the photo rather than falling into self-modification.
+   Regressions confirmed unaffected: plain text-to-image generation, a
+   genuine self-modification request, face enrollment with an attached
+   photo, and "make a 3d model of this" (still routes to the image-to-3D
+   pipeline, not restyling, via `IMAGE_EDIT_3D_EXCLUDE_PATTERN`).
 
 ## What's next
 

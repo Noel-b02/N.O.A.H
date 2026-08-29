@@ -60,6 +60,10 @@ const SKELETON_SCRIPT = path.join(IMAGE23D_DIR, "extract_pose_skeleton.py");
 // Plain SDXL text-to-image, no ControlNet — same venv/model as
 // POSE_SEED_SCRIPT, just without the pose-conditioning machinery.
 const IMAGE_GEN_SCRIPT = path.join(IMAGE23D_DIR, "generate_image.py");
+// SDXL img2img restyling of an attached photo — same base model/venv as
+// IMAGE_GEN_SCRIPT, just a different pipeline wrapper class, so this needed
+// zero new model download.
+const IMAGE_EDIT_SCRIPT = path.join(IMAGE23D_DIR, "edit_image.py");
 
 // Lives under public/ so express.static() serves the .glb files directly —
 // no separate file-serving endpoint needed. Kept distinct from
@@ -1003,6 +1007,87 @@ function extractFusionSubject(message: string): string {
 // any normal message. Top-level (not handler-local, unlike most other
 // trigger patterns) since extractImageGenPrompt below also needs it.
 const IMAGE_GEN_TRIGGER_PATTERN = /\b(create|make|generate|draw|paint|design)\b.{0,40}\b(image|picture|photo|illustration|artwork|drawing|painting|wallpaper)\b/i;
+
+// Restyling an attached photo via SDXL img2img — "make this look like a
+// watercolor painting", "turn this into anime style", "make it darker and
+// moodier". First-pass wording, several named sub-patterns OR'd together
+// (same convention as the mesh-edit patterns) rather than one dense regex,
+// so each phrasing shape can be retuned independently once live use turns
+// up a miss — exactly what happened to ENROLL_FACE_TRIGGER_PATTERN before
+// it grew past its first "as X" construction.
+const IMAGE_EDIT_TRIGGER_PATTERN = /\b((make|turn|edit|convert) (this|it)( photo| image| picture)?\s*(to\s+)?(look like|into)|(restyle|reimagine|redo|edit) (this|it)( photo| image| picture)? as|in the style of|as an? (watercolor|oil painting|painting|sketch|cartoon|anime|pixel art|comic|impressionist|pencil drawing)|make (this|it)( photo| image| picture)? (darker|brighter|moodier|lighter|warmer|cooler|more (vibrant|dramatic|vintage|cinematic|dreamy)|black and white|monochrome|sepia))\b/i;
+// Computed before wantsModification/looksLikeFusionRequest exist as
+// variables (see below), so this can't reference looksLikeFusionRequest —
+// carries its own self-contained 3D-vocabulary exclusion instead, mirroring
+// looksLikeImageFusionRequest's own !SHAPE_WORD_PATTERN guard. Without
+// this, "turn this into a 3d model" would get misrouted to SDXL restyling
+// instead of falling through to the actual image-to-3D pipeline.
+const IMAGE_EDIT_3D_EXCLUDE_PATTERN = /\b(3d models?|3d shapes?|cad models?|mesh|\.stl|\.glb|printable)\b/i;
+
+// The reply text / registry subject — a short human-readable label, e.g.
+// "a watercolor painting" or "darker and moodier". Handles both the
+// style-tail constructions ("look like X" / "as X") and the mood-adjective
+// construction ("make it X"), which don't share a common tail shape. Falls
+// back the same way extractImageGenPrompt does when nothing usable is found.
+function extractImageEditSubject(message: string): string {
+  const styleMatch = message.match(/\b(?:look like|into|as|in the style of)\s+(.+)$/i);
+  if (styleMatch) return styleMatch[1].replace(/[?.!]+$/, "").trim() || "the restyled photo";
+  const moodMatch = message.match(/\bmake (?:this|it)(?: photo| image| picture)?\s+(.+)$/i);
+  if (moodMatch) return moodMatch[1].replace(/[?.!]+$/, "").trim() || "the restyled photo";
+  return "the restyled photo";
+}
+
+// Confirmed live, not assumed: a bare style name alone ("a watercolor
+// painting") does NOT reliably push SDXL img2img away from the input
+// photo's own photographic prior — neither higher strength, nor a
+// negative-prompt push against realism, nor generic quality boosters
+// ("highly detailed") produced a visible effect in testing. Only concrete
+// medium/texture language did (soft brushstrokes, visible paint texture,
+// etc.). This maps each style/mood keyword IMAGE_EDIT_TRIGGER_PATTERN
+// recognizes to language confirmed to actually work. Multiple matches (e.g.
+// "darker and moodier") are combined rather than picking just one.
+const IMAGE_EDIT_STYLE_EXPANSIONS: Record<string, string> = {
+  "watercolor": "watercolor painting, soft brushstrokes, visible paint texture, color bleeding, artistic",
+  "oil painting": "oil painting, thick visible brushstrokes, canvas texture, painterly",
+  "painting": "painting, visible brushstrokes, painterly texture, artistic",
+  "sketch": "pencil sketch, hand-drawn linework, cross-hatching, sketchbook style",
+  "pencil drawing": "pencil drawing, graphite shading, hand-drawn linework",
+  "cartoon": "cartoon illustration, bold outlines, flat cel-shaded colors, stylized",
+  "anime": "anime illustration, cel-shaded, clean linework, vibrant anime art style",
+  "pixel art": "pixel art, blocky pixels, limited color palette, retro game art style",
+  "comic": "comic book illustration, bold ink outlines, halftone shading",
+  "impressionist": "impressionist painting, loose visible brushstrokes, soft color blending",
+  "darker": "darker, dramatic low-key lighting, deep shadows, dark moody background",
+  "moodier": "moody atmosphere, dramatic shadows, dark desaturated tones",
+  "brighter": "bright even lighting, airy, high-key lighting",
+  "lighter": "lighter tones, soft bright lighting",
+  "warmer": "warm golden lighting, amber tones",
+  "cooler": "cool blue-toned lighting, cold color grading",
+  "vibrant": "vibrant saturated colors, punchy contrast",
+  "dramatic": "dramatic lighting, strong shadows, cinematic contrast",
+  "vintage": "vintage film photo, faded colors, film grain, retro color grading",
+  "cinematic": "cinematic lighting, film color grading, dramatic composition",
+  "dreamy": "dreamy soft focus, glowing light, ethereal atmosphere",
+  "black and white": "black and white, monochrome, high contrast grayscale",
+  "monochrome": "monochrome, single-tone color grading",
+  "sepia": "sepia tone, warm brown vintage color grading"
+};
+
+// The actual SDXL prompt — deliberately different from the cosmetic
+// subject above. Looks up every matching keyword against the combined
+// subject+message text and concatenates their expansions; an unrecognized
+// style/mood word (not in the table above) falls back to a best-effort
+// generic descriptor, which testing showed is meaningfully weaker than a
+// table hit but still better than the bare phrase alone.
+function buildImageEditPrompt(message: string, subject: string): string {
+  const haystack = `${subject} ${message}`.toLowerCase();
+  const matches = Object.entries(IMAGE_EDIT_STYLE_EXPANSIONS)
+    .filter(([keyword]) => haystack.includes(keyword))
+    .map(([, expansion]) => expansion);
+  return matches.length > 0
+    ? matches.join(", ")
+    : `${subject}, distinct art style, visible medium texture, strong stylistic rendering`;
+}
 
 // Pulls the descriptive part out of an image-generation request.
 // Deliberately simpler than extractFusionSubject: image prompts are
@@ -1989,6 +2074,48 @@ function generateImage(prompt: string, outputPath: string): Promise<GeneratedIma
   });
 }
 
+// SDXL img2img restyling — identical shape to generateImage above, just
+// spawning edit_image.py with an extra input-image-path argument ahead of
+// the prompt. Reuses GeneratedImageResult; no new type needed.
+function editImage(inputPath: string, prompt: string, outputPath: string): Promise<GeneratedImageResult> {
+  return new Promise((resolve) => {
+    if (!fs.existsSync(HUNYUAN3D_PYTHON)) {
+      resolve({ success: false, error: `Hunyuan3D venv not found at ${HUNYUAN3D_PYTHON}.` });
+      return;
+    }
+
+    const child = spawn(HUNYUAN3D_PYTHON, [IMAGE_EDIT_SCRIPT, inputPath, prompt, outputPath], {
+      env: { ...process.env, HF_HUB_DISABLE_XET: "1" }
+    });
+
+    let stderr = "";
+    child.stderr.on("data", (d) => { stderr += d.toString(); });
+
+    const timeout = setTimeout(() => {
+      child.kill();
+      resolve({ success: false, error: "Image editing timed out after 10 minutes." });
+    }, 600000);
+
+    child.on("error", (err) => {
+      clearTimeout(timeout);
+      resolve({ success: false, error: `Failed to launch image editing: ${err.message}` });
+    });
+
+    child.on("exit", (code) => {
+      clearTimeout(timeout);
+      if (code !== 0) {
+        resolve({ success: false, error: stderr.trim().slice(-2000) || `Image editing exited with code ${code}` });
+        return;
+      }
+      if (!fs.existsSync(outputPath)) {
+        resolve({ success: false, error: "Image editing finished but didn't produce an output image." });
+        return;
+      }
+      resolve({ success: true, imagePath: outputPath });
+    });
+  });
+}
+
 interface PoseSkeletonReport {
   usable: boolean;
   reason: string | null;
@@ -2624,13 +2751,24 @@ app.post('/api/chat', async (req, res) => {
   const looksLikeFaceEnrollRequest = faceEnrollName !== null;
   console.log("LOOKS LIKE FACE ENROLL REQUEST:", looksLikeFaceEnrollRequest, "| name:", faceEnrollName);
 
+  // "Edit this photo to look like a painting" contains "edit," which
+  // wantsModification's own regex below would otherwise swallow, misrouting
+  // image restyling into the self-modification flow — same collision, same
+  // fix pattern as looksLikeMeshEditRequest/looksLikeFaceEnrollRequest
+  // above. Gated on hasAttachedImage since there's nothing to restyle
+  // without a photo, with its own 3D-vocabulary exclusion (rather than
+  // referencing looksLikeFusionRequest, which doesn't exist as a variable
+  // yet at this point in the file).
+  const looksLikeImageEditRequest = hasAttachedImage && !looksLikeMeshEditRequest && !looksLikeFaceEnrollRequest && !IMAGE_EDIT_3D_EXCLUDE_PATTERN.test(message) && IMAGE_EDIT_TRIGGER_PATTERN.test(message);
+  console.log("LOOKS LIKE IMAGE EDIT REQUEST:", looksLikeImageEditRequest);
+
   // "No changes to your personality" / "I didn't change anything" mention the
   // keyword while explicitly saying nothing should happen — without this,
   // they trip wantsModification just as wrongly as "do you remember" tripped
   // it on the word "remember" (see REMEMBER_QUESTION_PATTERN above).
   const NEGATED_MODIFICATION_PATTERN = /\b(no|not|don'?t|didn'?t|without|never)\s+(\w+\s+){0,2}(changes?|modif(y|ication)|updates?)\b/i;
 
-  const wantsModification = !looksLikeMeshEditRequest && !looksLikeFaceEnrollRequest && !NEGATED_MODIFICATION_PATTERN.test(message) && (
+  const wantsModification = !looksLikeMeshEditRequest && !looksLikeFaceEnrollRequest && !looksLikeImageEditRequest && !NEGATED_MODIFICATION_PATTERN.test(message) && (
     (REMEMBER_QUESTION_PATTERN.test(message) || FORGETFUL_STATEMENT_PATTERN.test(message))
       ? /(modify|change|rewrite|update|edit|improve|refactor|memorize|store|save)/i.test(message)
       : /(modify|change|rewrite|update|edit|improve|refactor|remember|memorize|store|save)/i.test(message)
@@ -2706,7 +2844,11 @@ app.post('/api/chat', async (req, res) => {
   // vocabulary, so !looksLikeFusionRequest below is just the same "exclude
   // everything computed before it" convention every flag here follows, not
   // a sign of real collision risk.
-  const looksLikeImageGenRequest = !looksLikeMeshEditRequest && !wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeStatusQuery && !looksLikeVisionStatusQuery && !looksLikeHeadlinesQuery && !looksLikeSearchQuery && !isStickySearchFollowup && !looksLikeFusionRequest && IMAGE_GEN_TRIGGER_PATTERN.test(message);
+  // !looksLikeImageEditRequest matters here, not just for consistency —
+  // IMAGE_GEN_TRIGGER_PATTERN's "make ... photo" actually matches "make
+  // this photo darker," so without this an attached-photo mood request
+  // would tie with plain text-to-image generation.
+  const looksLikeImageGenRequest = !looksLikeMeshEditRequest && !looksLikeImageEditRequest && !wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeStatusQuery && !looksLikeVisionStatusQuery && !looksLikeHeadlinesQuery && !looksLikeSearchQuery && !isStickySearchFollowup && !looksLikeFusionRequest && IMAGE_GEN_TRIGGER_PATTERN.test(message);
   console.log("LOOKS LIKE IMAGE GEN REQUEST:", looksLikeImageGenRequest);
 
   // Ollama's "thinking" mode measurably improves how carefully the model reasons through a request, but costs ~10-15+ seconds of extra latency
@@ -2740,7 +2882,7 @@ app.post('/api/chat', async (req, res) => {
   const looksLikeDocumentQuestion = hasActiveDocument && !wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeStatusQuery && !looksLikeVisionStatusQuery && !looksLikeHeadlinesQuery && !looksLikeSearchQuery && !isStickySearchFollowup && !looksLikeFusionRequest && !looksLikeImageGenRequest;
   console.log("LOOKS LIKE DOCUMENT QUESTION:", looksLikeDocumentQuestion);
 
-  const isComplex = wantsModification || isRecallQuery || isStickyRecallFollowup || looksLikeStatusQuery || looksLikeVisionStatusQuery || looksLikeHeadlinesQuery || looksLikeSearchQuery || isStickySearchFollowup || looksLikeFusionRequest || looksLikeMeshEditRequest || looksLikeImageGenRequest || looksLikeDocumentQuestion || (
+  const isComplex = wantsModification || isRecallQuery || isStickyRecallFollowup || looksLikeStatusQuery || looksLikeVisionStatusQuery || looksLikeHeadlinesQuery || looksLikeSearchQuery || isStickySearchFollowup || looksLikeFusionRequest || looksLikeMeshEditRequest || looksLikeImageGenRequest || looksLikeImageEditRequest || looksLikeDocumentQuestion || (
     wordCount > 5 && /(typescript|javascript|debug|refactor|git|branch)/i.test(message)
   );
 
@@ -2868,7 +3010,7 @@ app.post('/api/chat', async (req, res) => {
   // conversations) and their "I have no record of that day" replies would
   // otherwise false-positive as uncertainty below — the search fallback only
   // makes sense for genuine open-ended chat turns, not those paths.
-  const isPlainChatTurn = !wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeStatusQuery && !looksLikeVisionStatusQuery && !looksLikeHeadlinesQuery && !looksLikeSearchQuery && !isStickySearchFollowup && !looksLikeFusionRequest && !looksLikeImageGenRequest;
+  const isPlainChatTurn = !wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeStatusQuery && !looksLikeVisionStatusQuery && !looksLikeHeadlinesQuery && !looksLikeSearchQuery && !isStickySearchFollowup && !looksLikeFusionRequest && !looksLikeImageGenRequest && !looksLikeImageEditRequest;
 
   const searchInstructions = isPlainChatTurn ? `
   If answering requires current or real-world information you don't already know — release dates, sports results, news, prices, "when does X come out", "who won Y" — do not guess or make something up. Instead, respond with EXACTLY this and nothing else, no other words:
@@ -3651,11 +3793,53 @@ Now generate code for this request: "${message}"`;
       });
     }
 
+    // Img2img restyling of an attached photo — SDXL, same venv/model as
+    // plain image generation just below, no new download. The SDXL prompt
+    // is built via buildImageEditPrompt, not the raw message — confirmed
+    // live that the raw conversational sentence ("make this look like a
+    // watercolor painting") produces no visible restyle at all; SDXL needs
+    // concrete descriptive language, not an instruction, and the expansion
+    // table supplies that for every style/mood word the trigger recognizes.
+    if (looksLikeImageEditRequest) {
+      const editSubject = extractImageEditSubject(message);
+      const editPrompt = buildImageEditPrompt(message, editSubject);
+      const inputPath = saveBase64ImageToFile(attachedImage!.base64, attachedImage!.mimeType);
+      const filename = `${Date.now()}.png`;
+      const outputPath = path.join(IMAGES_DIR, filename);
+      fs.mkdirSync(IMAGES_DIR, { recursive: true });
+
+      const editResult = await withGpuExclusive(() => editImage(inputPath, editPrompt, outputPath));
+      cleanupTempFiles([inputPath]);
+
+      let editReplyText: string;
+      let editedImage: GeneratedImageEntry | null = null;
+      if (editResult.success) {
+        editedImage = registerGeneratedImage(editSubject, filename);
+        editReplyText = `Here's the photo restyled as ${editSubject}.`;
+      } else {
+        editReplyText = `Something went wrong editing that photo: ${editResult.error}`;
+      }
+
+      conversationHistory.push(`Assistant: ${editReplyText}`);
+      saveHistory();
+      clearTimeout(timeout);
+
+      return res.json({
+        response: editReplyText,
+        hasProposedChanges: false,
+        ...(editedImage ? {
+          imageId: editedImage.id,
+          generatedImageUrl: `/generated-images/${editedImage.filename}`,
+          imageSubject: editedImage.subject
+        } : {})
+      });
+    }
+
     // Plain text-to-image generation — no ControlNet, no 3D pipeline, no
-    // Fusion involved. Explicitly does NOT support editing/img2img of an
-    // attached photo (deferred; see IMAGE_GEN_ROADMAP.md) — this is
-    // prompt-only, same posture as generatePoseGuidedSeed's canonical-pose
-    // path but standalone.
+    // Fusion involved. Attached-photo editing/restyling is handled by
+    // looksLikeImageEditRequest above; this branch is prompt-only, same
+    // posture as generatePoseGuidedSeed's canonical-pose path but
+    // standalone.
     if (looksLikeImageGenRequest) {
       const imageGenPrompt = extractImageGenPrompt(message);
       const filename = `${Date.now()}.png`;

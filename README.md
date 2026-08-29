@@ -60,6 +60,11 @@ to a third-party API by default.
     paint pipeline) — say "shape only" or "no texture" for the older,
     faster bare-geometry path. See `IMAGE_GEN_ROADMAP.md` for the full
     pipeline and what's headed next.
+- **Image editing**: attach a photo and ask Noah to restyle it ("make this
+  look like a watercolor painting", "make it darker and moodier") via SDXL
+  img2img — broad restyling, not pixel-precise edits. See
+  `IMAGE_GEN_ROADMAP.md`'s "Image editing / restyling" section for scope
+  and known limitations.
 - **3D printing**: a generated model can be repaired/validated, sliced with
   Bambu Studio, and sent to a Bambu Lab printer over the local network —
   Noah asks for explicit confirmation before anything actually prints. See
