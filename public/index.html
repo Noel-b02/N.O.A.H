@@ -846,7 +846,7 @@
         if (data.response) {
           const model = data.modelId ? { id: data.modelId, url: data.modelUrl, subject: data.modelSubject } : null;
           const image = data.imageId ? { id: data.imageId, url: data.generatedImageUrl, subject: data.imageSubject } : null;
-          appendMessage('assistant', data.response, model, image);
+          appendMessage('assistant', data.response, model, image, data.comparison || null);
           speakReply(data.response);
         }
 
@@ -1300,7 +1300,7 @@
     // the preview panel. Wired via addEventListener rather than an inline
     // onclick attribute so subject (arbitrary user-influenced text) never
     // has to be safely embedded inside an HTML attribute string.
-    function appendMessage(sender, text, model = null, image = null) {
+    function appendMessage(sender, text, model = null, image = null, comparison = null) {
       const msgId = 'msg-' + (++messageIdCounter);
       const div = document.createElement('div');
       div.id = msgId;
@@ -1325,6 +1325,16 @@
             <div class="mt-2 flex gap-2">
               <button class="save-image-btn text-[9px] font-mono tracking-widest text-cyan-400 border border-cyan-500/30 px-3 py-1.5 rounded hover:bg-cyan-500/10 uppercase transition duration-300">SAVE</button>
               <button class="discard-image-btn text-[9px] font-mono tracking-widest text-rose-400 border border-rose-500/30 px-3 py-1.5 rounded hover:bg-rose-500/10 uppercase transition duration-300">DISCARD</button>
+            </div>
+          ` : ''}
+          ${comparison ? `
+            <div class="mt-3 grid grid-cols-2 gap-3">
+              ${comparison.map(c => `
+                <div class="border border-cyan-500/20 rounded p-3 bg-black/20">
+                  <p class="text-[9px] font-mono tracking-widest text-cyan-400 font-extrabold mb-2">${escapeHtml(c.model)}</p>
+                  <p class="text-xs text-slate-300 leading-relaxed">${c.response !== null ? linkify(c.response).replace(/\n/g, '<br>') : `<span class="text-rose-400">(no response — error: ${escapeHtml(c.error || 'unknown')})</span>`}</p>
+                </div>
+              `).join('')}
             </div>
           ` : ''}
         `;

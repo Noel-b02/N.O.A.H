@@ -873,6 +873,55 @@ function getGpuStats(): GpuStats | null {
   }
 }
 
+// Real, live data (actual file sizes of models already pulled) — same
+// base-URL-rewrite trick already used for /api/version and /api/embeddings
+// above, applied to Ollama's own /api/tags endpoint. Not used anywhere in
+// this project before now.
+const OLLAMA_TAGS_URL = OLLAMA_URL.replace(/\/api\/generate$/, "/api/tags");
+
+interface PulledModel {
+  name: string;
+  sizeBytes: number;
+}
+
+async function listPulledModels(): Promise<PulledModel[]> {
+  try {
+    const res = await fetch(OLLAMA_TAGS_URL, { signal: AbortSignal.timeout(3000) });
+    if (!res.ok) return [];
+    const data = await res.json() as { models?: { name: string; size: number }[] };
+    return (data.models ?? []).map(m => ({ name: m.name, sizeBytes: m.size }));
+  } catch {
+    return [];
+  }
+}
+
+// Approximate VRAM figures for common Q4_K_M-quantization builds of models
+// a home user would realistically consider pulling — manually curated, NOT
+// live-confirmed the way the image-pipeline VRAM figures elsewhere in this
+// file are (those come from real measured peaks; these are reasonable
+// estimates for models that may not even be pulled yet). Needs occasional
+// manual upkeep as new model families become popular — an accepted,
+// deliberate limitation, not an oversight. The reply text built from this
+// table says so explicitly, not just this comment.
+const OLLAMA_MODEL_VRAM_TABLE: { name: string; approxVramGB: number }[] = [
+  { name: "llama3.2:1b", approxVramGB: 1.5 },
+  { name: "llama3.2:3b", approxVramGB: 2.5 },
+  { name: "llama3.1:8b", approxVramGB: 5.5 },
+  { name: "llama3.1:70b", approxVramGB: 43 },
+  { name: "qwen2.5:7b", approxVramGB: 5 },
+  { name: "qwen2.5:14b", approxVramGB: 9.5 },
+  { name: "qwen2.5:32b", approxVramGB: 20 },
+  { name: "mistral:7b", approxVramGB: 5 },
+  { name: "mixtral:8x7b", approxVramGB: 27 },
+  { name: "phi3:mini", approxVramGB: 2.5 },
+  { name: "phi3:medium", approxVramGB: 8.5 },
+  { name: "gemma2:9b", approxVramGB: 6.5 },
+  { name: "gemma2:27b", approxVramGB: 17 },
+  { name: "codellama:13b", approxVramGB: 8.5 },
+  { name: "deepseek-r1:7b", approxVramGB: 5 },
+  { name: "deepseek-r1:14b", approxVramGB: 9.5 }
+];
+
 async function isServiceHealthy(url: string, timeoutMs = 2000): Promise<boolean> {
   try {
     const controller = new AbortController();
@@ -2779,13 +2828,31 @@ app.post('/api/chat', async (req, res) => {
   const looksLikeImageEditRequest = hasAttachedImage && !looksLikeMeshEditRequest && !looksLikeFaceEnrollRequest && !IMAGE_EDIT_3D_EXCLUDE_PATTERN.test(message) && IMAGE_EDIT_TRIGGER_PATTERN.test(message);
   console.log("LOOKS LIKE IMAGE EDIT REQUEST:", looksLikeImageEditRequest);
 
+  // Model comparison ("compare qwen3.5:4b and qwen3.5:9b on: write a haiku").
+  // Requires BOTH the word "compare"/"vs"/"versus" AND at least 2 colon-form
+  // Ollama model identifiers (e.g. "qwen3.5:9b") — that combination is
+  // distinctive enough (nothing else in this cascade produces or expects
+  // colon-form tokens) that it's checked and branched on first, ahead of
+  // every other early-return intent, rather than threaded through each of
+  // their exclusion chains like looksLikeHardwareQuery/looksLikeModelRecommendQuery
+  // below had to be. The leading-letter requirement is deliberate — confirmed
+  // live that a plain "compare 10:30 and 11:45" false-positived on a naive
+  // \w+:\w+ pattern (both look like colon-form tokens); every real Ollama
+  // model name starts with a letter (qwen3.5, llama3.1, gemma4, ...), so this
+  // excludes bare numeric/time-like tokens without excluding any real model.
+  const MODEL_NAME_TOKEN_PATTERN = /\b[a-zA-Z][\w.-]*:[\w.-]+\b/g;
+  const COMPARE_MODELS_TRIGGER_PATTERN = /\b(compare|vs\.?|versus)\b/i;
+  const compareModelTokens = message.match(MODEL_NAME_TOKEN_PATTERN) ?? [];
+  const looksLikeCompareModelsRequest = COMPARE_MODELS_TRIGGER_PATTERN.test(message) && compareModelTokens.length >= 2;
+  console.log("LOOKS LIKE COMPARE MODELS REQUEST:", looksLikeCompareModelsRequest, "| tokens:", compareModelTokens);
+
   // "No changes to your personality" / "I didn't change anything" mention the
   // keyword while explicitly saying nothing should happen — without this,
   // they trip wantsModification just as wrongly as "do you remember" tripped
   // it on the word "remember" (see REMEMBER_QUESTION_PATTERN above).
   const NEGATED_MODIFICATION_PATTERN = /\b(no|not|don'?t|didn'?t|without|never)\s+(\w+\s+){0,2}(changes?|modif(y|ication)|updates?)\b/i;
 
-  const wantsModification = !looksLikeMeshEditRequest && !looksLikeFaceEnrollRequest && !looksLikeImageEditRequest && !NEGATED_MODIFICATION_PATTERN.test(message) && (
+  const wantsModification = !looksLikeMeshEditRequest && !looksLikeFaceEnrollRequest && !looksLikeImageEditRequest && !looksLikeCompareModelsRequest && !NEGATED_MODIFICATION_PATTERN.test(message) && (
     (REMEMBER_QUESTION_PATTERN.test(message) || FORGETFUL_STATEMENT_PATTERN.test(message))
       ? /(modify|change|rewrite|update|edit|improve|refactor|memorize|store|save)/i.test(message)
       : /(modify|change|rewrite|update|edit|improve|refactor|remember|memorize|store|save)/i.test(message)
@@ -2820,15 +2887,32 @@ app.post('/api/chat', async (req, res) => {
   const VISION_STATUS_TRIGGER_PATTERN = /\b(who('?s| is| was) (there|here|around|present|watching)|who (just )?(showed up|showing up|walked in|appeared|arrived)|who did you see|is (anyone|someone) (there|here)|who'?s in (the (room|frame|view)))\b/i;
   const looksLikeVisionStatusQuery = !wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeStatusQuery && VISION_STATUS_TRIGGER_PATTERN.test(message);
 
+  // "What's my GPU" / "how much VRAM do I have" is a factual question about
+  // the user's own machine, not about Noah's own operational health —
+  // deliberately its own intent rather than folded into
+  // looksLikeStatusQuery, which is framed around service uptime ("Core
+  // Integrity: X%") and would otherwise need to grow broader in a way that
+  // risks exactly the kind of cross-trigger collision already found once
+  // this session (the sticky-search-followup bug).
+  const HARDWARE_TRIGGER_PATTERN = /\b(what'?s my (gpu|hardware|vram)|how much vram|what gpu (do i have|am i running)|my (graphics|video) card|check my hardware)\b/i;
+  const looksLikeHardwareQuery = !wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeStatusQuery && !looksLikeVisionStatusQuery && HARDWARE_TRIGGER_PATTERN.test(message);
+
+  // "What models can I run" — combines real data (already-pulled models,
+  // via listPulledModels' actual file sizes) with OLLAMA_MODEL_VRAM_TABLE's
+  // necessarily-approximate suggestions for what else would fit. Same
+  // "own intent, not folded into status" reasoning as hardware above.
+  const MODEL_RECOMMEND_TRIGGER_PATTERN = /\b(what models? (can|could|should) i run|recommend(ed)? (a |an )?(ollama )?model|which models? (fit|would fit)|models? for my (gpu|hardware|vram))\b/i;
+  const looksLikeModelRecommendQuery = !wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeStatusQuery && !looksLikeVisionStatusQuery && !looksLikeHardwareQuery && MODEL_RECOMMEND_TRIGGER_PATTERN.test(message);
+
   // "Give me today's headlines" is a news-digest request, not a factual
   // lookup — it gets its own trigger and its own fetch path (SearXNG's news
   // category + day filter) rather than a plain web search, which just
   // surfaces static homepages for a bare term like "headlines".
   const HEADLINES_TRIGGER_PATTERN = /\b(headlines|breaking news|today'?s news|news today|on the news|what'?s (been )?reported|happening in the world)\b/i;
-  const looksLikeHeadlinesQuery = !wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeStatusQuery && !looksLikeVisionStatusQuery && HEADLINES_TRIGGER_PATTERN.test(message);
+  const looksLikeHeadlinesQuery = !wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeStatusQuery && !looksLikeVisionStatusQuery && !looksLikeHardwareQuery && !looksLikeModelRecommendQuery && HEADLINES_TRIGGER_PATTERN.test(message);
 
   const SEARCH_TRIGGER_PATTERN = /\b(latest news|who won|release date|launch date|premiere date|when('s| is| does| will).{0,30}(come out|coming out|releas(e|ing)|drop(ping)?|launch(ing)?|premier(e|ing))|current (weather|price|score|exchange rate)|how much (is|does|would)|price of|what'?s the weather|weather (today|forecast|right now))\b/i;
-  const looksLikeSearchQuery = !wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeStatusQuery && !looksLikeVisionStatusQuery && !looksLikeHeadlinesQuery && SEARCH_TRIGGER_PATTERN.test(message);
+  const looksLikeSearchQuery = !wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeStatusQuery && !looksLikeVisionStatusQuery && !looksLikeHardwareQuery && !looksLikeModelRecommendQuery && !looksLikeHeadlinesQuery && SEARCH_TRIGGER_PATTERN.test(message);
 
   // A follow-up on an already-answered search or headlines request (e.g.
   // "give me the link to the sites you used", "which one said that") —
@@ -2844,9 +2928,9 @@ app.post('/api/chat', async (req, res) => {
   // are tested directly (not via looksLikeFusionRequest/looksLikeImageGenRequest,
   // which aren't computed yet) for the same TDZ-ordering reason
   // looksLikeImageEditRequest carries its own self-contained exclusion above.
-  const isStickySearchFollowup = !wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeStatusQuery && !looksLikeVisionStatusQuery && !looksLikeHeadlinesQuery && !looksLikeSearchQuery && !looksLikeMeshEditRequest && !looksLikeFaceEnrollRequest && !looksLikeImageEditRequest && !FUSION_TRIGGER_PATTERN.test(message) && !IMAGE_GEN_TRIGGER_PATTERN.test(message) && stickySearchTurnsRemaining > 0;
+  const isStickySearchFollowup = !wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeStatusQuery && !looksLikeVisionStatusQuery && !looksLikeHardwareQuery && !looksLikeModelRecommendQuery && !looksLikeHeadlinesQuery && !looksLikeSearchQuery && !looksLikeMeshEditRequest && !looksLikeFaceEnrollRequest && !looksLikeImageEditRequest && !FUSION_TRIGGER_PATTERN.test(message) && !IMAGE_GEN_TRIGGER_PATTERN.test(message) && stickySearchTurnsRemaining > 0;
 
-  const looksLikeFusionRequest = !looksLikeMeshEditRequest && !wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeStatusQuery && !looksLikeVisionStatusQuery && !looksLikeHeadlinesQuery && !looksLikeSearchQuery && !isStickySearchFollowup && FUSION_TRIGGER_PATTERN.test(message);
+  const looksLikeFusionRequest = !looksLikeMeshEditRequest && !wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeStatusQuery && !looksLikeVisionStatusQuery && !looksLikeHardwareQuery && !looksLikeModelRecommendQuery && !looksLikeHeadlinesQuery && !looksLikeSearchQuery && !isStickySearchFollowup && FUSION_TRIGGER_PATTERN.test(message);
 
   // A Fusion request either describes explicit parametric geometry (shape
   // words, dimensions) — handled by the existing code-generation path — or
@@ -2874,7 +2958,7 @@ app.post('/api/chat', async (req, res) => {
   // IMAGE_GEN_TRIGGER_PATTERN's "make ... photo" actually matches "make
   // this photo darker," so without this an attached-photo mood request
   // would tie with plain text-to-image generation.
-  const looksLikeImageGenRequest = !looksLikeMeshEditRequest && !looksLikeImageEditRequest && !wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeStatusQuery && !looksLikeVisionStatusQuery && !looksLikeHeadlinesQuery && !looksLikeSearchQuery && !isStickySearchFollowup && !looksLikeFusionRequest && IMAGE_GEN_TRIGGER_PATTERN.test(message);
+  const looksLikeImageGenRequest = !looksLikeMeshEditRequest && !looksLikeImageEditRequest && !wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeStatusQuery && !looksLikeVisionStatusQuery && !looksLikeHardwareQuery && !looksLikeModelRecommendQuery && !looksLikeHeadlinesQuery && !looksLikeSearchQuery && !isStickySearchFollowup && !looksLikeFusionRequest && IMAGE_GEN_TRIGGER_PATTERN.test(message);
   console.log("LOOKS LIKE IMAGE GEN REQUEST:", looksLikeImageGenRequest);
 
   // Ollama's "thinking" mode measurably improves how carefully the model reasons through a request, but costs ~10-15+ seconds of extra latency
@@ -2887,6 +2971,8 @@ app.post('/api/chat', async (req, res) => {
   console.log("IS STICKY RECALL FOLLOWUP:", isStickyRecallFollowup, "| turns remaining:", stickyRecallTurnsRemaining);
   console.log("LOOKS LIKE STATUS QUERY:", looksLikeStatusQuery);
   console.log("LOOKS LIKE VISION STATUS QUERY:", looksLikeVisionStatusQuery);
+  console.log("LOOKS LIKE HARDWARE QUERY:", looksLikeHardwareQuery);
+  console.log("LOOKS LIKE MODEL RECOMMEND QUERY:", looksLikeModelRecommendQuery);
   console.log("LOOKS LIKE HEADLINES QUERY:", looksLikeHeadlinesQuery);
   console.log("LOOKS LIKE SEARCH QUERY:", looksLikeSearchQuery);
   console.log("IS STICKY SEARCH FOLLOWUP:", isStickySearchFollowup, "| turns remaining:", stickySearchTurnsRemaining);
@@ -2905,10 +2991,10 @@ app.post('/api/chat', async (req, res) => {
   // plain chat turn that also happens to have a document active, so it
   // sits at the bottom of the same priority cascade and can't collide
   // with anything above it.
-  const looksLikeDocumentQuestion = hasActiveDocument && !wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeStatusQuery && !looksLikeVisionStatusQuery && !looksLikeHeadlinesQuery && !looksLikeSearchQuery && !isStickySearchFollowup && !looksLikeFusionRequest && !looksLikeImageGenRequest;
+  const looksLikeDocumentQuestion = hasActiveDocument && !wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeStatusQuery && !looksLikeVisionStatusQuery && !looksLikeHardwareQuery && !looksLikeModelRecommendQuery && !looksLikeHeadlinesQuery && !looksLikeSearchQuery && !isStickySearchFollowup && !looksLikeFusionRequest && !looksLikeImageGenRequest;
   console.log("LOOKS LIKE DOCUMENT QUESTION:", looksLikeDocumentQuestion);
 
-  const isComplex = wantsModification || isRecallQuery || isStickyRecallFollowup || looksLikeStatusQuery || looksLikeVisionStatusQuery || looksLikeHeadlinesQuery || looksLikeSearchQuery || isStickySearchFollowup || looksLikeFusionRequest || looksLikeMeshEditRequest || looksLikeImageGenRequest || looksLikeImageEditRequest || looksLikeDocumentQuestion || (
+  const isComplex = wantsModification || isRecallQuery || isStickyRecallFollowup || looksLikeStatusQuery || looksLikeVisionStatusQuery || looksLikeHardwareQuery || looksLikeModelRecommendQuery || looksLikeHeadlinesQuery || looksLikeSearchQuery || isStickySearchFollowup || looksLikeFusionRequest || looksLikeMeshEditRequest || looksLikeImageGenRequest || looksLikeImageEditRequest || looksLikeDocumentQuestion || (
     wordCount > 5 && /(typescript|javascript|debug|refactor|git|branch)/i.test(message)
   );
 
@@ -3036,7 +3122,7 @@ app.post('/api/chat', async (req, res) => {
   // conversations) and their "I have no record of that day" replies would
   // otherwise false-positive as uncertainty below — the search fallback only
   // makes sense for genuine open-ended chat turns, not those paths.
-  const isPlainChatTurn = !wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeStatusQuery && !looksLikeVisionStatusQuery && !looksLikeHeadlinesQuery && !looksLikeSearchQuery && !isStickySearchFollowup && !looksLikeFusionRequest && !looksLikeImageGenRequest && !looksLikeImageEditRequest;
+  const isPlainChatTurn = !wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeStatusQuery && !looksLikeVisionStatusQuery && !looksLikeHardwareQuery && !looksLikeModelRecommendQuery && !looksLikeHeadlinesQuery && !looksLikeSearchQuery && !isStickySearchFollowup && !looksLikeFusionRequest && !looksLikeImageGenRequest && !looksLikeImageEditRequest;
 
   const searchInstructions = isPlainChatTurn ? `
   If answering requires current or real-world information you don't already know — release dates, sports results, news, prices, "when does X come out", "who won Y" — do not guess or make something up. Instead, respond with EXACTLY this and nothing else, no other words:
@@ -3107,6 +3193,54 @@ app.post('/api/chat', async (req, res) => {
       if (!res.ok) throw new Error(`Ollama connection failed: HTTP ${res.status} ${await res.text().catch(() => "")}`.trim());
       const data = await res.json() as { response: string };
       return data.response;
+    }
+
+    // Model comparison is checked before every other early-return
+    // path — its trigger (the word "compare"/"vs"/"versus" AND 2+
+    // colon-form model tokens like "qwen3.5:9b") is distinctive enough
+    // that it doesn't need to compete for priority with anything else in
+    // this cascade, so it gets first refusal unconditionally.
+    if (looksLikeCompareModelsRequest) {
+      const [modelA, modelB] = compareModelTokens.slice(0, 2);
+      const ignoredModelNote = compareModelTokens.length > 2
+        ? ` (ignored the rest: ${compareModelTokens.slice(2).join(", ")} — comparisons are limited to 2 models at a time)`
+        : "";
+
+      const pulled = await listPulledModels();
+      const pulledNames = new Set(pulled.map(m => m.name));
+      const missing = [modelA, modelB].filter(m => !pulledNames.has(m));
+
+      if (missing.length > 0) {
+        const availableList = pulled.length > 0 ? pulled.map(m => m.name).join(", ") : "(none pulled)";
+        const compareReplyText = `I don't have ${missing.join(" and ")} pulled, so I can't run that comparison. Models available locally: ${availableList}.`;
+        conversationHistory.push(`Assistant: ${compareReplyText}`);
+        saveHistory();
+        clearTimeout(timeout);
+        return res.json({ response: compareReplyText, hasProposedChanges: false });
+      }
+
+      const promptExtractionPrompt = `Extract just the actual question or task the user wants both models to answer, stripped of any "compare X and Y" framing. Reply with ONLY that question/task text and nothing else.\n\nRequest: "${message}"`;
+      const rawComparePrompt = await callOllama(promptExtractionPrompt, 40);
+      const comparePrompt = rawComparePrompt.replace(/["'\n]+/g, " ").trim() || message;
+      console.log("EXTRACTED COMPARISON PROMPT:", comparePrompt);
+
+      const runOne = async (modelName: string): Promise<{ model: string; response: string | null; error?: string }> => {
+        try {
+          const raw = await callOllama(comparePrompt, 400, false, undefined, modelName);
+          return { model: modelName, response: raw.trim() };
+        } catch (err: any) {
+          return { model: modelName, response: null, error: err.message };
+        }
+      };
+
+      const comparison = await Promise.all([runOne(modelA), runOne(modelB)]);
+      const compareReplyText = `Here's how ${modelA} and ${modelB} answered "${comparePrompt}"${ignoredModelNote}:`;
+
+      conversationHistory.push(`Assistant: ${compareReplyText}`);
+      saveHistory();
+      clearTimeout(timeout);
+
+      return res.json({ response: compareReplyText, comparison, hasProposedChanges: false });
     }
 
     // Face enrollment is its own early-return path, checked before the
@@ -4019,6 +4153,49 @@ Now generate code for this request: "${message}"`;
 
       console.log("LIVE VISION STATUS CONTEXT:");
       console.log(recallContext);
+    } else if (looksLikeHardwareQuery) {
+      console.log("FETCHING LIVE HARDWARE STATS");
+      const gpu = getGpuStats();
+      const hardwareFact = gpu
+        ? `GPU: NVIDIA card detected. VRAM: ${gpu.vramUsedMB}MB used / ${gpu.vramTotalMB}MB total (${(gpu.vramTotalMB / 1024).toFixed(1)}GB total). Utilization: ${gpu.utilizationPercent}%. Temperature: ${gpu.temperatureC}°C.`
+        : "No NVIDIA GPU was detected (or nvidia-smi isn't on PATH) — this only supports NVIDIA cards right now, the same limitation the HUD's own GPU stats have.";
+
+      recallContext = `--- LIVE HARDWARE STATUS ---\n${hardwareFact}\n--- END LIVE HARDWARE STATUS ---\n` +
+        `Answer the user's question using this real, current hardware data. Do not guess or make up different numbers — if no GPU was detected, say so plainly rather than inventing specs.\n\n`;
+
+      console.log("LIVE HARDWARE CONTEXT:");
+      console.log(recallContext);
+    } else if (looksLikeModelRecommendQuery) {
+      console.log("FETCHING MODEL RECOMMENDATION DATA");
+      const gpu = getGpuStats();
+      const pulled = await listPulledModels();
+      const pulledNames = new Set(pulled.map(m => m.name));
+
+      const pulledSummary = pulled.length > 0
+        ? pulled.map(m => `- ${m.name} (already pulled, ${(m.sizeBytes / 1e9).toFixed(1)}GB on disk — this is real, measured)`).join("\n")
+        : "(no models currently pulled)";
+
+      // Only suggest table entries not already pulled, and only ones that
+      // would plausibly fit — "plausibly" because these are approximate
+      // figures, not measured peaks, so the fit call itself is a judgment
+      // call, not a guarantee.
+      const totalVramGB = gpu ? gpu.vramTotalMB / 1024 : null;
+      const suggestions = totalVramGB !== null
+        ? OLLAMA_MODEL_VRAM_TABLE.filter(m => !pulledNames.has(m.name) && m.approxVramGB <= totalVramGB * 0.85)
+        : [];
+      const suggestionSummary = suggestions.length > 0
+        ? suggestions.map(m => `- ${m.name} (approx. ${m.approxVramGB}GB — NOT pulled, NOT measured, a rough estimate only)`).join("\n")
+        : "(no additional suggestions — either no GPU was detected, or nothing in the reference list clearly fits)";
+
+      const hardwareLine = totalVramGB !== null
+        ? `Total VRAM detected: ${totalVramGB.toFixed(1)}GB.`
+        : "No NVIDIA GPU was detected — recommend conservative, CPU-friendly models (small parameter counts) rather than reasoning about VRAM fit at all.";
+
+      recallContext = `--- MODEL RECOMMENDATION DATA ---\n${hardwareLine}\n\nAlready pulled locally (real, measured sizes):\n${pulledSummary}\n\nOther models that would likely fit, if you wanted to pull one (APPROXIMATE — not measured, a rough guide only, manually curated and may be out of date for newer model releases):\n${suggestionSummary}\n--- END MODEL RECOMMENDATION DATA ---\n` +
+        `Answer the user's question using this real data. Clearly distinguish already-pulled models (real sizes) from suggestions (approximate, explicitly tell the user these are estimates, not guarantees) — do not present a suggestion as if it were measured.\n\n`;
+
+      console.log("MODEL RECOMMENDATION CONTEXT:");
+      console.log(recallContext);
     } else if (looksLikeHeadlinesQuery) {
       console.log("FETCHING TODAY'S HEADLINES");
       const results = await fetchTodaysHeadlines();
@@ -4090,7 +4267,7 @@ Now generate code for this request: "${message}"`;
     // now works, anchoring on its own prior answers over the live data. For
     // these two intents specifically, omit history so the fresh fact is the
     // only thing in the room.
-    const isFreshLiveStatusQuery = looksLikeStatusQuery || looksLikeVisionStatusQuery;
+    const isFreshLiveStatusQuery = looksLikeStatusQuery || looksLikeVisionStatusQuery || looksLikeHardwareQuery || looksLikeModelRecommendQuery;
     const fullPrompt = wantsModification
       ? `System Instruction:\n${metaSystemInstruction}\n\n` + `User Request:\n${message}`
       : isFreshLiveStatusQuery
