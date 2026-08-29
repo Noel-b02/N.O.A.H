@@ -3320,11 +3320,26 @@ Now generate code for this request: "${message}"`;
       const pulled = await listPulledModels();
       const pulledNames = new Set(pulled.map(m => m.name));
 
+      // Computed before pulledSummary (not after, as originally written) so
+      // each pulled model can be labeled fits/exceeds directly in the data
+      // instead of leaving that arithmetic to the LLM — confirmed live that
+      // leaving it implicit let the model recommend a 23.9GB model as its
+      // "top pick" on a 15.9GB card, backed by a fabricated "it's probably
+      // quantized or offloaded" excuse with no real data behind it. The
+      // measured size already reflects whatever quantization that model was
+      // pulled in — there's nothing more to offload it into.
+      const totalVramGB = gpu ? gpu.vramTotalMB / 1024 : null;
+
       const pulledSummary = pulled.length > 0
-        ? pulled.map(m => `- ${m.name} (already pulled, ${(m.sizeBytes / 1e9).toFixed(1)}GB on disk — this is real, measured)`).join("\n")
+        ? pulled.map(m => {
+            const sizeGB = m.sizeBytes / 1e9;
+            const fitNote = totalVramGB !== null
+              ? (sizeGB <= totalVramGB ? "fits your VRAM" : "EXCEEDS your VRAM — do not recommend this as a primary pick, it will run slow or fail to load fully on the GPU")
+              : "VRAM fit unknown, no GPU detected";
+            return `- ${m.name} (already pulled, ${sizeGB.toFixed(1)}GB on disk — this is real, measured — ${fitNote})`;
+          }).join("\n")
         : "(no models currently pulled)";
 
-      const totalVramGB = gpu ? gpu.vramTotalMB / 1024 : null;
       const suggestions = totalVramGB !== null
         ? OLLAMA_MODEL_VRAM_TABLE.filter(m => !pulledNames.has(m.name) && m.approxVramGB <= totalVramGB * 0.85)
         : [];
@@ -3337,7 +3352,7 @@ Now generate code for this request: "${message}"`;
         : "No NVIDIA GPU was detected — recommend conservative, CPU-friendly models (small parameter counts) rather than reasoning about VRAM fit at all.";
 
       recallContext = `--- MODEL RECOMMENDATION DATA ---\n${hardwareLine}\n\nAlready pulled locally (real, measured sizes):\n${pulledSummary}\n\nOther models that would likely fit, if you wanted to pull one (APPROXIMATE — not measured, a rough guide only, manually curated and may be out of date for newer model releases):\n${suggestionSummary}\n--- END MODEL RECOMMENDATION DATA ---\n` +
-        `Answer the user's question using this real data. Clearly distinguish already-pulled models (real sizes) from suggestions (approximate, explicitly tell the user these are estimates, not guarantees) — do not present a suggestion as if it were measured.\n\n`;
+        `Answer the user's question using this real data. Clearly distinguish already-pulled models (real sizes) from suggestions (approximate, explicitly tell the user these are estimates, not guarantees) — do not present a suggestion as if it were measured. Your top pick MUST be one that fits VRAM (marked "fits your VRAM" above) — never recommend a model marked as exceeding VRAM as a primary/top pick, and never speculate that an oversized model "probably still works" via quantization or offloading; the size shown already accounts for that, so say plainly that it exceeds VRAM and would run slow or fail instead.\n\n`;
 
       console.log("MODEL RECOMMENDATION CONTEXT:");
       console.log(recallContext);
