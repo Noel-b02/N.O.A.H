@@ -19,6 +19,7 @@ else adds a capability on top:
 | Hunyuan3D-2 | No | The image-to-3D part of the above specifically |
 | Bambu Lab printer | No | Slicing + printing a generated model, on top of Hunyuan3D-2 |
 | Vision service | No | Camera-based facial recognition (off by default even once set up — see VISION_SETUP.md) |
+| Telegram bot | No | Text/voice-note chat with Noah from anywhere, not just the local web UI — see TELEGRAM_SETUP.md |
 
 If you just want to try the chat assistant, you can skip straight to
 [Run it](#5-run-it) after step 2 below.
@@ -71,6 +72,7 @@ Set up whichever of these you want, in any order:
 - [`SEARXNG_SETUP.md`](SEARXNG_SETUP.md) — web search, news, recall
 - [`SPEECH_SETUP.md`](SPEECH_SETUP.md) — voice input/output
 - [`VISION_SETUP.md`](VISION_SETUP.md) — camera-based facial recognition (read the Privacy section first)
+- [`TELEGRAM_SETUP.md`](TELEGRAM_SETUP.md) — text/voice-note chat with Noah from anywhere
 - [`FUSION_SETUP.md`](FUSION_SETUP.md) — CAD generation in Fusion 360
   - [`HUNYUAN3D_SETUP.md`](HUNYUAN3D_SETUP.md) — needed on top of the above
     specifically for "make me a model of X" style requests

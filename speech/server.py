@@ -7,6 +7,7 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import Response
 from pydantic import BaseModel
 
+import av
 import numpy as np
 import soundfile as sf
 from faster_whisper import WhisperModel
@@ -59,6 +60,12 @@ except Exception as e:
 
 class SpeakRequest(BaseModel):
     text: str
+    # "wav" (default, existing web UI behavior, untouched) or "ogg" — Ogg
+    # container / Opus codec, the specific format Telegram's sendVoice API
+    # requires for a real voice-message bubble (a WAV would need the
+    # separate sendAudio API instead, losing that UX). Confirmed live via a
+    # real encode-then-decode round trip before relying on it.
+    format: str = "wav"
 
 
 @app.post("/transcribe")
@@ -112,6 +119,25 @@ async def speak(req: SpeakRequest):
             raise HTTPException(status_code=500, detail="Kokoro produced no audio for this text.")
 
         full_audio = np.concatenate(audio_chunks)
+
+        if req.format == "ogg":
+            buffer = io.BytesIO()
+            container = av.open(buffer, mode="w", format="ogg")
+            # layout="mono" must be passed explicitly on both the stream and
+            # the frame — confirmed live that omitting it silently produces
+            # a stereo encode instead of erroring, which would double the
+            # file size and desync duration for no benefit (Kokoro's output
+            # is mono).
+            stream = container.add_stream("libopus", rate=KOKORO_SAMPLE_RATE, layout="mono")
+            audio_f32 = np.ascontiguousarray(full_audio, dtype=np.float32)
+            frame = av.AudioFrame.from_ndarray(audio_f32.reshape(1, -1), format="fltp", layout="mono")
+            frame.sample_rate = KOKORO_SAMPLE_RATE
+            for packet in stream.encode(frame):
+                container.mux(packet)
+            for packet in stream.encode(None):  # flush — required, or trailing packets are silently dropped
+                container.mux(packet)
+            container.close()
+            return Response(content=buffer.getvalue(), media_type="audio/ogg")
 
         buffer = io.BytesIO()
         sf.write(buffer, full_audio, KOKORO_SAMPLE_RATE, format="WAV")

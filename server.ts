@@ -4,6 +4,7 @@ import { execFileSync, spawn, ChildProcess } from 'child_process';
 import path from 'path';
 import dotenv from 'dotenv';
 import { randomUUID } from 'crypto';
+import { startTelegramBot } from './telegram';
 
 dotenv.config();
 
@@ -760,6 +761,7 @@ async function withGpuExclusive<T>(fn: () => Promise<T>): Promise<T> {
 
 startSpeechService();
 startVisionService();
+startTelegramBot();
 
 // --- Bambu Connect (official print handoff) ---
 // See PRINTER_SETUP.md. Bambu Lab's own desktop relay app — chosen over a
@@ -919,6 +921,18 @@ async function executeFusionScript(code: string): Promise<FusionExecutionResult>
     };
   }
 }
+
+// Requires an explicit "3d model"/"cad model"/"in fusion" mention alongside
+// a creation verb — kept deliberately narrow since this triggers real code
+// execution inside a running Fusion 360 session, not just a chat response.
+// Top-level (moved out of the handler) so isStickySearchFollowup/
+// isStickyRecallFollowup can test against it directly — confirmed live on
+// master: a sticky search/headlines follow-up window swallowed an
+// unrelated, clearly-distinct request before it ever reached its own
+// trigger pattern, since those sticky flags are computed before
+// looksLikeFusionRequest exists as a variable and couldn't previously
+// exclude it.
+const FUSION_TRIGGER_PATTERN = /\b(create|make|generate|build|design|remove|delete|clear)\b.{0,40}\b(3d models?|3d shapes?|cad models?|in fusion(?: ?360)?)\b/i;
 
 // Lets a request override the auto-searched reference image with a specific
 // one (e.g. "...in fusion 360: https://example.com/photo.jpg") — needed for
@@ -1984,7 +1998,7 @@ app.post('/api/transcribe', express.raw({ type: '*/*', limit: '25mb' }), async (
 // API: Text-to-speech — forwards text to the local Piper service and streams
 // back the resulting WAV audio.
 app.post('/api/speak', async (req, res) => {
-  const { text } = req.body;
+  const { text, format } = req.body as { text?: string; format?: "wav" | "ogg" };
   if (!text || !text.trim()) {
     return res.status(400).json({ error: "text is required." });
   }
@@ -1993,7 +2007,7 @@ app.post('/api/speak', async (req, res) => {
     const response = await fetch(`${SPEECH_SERVICE_URL}/speak`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text })
+      body: JSON.stringify({ text, ...(format ? { format } : {}) })
     });
 
     if (!response.ok) {
@@ -2002,7 +2016,10 @@ app.post('/api/speak', async (req, res) => {
     }
 
     const audioBuffer = Buffer.from(await response.arrayBuffer());
-    res.set('Content-Type', 'audio/wav');
+    // Defaults to wav (existing web UI behavior, unchanged) — must match
+    // whatever format was actually requested, since Telegram voice notes
+    // need an accurate audio/ogg label, not a hardcoded audio/wav one.
+    res.set('Content-Type', format === 'ogg' ? 'audio/ogg' : 'audio/wav');
     res.send(audioBuffer);
   } catch (err: any) {
     console.error("Speech synthesis failed:", err.message);
@@ -2199,7 +2216,10 @@ app.post('/api/chat', async (req, res) => {
   );
 
   // A follow-up on an already-answered recall query (e.g. "give me specifics", "quote it") — doesn't re-trigger isRecallQuery on its own, but should still get the archived context and the smarter model.
-  const isStickyRecallFollowup = !wantsModification && !isRecallQuery && stickyRecallTurnsRemaining > 0;
+  // Same exclusions as isStickySearchFollowup below and for the same
+  // confirmed-live reason — an unrelated, clearly-distinct request landing
+  // during this sticky window shouldn't get swallowed by it either.
+  const isStickyRecallFollowup = !wantsModification && !isRecallQuery && !looksLikeMeshEditRequest && !looksLikeFaceEnrollRequest && !FUSION_TRIGGER_PATTERN.test(message) && stickyRecallTurnsRemaining > 0;
 
   // "What does core integrity mean" is answered fine from the general explanation now in personality.txt — but "why isn't it 100%" or "what's down" needs the actual live health state, which the model has no way to
   // know on its own. This always fetches fresh (no sticky reuse): unlike a search result, service health can flip within seconds, so reusing stale
@@ -2229,13 +2249,17 @@ app.post('/api/chat', async (req, res) => {
   // A follow-up on an already-answered search or headlines request (e.g.
   // "give me the link to the sites you used", "which one said that") —
   // needs the same results (with real URLs) rather than the model
-  // improvising from its own summary.
-  const isStickySearchFollowup = !wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeStatusQuery && !looksLikeVisionStatusQuery && !looksLikeHeadlinesQuery && !looksLikeSearchQuery && stickySearchTurnsRemaining > 0;
+  // improvising from its own summary. Confirmed live (on master): without
+  // the explicit mesh-edit/face-enroll/fusion exclusions below, an
+  // unrelated request landing right after a search/headlines exchange got
+  // swallowed into this sticky-followup path instead of ever reaching its
+  // own, much more specific trigger pattern. The first two flags are
+  // already computed by this point and can be referenced directly;
+  // FUSION_TRIGGER_PATTERN is tested directly (not via
+  // looksLikeFusionRequest, which isn't computed yet) for the same
+  // TDZ-ordering reason it's now a top-level const.
+  const isStickySearchFollowup = !wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeStatusQuery && !looksLikeVisionStatusQuery && !looksLikeHeadlinesQuery && !looksLikeSearchQuery && !looksLikeMeshEditRequest && !looksLikeFaceEnrollRequest && !FUSION_TRIGGER_PATTERN.test(message) && stickySearchTurnsRemaining > 0;
 
-  // Requires an explicit "3d model"/"cad model"/"in fusion" mention alongside
-  // a creation verb — kept deliberately narrow since this triggers real code
-  // execution inside a running Fusion 360 session, not just a chat response.
-  const FUSION_TRIGGER_PATTERN = /\b(create|make|generate|build|design|remove|delete|clear)\b.{0,40}\b(3d models?|3d shapes?|cad models?|in fusion(?: ?360)?)\b/i;
   const looksLikeFusionRequest = !looksLikeMeshEditRequest && !wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeStatusQuery && !looksLikeVisionStatusQuery && !looksLikeHeadlinesQuery && !looksLikeSearchQuery && !isStickySearchFollowup && FUSION_TRIGGER_PATTERN.test(message);
 
   // A Fusion request either describes explicit parametric geometry (shape
