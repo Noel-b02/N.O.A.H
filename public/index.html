@@ -834,7 +834,7 @@
 
         if (data.response) {
           const model = data.modelId ? { id: data.modelId, url: data.modelUrl, subject: data.modelSubject } : null;
-          appendMessage('assistant', data.response, model);
+          appendMessage('assistant', data.response, model, data.comparison || null);
           speakReply(data.response);
         }
 
@@ -1288,7 +1288,7 @@
     // the preview panel. Wired via addEventListener rather than an inline
     // onclick attribute so subject (arbitrary user-influenced text) never
     // has to be safely embedded inside an HTML attribute string.
-    function appendMessage(sender, text, model = null) {
+    function appendMessage(sender, text, model = null, comparison = null) {
       const msgId = 'msg-' + (++messageIdCounter);
       const div = document.createElement('div');
       div.id = msgId;
@@ -1308,6 +1308,16 @@
           <p class="text-[9px] font-mono tracking-widest text-cyan-400 font-extrabold mb-2">NOAH CORE OUTPUT</p>
           <p class="text-sm text-slate-300 leading-relaxed">${linkify(text).replace(/\n/g, '<br>')}</p>
           ${model ? `<button class="view-model-btn mt-3 text-[9px] font-mono tracking-widest text-cyan-400 border border-cyan-500/30 px-3 py-1.5 rounded hover:bg-cyan-500/10 uppercase transition duration-300">VIEW MODEL: ${escapeHtml(model.subject)}</button>` : ''}
+          ${comparison ? `
+            <div class="mt-3 grid grid-cols-2 gap-3">
+              ${comparison.map(c => `
+                <div class="border border-cyan-500/20 rounded p-3 bg-black/20">
+                  <p class="text-[9px] font-mono tracking-widest text-cyan-400 font-extrabold mb-2">${escapeHtml(c.model)}</p>
+                  <p class="text-xs text-slate-300 leading-relaxed">${c.response !== null ? linkify(c.response).replace(/\n/g, '<br>') : `<span class="text-rose-400">(no response — error: ${escapeHtml(c.error || 'unknown')})</span>`}</p>
+                </div>
+              `).join('')}
+            </div>
+          ` : ''}
         `;
       } else {
         div.className += " bg-rose-950/10 border-rose-500/20 max-w-xl text-rose-300";
