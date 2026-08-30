@@ -1,0 +1,7 @@
+[
+  {
+    "name": "filesystem",
+    "command": "npx",
+    "args": ["-y", "@modelcontextprotocol/server-filesystem", "C:/path/to/a/folder/you/want/noah/to/access"]
+  }
+]
