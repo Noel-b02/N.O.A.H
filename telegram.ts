@@ -193,7 +193,7 @@ async function handleMessage(message: any): Promise<void> {
   const chatRes = await fetch(`${LOCAL_SERVER_URL}/api/chat`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ message: userMessage, attachedImage })
+    body: JSON.stringify({ message: userMessage, attachedImage, channel: 'telegram' })
   });
   const data = await chatRes.json().catch(() => ({ error: "Got an unreadable response from Noah's chat handler." })) as {
     response?: string;
