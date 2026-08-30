@@ -423,7 +423,10 @@ function searchArchivesByKeyword(keyword: string): { date: string; line: string 
 // themselves. Feeding those back to the model as "context" causes it to
 // parrot the same denial instead of answering — strip them out so recall
 // context only contains real conversation, not the bug's own leftovers.
-const STALE_NO_MEMORY_REPLY_PATTERN = /^Assistant:.*\b(don't have access to (our|any|the)|no record of|not in my (immediate )?memory|memory (starts fresh|is limited to|only (goes|holds))|no archived (conversation|mentions))\b/i;
+// The optional " (Telegram)" tag between "Assistant" and ":" (see channelTag
+// in /api/chat) must still match here, or every stale reply sent over
+// Telegram would leak into recall context untouched.
+const STALE_NO_MEMORY_REPLY_PATTERN = /^Assistant(?: \(Telegram\))?:.*\b(don't have access to (our|any|the)|no record of|not in my (immediate )?memory|memory (starts fresh|is limited to|only (goes|holds))|no archived (conversation|mentions))\b/i;
 
 function stripStaleNoMemoryReplies(messages: string[]): string[] {
   return messages.filter(line => !STALE_NO_MEMORY_REPLY_PATTERN.test(line));
@@ -2127,12 +2130,19 @@ app.post('/api/vision/enroll', async (req, res) => {
 
 // API: Send chat prompt to the assistant
 app.post('/api/chat', async (req, res) => {
-  const { message, attachedImage, openModelId, currentDocumentId } = req.body as {
+  const { message, attachedImage, openModelId, currentDocumentId, channel } = req.body as {
     message: string;
     attachedImage?: { base64: string; mimeType: string } | null;
     openModelId?: string | null;
     currentDocumentId?: string | null;
+    channel?: "telegram";
   };
+  // Tags conversationHistory/archive entries by origin so a later recall can
+  // be scoped to "on telegram" specifically (see CHANNEL_TRIGGER_PATTERN
+  // below). Deliberately a plain string suffix, not a structured field, to
+  // match this file's existing string[]-based history/archive format rather
+  // than restructuring it.
+  const channelTag = channel === "telegram" ? " (Telegram)" : "";
   const hasAttachedImage = !!attachedImage?.base64;
   // False both when nothing is attached and when the id is stale (e.g. the
   // server restarted since the frontend last uploaded a document) — either
@@ -2201,7 +2211,7 @@ app.post('/api/chat', async (req, res) => {
     // print survives unrelated small talk rather than being force-consumed.
   }
 
-  conversationHistory.push(`User: ${message}`);
+  conversationHistory.push(`User${channelTag}: ${message}`);
   saveHistory();
 
   const personality = loadFile(PERSONALITY_FILE);
@@ -2281,6 +2291,15 @@ app.post('/api/chat', async (req, res) => {
   const isRecallQuery = !wantsModification && (
     mentionsRecall || (recallDate !== null && /what|talk|discuss|speak|say/i.test(message))
   );
+
+  // "What did we talk about on Telegram" narrows a recall (date- or
+  // topic-based) to only channel-tagged messages — see channelTag in
+  // /api/chat for how the tag gets into archived lines in the first place.
+  // A bare topic/date recall with no channel mention stays untouched and
+  // searches everything, by design (Noel: topic recall should look at all
+  // history unless a channel or date is also given).
+  const CHANNEL_TRIGGER_PATTERN = /\b(on telegram|via telegram|in telegram|telegram (conversation|chat|message))\b/i;
+  const recallChannel: "telegram" | null = CHANNEL_TRIGGER_PATTERN.test(message) ? "telegram" : null;
 
   // A follow-up on an already-answered recall query (e.g. "give me specifics", "quote it") — doesn't re-trigger isRecallQuery on its own, but should still get the archived context and the smarter model.
   // Same exclusions as isStickySearchFollowup below and for the same
@@ -3211,28 +3230,40 @@ Now generate code for this request: "${message}"`;
 
     let recallContext = "";
     if (isRecallQuery) {
+      const channelLabel = recallChannel ? " (scoped to Telegram messages only)" : "";
       if (recallDate) {
         const sessions = findArchivesByDate(recallDate)
-          .map(s => ({ ...s, messages: stripStaleNoMemoryReplies(s.messages) }))
+          .map(s => ({
+            ...s,
+            messages: stripStaleNoMemoryReplies(s.messages).filter(m => !recallChannel || m.includes("(Telegram)"))
+          }))
           .filter(s => s.messages.length > 0);
         const dateLabel = recallDate.toDateString();
         recallContext = sessions.length > 0
-          ? `--- ARCHIVED CONVERSATION FROM ${dateLabel} ---\n` +
+          ? `--- ARCHIVED CONVERSATION FROM ${dateLabel}${channelLabel} ---\n` +
             sessions.map(s => s.messages.join("\n")).join("\n---\n") +
             `\n--- END ARCHIVED CONVERSATION ---\n` +
             `Every message between the markers above happened on ${dateLabel} — that is the true date of this whole block, no matter what other dates get mentioned in the conversation text itself (the user may have been asking about a different day within it). ` +
             `Answer the user's question about ${dateLabel} by summarizing what these messages show. Do not claim you have no record of ${dateLabel}: you are looking at it right now.\n\n`
-          : `--- NOTE: No archived conversation was found for ${dateLabel}. Tell the user you have no record of that day. ---\n\n`;
+          : `--- NOTE: No archived conversation${channelLabel} was found for ${dateLabel}. Tell the user you have no record of that day${channelLabel}. ---\n\n`;
       } else {
-        const topic = extractTopicKeyword(message);
+        // Strip the channel phrase itself before extracting the topic
+        // keyword — otherwise "what did we talk about pineapple on
+        // telegram" would extract "pineapple on telegram" as the literal
+        // search keyword (extractTopicKeyword's "about ... to end of
+        // string" regex has no way to know "on telegram" is a qualifier,
+        // not part of the topic), which then matches nothing.
+        const topicSource = recallChannel ? message.replace(CHANNEL_TRIGGER_PATTERN, "").trim() : message;
+        const topic = extractTopicKeyword(topicSource);
         const hits = (topic.length >= 3 ? searchArchivesByKeyword(topic) : [])
           .filter(h => !STALE_NO_MEMORY_REPLY_PATTERN.test(h.line))
+          .filter(h => !recallChannel || h.line.includes("(Telegram)"))
           .slice(0, 30);
         recallContext = hits.length > 0
-          ? `--- ARCHIVED MENTIONS OF "${topic}" ---\n` +
+          ? `--- ARCHIVED MENTIONS OF "${topic}"${channelLabel} ---\n` +
             hits.map(h => `[${new Date(h.date).toDateString()}] ${h.line}`).join("\n") +
             `\n--- END ARCHIVED MENTIONS ---\nAnswer the user's question using the archived mentions above.\n\n`
-          : `--- NOTE: No archived mentions of "${topic}" were found. Tell the user you have no record of discussing that. ---\n\n`;
+          : `--- NOTE: No archived mentions of "${topic}"${channelLabel} were found. Tell the user you have no record of discussing that${channelLabel}. ---\n\n`;
       }
 
       // Keep this context available for a few follow-up turns.
@@ -3553,7 +3584,7 @@ Now generate code for this request: "${message}"`;
               "[UPDATE GENERATED]"
             );
 
-        conversationHistory.push(`Assistant: ${historySafeResponse}`);
+        conversationHistory.push(`Assistant${channelTag}: ${historySafeResponse}`);
         saveHistory();
       }
     }
