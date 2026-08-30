@@ -129,6 +129,7 @@
 
     <div class="flex items-center space-x-6">
       <button id="open-models-panel-btn" onclick="openModelsPanel()" class="bg-cyan-950/40 hover:bg-cyan-500/15 border border-cyan-500/40 text-cyan-400 font-bold tracking-widest text-[10px] px-4 py-2 rounded uppercase transition duration-300">SYSTEM</button>
+      <button id="open-agent-panel-btn" onclick="openAgentPanel()" class="bg-cyan-950/40 hover:bg-cyan-500/15 border border-cyan-500/40 text-cyan-400 font-bold tracking-widest text-[10px] px-4 py-2 rounded uppercase transition duration-300">AGENT</button>
 
       <!-- Active Protocol Diagnostics -->
       <div class="text-right font-mono text-xs hidden sm:block">
@@ -403,6 +404,58 @@
         </div>
       </div>
     </section>
+
+    <section id="agent-panel" class="w-[500px] xl:w-[650px] bg-slate-950/95 border-l border-cyan-500/20 flex flex-col hidden relative z-20">
+      <div class="absolute top-0 right-0 w-4 h-4 border-t-2 border-r-2 border-cyan-400/30"></div>
+
+      <div class="p-6 border-b border-cyan-500/20 bg-cyan-950/5 flex items-center justify-between">
+        <div>
+          <h2 class="text-xs font-black text-cyan-400 tracking-widest uppercase">Agent Mode</h2>
+          <p class="text-[9px] text-slate-500 mt-1 uppercase tracking-widest font-mono">Goal-driven, multi-step</p>
+        </div>
+        <button onclick="closeAgentPanel()" class="text-slate-500 hover:text-cyan-400 text-xs font-mono">✕</button>
+      </div>
+
+      <div class="flex-1 overflow-y-auto p-6 space-y-4">
+        <p class="text-xs text-slate-500 leading-relaxed">
+          Give Noah a goal. It plans a rough approach, then — once you run it — works through multiple steps on its own (web search, any connected MCP tools) until it has an answer or hits its step limit. Once started, a run cannot be paused or interrupted, so review the preview first and only run goals you're comfortable Noah pursuing unsupervised.
+        </p>
+
+        <div class="flex gap-2">
+          <textarea id="agent-goal" rows="3" placeholder="What should Noah work on?" class="flex-1 bg-slate-950 border border-cyan-500/30 text-slate-300 font-mono text-xs rounded px-3 py-2 resize-none placeholder:text-slate-600"></textarea>
+          <button
+            type="button"
+            id="agent-mic-btn"
+            title="Click to speak"
+            class="bg-cyan-950/40 hover:bg-cyan-500/15 border border-cyan-500/40 text-cyan-400 font-bold tracking-widest text-[10px] px-3 rounded uppercase transition duration-300 self-stretch"
+          >
+            🎤
+          </button>
+        </div>
+
+        <button
+          onclick="previewAgentPlanFromPanel()"
+          id="agent-preview-btn"
+          class="w-full bg-cyan-950/40 hover:bg-cyan-500/15 border border-cyan-500/40 text-cyan-400 font-bold tracking-widest text-[10px] py-3 rounded uppercase transition duration-300"
+        >
+          Preview Plan
+        </button>
+
+        <div id="agent-preview-content"></div>
+
+        <button
+          onclick="runAgentFromPanel()"
+          id="agent-run-btn"
+          disabled
+          class="w-full bg-emerald-950/20 hover:bg-emerald-500/15 border border-emerald-500/50 text-emerald-400 font-bold tracking-widest text-[10px] py-3 rounded uppercase transition duration-300 hidden"
+        >
+          Run
+        </button>
+
+        <div id="agent-status"></div>
+        <div id="agent-results"></div>
+      </div>
+    </section>
   </main>
 
   <!-- Control Scripts & Visual Interactions -->
@@ -423,6 +476,7 @@
     const modelViewerSubjectEl = document.getElementById('model-viewer-subject');
     const modelSaveBtn = document.getElementById('model-save-btn');
     const modelsPanel = document.getElementById('models-panel');
+    const agentPanel = document.getElementById('agent-panel');
 
     // Tracks whichever model is currently open in the preview panel, so
     // saveCurrentModel()/discardCurrentModel() know which id to act on.
@@ -436,6 +490,7 @@
       modelSaveBtn.textContent = saved ? 'SAVED' : 'SAVE';
       diffPanel.classList.add('hidden');
       modelsPanel.classList.add('hidden');
+      agentPanel.classList.add('hidden');
       modelViewerPanel.classList.remove('hidden');
     }
 
@@ -474,6 +529,7 @@
     async function openModelsPanel() {
       diffPanel.classList.add('hidden');
       modelViewerPanel.classList.add('hidden');
+      agentPanel.classList.add('hidden');
       modelsPanel.classList.remove('hidden');
 
       const hwEl = document.getElementById('hw-panel-content');
@@ -501,6 +557,239 @@
 
     function closeModelsPanel() {
       modelsPanel.classList.add('hidden');
+    }
+
+    // Agent mode: give Noah a goal, preview a rough approach, then run it —
+    // an adaptive multi-step loop (web search / any connected MCP tools)
+    // that executes to completion unsupervised once started (this app has
+    // no way to interrupt a request mid-flight, same as mesh generation
+    // already blocking for up to 45 minutes) — see /api/agent/run.
+    function openAgentPanel() {
+      diffPanel.classList.add('hidden');
+      modelViewerPanel.classList.add('hidden');
+      modelsPanel.classList.add('hidden');
+      agentPanel.classList.remove('hidden');
+    }
+
+    function closeAgentPanel() {
+      agentPanel.classList.add('hidden');
+    }
+
+    // Independent recorder for the agent panel's goal field — deliberately
+    // not sharing state with the main mic button (isRecording/mediaRecorder/
+    // etc. below) rather than refactoring that already-working flow to be
+    // reusable: this is a smaller, lower-risk duplication than touching
+    // code with several subtle correctness details (min-duration check,
+    // stop-requested-during-startup race) that's already been through real
+    // user testing this session. Reuses the same /api/transcribe endpoint,
+    // just writes the result into the goal textarea instead of sending a
+    // chat message. MIN_RECORDING_MS is the one piece actually shared —
+    // it's a plain top-level const, safe to reference from here since this
+    // code only runs on a later click, well after that const is defined.
+    let agentIsRecording = false;
+    let agentIsStarting = false;
+    let agentStopRequested = false;
+    let agentMediaRecorder = null;
+    let agentRecordedChunks = [];
+    let agentRecordingStartedAt = 0;
+
+    async function startAgentRecording() {
+      const btn = document.getElementById('agent-mic-btn');
+      if (agentIsRecording || agentIsStarting) return;
+      agentIsStarting = true;
+      agentStopRequested = false;
+
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+        if (agentStopRequested) {
+          stream.getTracks().forEach(track => track.stop());
+          agentIsStarting = false;
+          return;
+        }
+
+        agentRecordedChunks = [];
+        agentMediaRecorder = new MediaRecorder(stream);
+        agentMediaRecorder.ondataavailable = (e) => {
+          if (e.data.size > 0) agentRecordedChunks.push(e.data);
+        };
+        agentMediaRecorder.onstop = async () => {
+          stream.getTracks().forEach(track => track.stop());
+          const durationMs = Date.now() - agentRecordingStartedAt;
+          if (durationMs < MIN_RECORDING_MS) {
+            document.getElementById('agent-status').innerHTML = `<p class="text-rose-400 text-xs mt-2">Speak for a little longer before stopping.</p>`;
+            return;
+          }
+          const audioBlob = new Blob(agentRecordedChunks, { type: 'audio/webm' });
+          await transcribeIntoAgentGoal(audioBlob);
+        };
+
+        agentMediaRecorder.start();
+        agentRecordingStartedAt = Date.now();
+        agentIsRecording = true;
+        agentIsStarting = false;
+        btn.classList.add('bg-rose-500/20', 'border-rose-500/60', 'text-rose-400');
+        btn.title = 'Click to stop';
+      } catch (err) {
+        console.error('Microphone access denied or unavailable:', err);
+        document.getElementById('agent-status').innerHTML = `<p class="text-rose-400 text-xs mt-2">Microphone access denied or unavailable.</p>`;
+        agentIsStarting = false;
+      }
+    }
+
+    function stopAgentRecording() {
+      const btn = document.getElementById('agent-mic-btn');
+      if (agentIsStarting && !agentIsRecording) {
+        agentStopRequested = true;
+        return;
+      }
+      if (!agentIsRecording || !agentMediaRecorder) return;
+      agentMediaRecorder.stop();
+      agentIsRecording = false;
+      btn.classList.remove('bg-rose-500/20', 'border-rose-500/60', 'text-rose-400');
+      btn.title = 'Click to speak';
+    }
+
+    async function transcribeIntoAgentGoal(audioBlob) {
+      const statusEl = document.getElementById('agent-status');
+      if (audioBlob.size < 1000) {
+        statusEl.innerHTML = `<p class="text-rose-400 text-xs mt-2">No audio captured — try again.</p>`;
+        return;
+      }
+      statusEl.innerHTML = `<p class="text-[10px] text-cyan-400 font-mono mt-2">Transcribing...</p>`;
+      try {
+        const response = await fetch('/api/transcribe', {
+          method: 'POST',
+          headers: { 'Content-Type': 'audio/webm' },
+          body: audioBlob
+        });
+        statusEl.innerHTML = '';
+        if (!response.ok) {
+          const detail = await response.json().catch(() => ({}));
+          statusEl.innerHTML = `<p class="text-rose-400 text-xs mt-2">Transcription failed: ${escapeHtml(detail.error || String(response.status))}</p>`;
+          return;
+        }
+        const data = await response.json();
+        const text = (data.text || '').trim();
+        if (!text) {
+          statusEl.innerHTML = `<p class="text-rose-400 text-xs mt-2">No speech detected.</p>`;
+          return;
+        }
+        // Appends rather than replaces — lets a partly-typed goal be
+        // extended by voice, and a bare voice-only goal works the same way
+        // since appending to an empty textarea is just the text itself.
+        const goalEl = document.getElementById('agent-goal');
+        goalEl.value = goalEl.value.trim() ? `${goalEl.value.trim()} ${text}` : text;
+      } catch (err) {
+        console.error('Agent transcription failed:', err);
+        statusEl.innerHTML = `<p class="text-rose-400 text-xs mt-2">Transcription request dropped.</p>`;
+      }
+    }
+
+    document.getElementById('agent-mic-btn').addEventListener('click', () => {
+      if (agentIsRecording || agentIsStarting) {
+        stopAgentRecording();
+      } else {
+        startAgentRecording();
+      }
+    });
+
+    async function previewAgentPlanFromPanel() {
+      const goal = document.getElementById('agent-goal').value.trim();
+      const previewEl = document.getElementById('agent-preview-content');
+      const previewBtn = document.getElementById('agent-preview-btn');
+      const runBtn = document.getElementById('agent-run-btn');
+
+      if (!goal) {
+        previewEl.innerHTML = `<p class="text-rose-400 text-xs mt-2">Enter a goal first.</p>`;
+        return;
+      }
+
+      previewBtn.disabled = true;
+      previewBtn.textContent = 'Thinking...';
+      previewEl.innerHTML = '';
+      runBtn.classList.add('hidden');
+
+      try {
+        const res = await fetch('/api/agent/plan', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ goal })
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          previewEl.innerHTML = `<p class="text-rose-400 text-xs mt-2">${escapeHtml(data.error || 'Preview failed.')}</p>`;
+          return;
+        }
+        previewEl.innerHTML = `<div class="border border-cyan-500/20 rounded p-3 bg-black/20 text-xs text-slate-300 leading-relaxed whitespace-pre-line">${escapeHtml(data.plan)}</div>`;
+        runBtn.classList.remove('hidden');
+        runBtn.disabled = false;
+      } catch (err) {
+        console.error('Agent plan preview failed:', err);
+        previewEl.innerHTML = `<p class="text-rose-400 text-xs mt-2">Request dropped.</p>`;
+      } finally {
+        previewBtn.disabled = false;
+        previewBtn.textContent = 'Preview Plan';
+      }
+    }
+
+    async function runAgentFromPanel() {
+      const goal = document.getElementById('agent-goal').value.trim();
+      const runBtn = document.getElementById('agent-run-btn');
+      const statusEl = document.getElementById('agent-status');
+      const resultsEl = document.getElementById('agent-results');
+
+      if (!goal) return;
+
+      runBtn.disabled = true;
+      runBtn.textContent = 'Running...';
+      resultsEl.innerHTML = '';
+      statusEl.innerHTML = `<p class="text-[10px] text-cyan-400 font-mono mt-2">Starting...</p>`;
+
+      try {
+        const res = await fetch('/api/agent/run', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ goal })
+        });
+        const data = await res.json();
+        statusEl.innerHTML = '';
+        if (!res.ok) {
+          resultsEl.innerHTML = `<p class="text-rose-400 text-xs mt-2">${escapeHtml(data.error || 'Agent run failed.')}</p>`;
+          return;
+        }
+        renderAgentResults(data);
+      } catch (err) {
+        console.error('Agent run failed:', err);
+        statusEl.innerHTML = '';
+        resultsEl.innerHTML = `<p class="text-rose-400 text-xs mt-2">Request dropped.</p>`;
+      } finally {
+        runBtn.disabled = false;
+        runBtn.textContent = 'Run';
+      }
+    }
+
+    function renderAgentResults(data) {
+      const resultsEl = document.getElementById('agent-results');
+      const stepsHtml = (data.steps || []).map((s, i) => `
+        <div class="border border-slate-700/40 rounded p-2 bg-black/10 mb-1">
+          <p class="text-[9px] font-mono text-cyan-400 mb-1">STEP ${i + 1}: ${escapeHtml(s.action)}</p>
+          <p class="text-[10px] text-slate-400 leading-relaxed">${escapeHtml(s.result.slice(0, 400))}</p>
+        </div>
+      `).join('');
+
+      resultsEl.innerHTML = `
+        <div class="border border-cyan-500/20 rounded p-3 bg-black/20 mt-2">
+          <p class="text-[9px] font-mono tracking-widest text-cyan-400 font-extrabold mb-2">${data.hitStepLimit ? 'RESULT (STEP LIMIT REACHED)' : 'RESULT'}</p>
+          <p class="text-xs text-slate-300 leading-relaxed mb-3">${linkify(data.finalAnswer).replace(/\n/g, '<br>')}</p>
+          ${stepsHtml ? `
+            <details>
+              <summary class="text-[9px] font-mono text-slate-500 uppercase cursor-pointer">Step log (${data.steps.length})</summary>
+              <div class="mt-2">${stepsHtml}</div>
+            </details>
+          ` : ''}
+        </div>
+      `;
     }
 
     function renderHardwarePanel(gpu) {
@@ -765,6 +1054,14 @@
         if (data.proactiveGreeting) {
           appendMessage('assistant', data.proactiveGreeting);
           speakReply(data.proactiveGreeting);
+        }
+
+        // Agent mode's live status rides this same poll, same reasoning as
+        // proactiveGreeting above — no dedicated push channel exists, and
+        // this fires every 3s regardless of whether a run is active.
+        const agentStatusEl = document.getElementById('agent-status');
+        if (agentStatusEl && data.agentProgress && data.agentProgress.active) {
+          agentStatusEl.innerHTML = `<p class="text-[10px] text-cyan-400 font-mono mt-2">STEP ${data.agentProgress.currentStep}/${data.agentProgress.maxSteps}: ${escapeHtml(data.agentProgress.description)}</p>`;
         }
       } catch (err) {
         console.error('Telemetry fetch failed:', err);
@@ -1602,6 +1899,7 @@
       diffContainer.innerHTML = '';
       modelViewerPanel.classList.add('hidden');
       modelsPanel.classList.add('hidden');
+      agentPanel.classList.add('hidden');
       diffPanel.classList.remove('hidden');
 
       if (commit && commit.title) {
