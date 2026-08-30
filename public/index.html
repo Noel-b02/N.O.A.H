@@ -532,15 +532,27 @@
 
       const pulledCards = overview.pulled.map(m => {
         const isCurrent = m.name === overview.currentModel;
+        // Noah auto-routes every complex/coding turn to codeModel already —
+        // it's not something to "consider," it's already running. Shown as
+        // a plain badge instead of an LLM pros/cons pitch (which is
+        // excluded for this model server-side) for exactly that reason:
+        // confirmed live the LLM described it as "significantly more
+        // capable... consider it" with no indication it's already active.
+        const isCodeModel = m.name === overview.codeModel;
         const fitBadge = m.fits === null
           ? `<span class="text-[9px] font-mono text-slate-500 border border-slate-600 rounded px-1.5 py-0.5 uppercase">Unknown</span>`
           : m.fits
             ? `<span class="text-[9px] font-mono text-emerald-400 border border-emerald-500/40 rounded px-1.5 py-0.5 uppercase">Fits</span>`
             : `<span class="text-[9px] font-mono text-rose-400 border border-rose-500/40 rounded px-1.5 py-0.5 uppercase">Exceeds VRAM</span>`;
+        const roleNote = isCurrent
+          ? ' <span class="text-cyan-400">(current chat model)</span>'
+          : isCodeModel
+            ? ' <span class="text-cyan-400">(already used for complex/coding tasks)</span>'
+            : '';
         return `
           <div class="border border-cyan-500/20 rounded p-3 bg-black/20">
             <div class="flex items-center justify-between mb-1">
-              <p class="text-xs font-mono text-slate-200 font-bold">${escapeHtml(m.name)}${isCurrent ? ' <span class="text-cyan-400">(current)</span>' : ''}</p>
+              <p class="text-xs font-mono text-slate-200 font-bold">${escapeHtml(m.name)}${roleNote}</p>
               ${fitBadge}
             </div>
             <p class="text-[10px] text-slate-500 font-mono mb-2">${m.sizeGB.toFixed(1)}GB on disk — measured</p>

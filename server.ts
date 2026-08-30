@@ -2027,13 +2027,22 @@ app.get('/api/models/overview', async (_, res) => {
   // within a reasonable num_predict budget. Pros/cons for models you'd
   // actually compare against (already pulled) is the higher-value case
   // anyway; suggestions still show in the list, just without this layer.
+  //
+  // Also excludes CODE_MODEL, not just CHAT_MODEL — confirmed live this was
+  // producing a genuinely misleading result: Noah already auto-routes every
+  // complex/coding turn to CODE_MODEL (isComplex), but the pros/cons text
+  // framed it as "significantly more capable... consider it" like a fresh
+  // suggestion, with no indication it's already in active use for exactly
+  // that reason. A model that's already one of Noah's two active roles gets
+  // a plain badge in the UI instead (see codeModel below) rather than an
+  // LLM-generated "you should get this" pitch for something already running.
   const candidates = recommendation.pulled
-    .filter(m => m.name !== CHAT_MODEL)
+    .filter(m => m.name !== CHAT_MODEL && m.name !== CODE_MODEL)
     .map(m => ({ name: m.name, detail: `${m.sizeGB.toFixed(1)}GB, already pulled, ${m.fits === false ? "exceeds your VRAM" : "fits your VRAM"}` }));
 
   let analysis: { model: string; pros: string[]; cons: string[] }[] | null = null;
   if (candidates.length > 0) {
-    const analysisPrompt = `Noah's default day-to-day chat model is "${CHAT_MODEL}". For each of the following candidate models, give 1-3 short pros and 1-3 short cons versus ${CHAT_MODEL} specifically (quality, speed, size/VRAM cost, use-case fit). Candidates:\n${candidates.map(c => `- ${c.name} (${c.detail})`).join("\n")}\n\nReply with ONLY a JSON array, no other text, in exactly this shape: [{"model": "name", "pros": ["..."], "cons": ["..."]}, ...] — one entry per candidate listed above, using its exact name.`;
+    const analysisPrompt = `Noah's default day-to-day chat model is "${CHAT_MODEL}", and its complex/coding-task model (automatically used for harder requests, not something the user has to switch to) is "${CODE_MODEL}". For each of the following candidate models, give 1-3 short pros and 1-3 short cons versus ${CHAT_MODEL} specifically (quality, speed, size/VRAM cost, use-case fit). Candidates:\n${candidates.map(c => `- ${c.name} (${c.detail})`).join("\n")}\n\nReply with ONLY a JSON array, no other text, in exactly this shape: [{"model": "name", "pros": ["..."], "cons": ["..."]}, ...] — one entry per candidate listed above, using its exact name.`;
     // Non-deterministic output (temperature 0.3) occasionally comes back as
     // near-valid-but-malformed JSON (confirmed live: a missing closing
     // bracket on the last "cons" array) — one retry is cheap and usually
@@ -2046,7 +2055,19 @@ app.get('/api/models/overview', async (_, res) => {
         const jsonMatch = raw.match(/\[[\s\S]*\]/);
         if (jsonMatch) {
           const parsed = JSON.parse(jsonMatch[0]);
-          if (Array.isArray(parsed)) analysis = parsed;
+          if (Array.isArray(parsed)) {
+            // Confirmed live: the prompt's candidate list is a request, not
+            // a hard constraint — the model sometimes includes CHAT_MODEL/
+            // CODE_MODEL anyway (the exact "you should get this" framing
+            // this endpoint exists to avoid for a model already in active
+            // use) and occasionally duplicates an entry. Enforced here
+            // rather than trusted from the prompt alone, same lesson as
+            // the fits/exceeds-VRAM labeling earlier this session.
+            const seen = new Set<string>();
+            analysis = parsed.filter((a: any) =>
+              a?.model && a.model !== CHAT_MODEL && a.model !== CODE_MODEL && !seen.has(a.model) && seen.add(a.model)
+            );
+          }
         }
       } catch (err: any) {
         console.warn(`Model overview pros/cons generation failed on attempt ${attempt + 1} (non-fatal):`, err.message);
@@ -2054,7 +2075,7 @@ app.get('/api/models/overview', async (_, res) => {
     }
   }
 
-  res.json({ currentModel: CHAT_MODEL, hardware: gpu, ...recommendation, analysis });
+  res.json({ currentModel: CHAT_MODEL, codeModel: CODE_MODEL, hardware: gpu, ...recommendation, analysis });
 });
 
 // API: returns a model's current info by id — used by the frontend instead
