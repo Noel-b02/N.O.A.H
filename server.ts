@@ -884,6 +884,88 @@ const OLLAMA_MODEL_VRAM_TABLE: { name: string; approxVramGB: number }[] = [
   { name: "deepseek-r1:14b", approxVramGB: 9.5 }
 ];
 
+interface ModelRecommendationData {
+  totalVramGB: number | null;
+  pulled: { name: string; sizeGB: number; fits: boolean | null }[];
+  suggestions: { name: string; approxVramGB: number }[];
+}
+
+// Pure data-gathering, shared by the chat-based model-recommend intent
+// (which wraps this in recallContext prose) and GET /api/models/overview
+// (which returns it as-is plus an LLM-generated pros/cons layer) — kept as
+// one function so the two surfaces can't drift on the fits/exceeds-VRAM
+// logic the way a duplicated copy eventually would.
+function buildModelRecommendationData(pulled: PulledModel[], gpu: GpuStats | null): ModelRecommendationData {
+  const pulledNames = new Set(pulled.map(m => m.name));
+  const totalVramGB = gpu ? gpu.vramTotalMB / 1024 : null;
+
+  const pulledData = pulled.map(m => {
+    const sizeGB = m.sizeBytes / 1e9;
+    const fits = totalVramGB !== null ? sizeGB <= totalVramGB : null;
+    return { name: m.name, sizeGB, fits };
+  });
+
+  // Only suggest table entries not already pulled, and only ones that
+  // would plausibly fit — "plausibly" because these are approximate
+  // figures, not measured peaks, so the fit call itself is a judgment
+  // call, not a guarantee.
+  const suggestions = totalVramGB !== null
+    ? OLLAMA_MODEL_VRAM_TABLE.filter(m => !pulledNames.has(m.name) && m.approxVramGB <= totalVramGB * 0.85)
+    : [];
+
+  return { totalVramGB, pulled: pulledData, suggestions };
+}
+
+// Standalone Ollama call usable outside the /api/chat request cycle — the
+// cascade's own callOllama() is a closure nested inside that handler
+// (captures a request-scoped AbortController/selectedModel), so it can't be
+// called from an independent REST route. Used by runModelComparison below
+// and GET /api/models/overview's pros/cons generation.
+async function callOllamaModel(prompt: string, numPredict: number, model: string, timeoutMs = 60000): Promise<string> {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    const res = await fetch(OLLAMA_URL, {
+      method: "POST",
+      signal: controller.signal,
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        model,
+        prompt,
+        stream: false,
+        // Without this, some models (confirmed live: qwen3.5:4b) default to
+        // "thinking" mode and put their real answer in a separate
+        // `thinking` field, leaving `response` empty until num_predict runs
+        // out mid-thought — matching the nested callOllama() in /api/chat,
+        // which passes this explicitly for the same reason.
+        think: false,
+        options: { num_predict: numPredict, num_ctx: 16384, temperature: 0.3 }
+      })
+    });
+    if (!res.ok) throw new Error(`Ollama connection failed: HTTP ${res.status} ${await res.text().catch(() => "")}`.trim());
+    const data = await res.json() as { response: string };
+    return data.response;
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+// Shared by the chat-based "compare X and Y on: ..." intent and
+// POST /api/models/compare — runs the same prompt against two models in
+// parallel, each independently try/caught so one failure doesn't blank out
+// the other's real result.
+async function runModelComparison(modelA: string, modelB: string, prompt: string): Promise<{ model: string; response: string | null; error?: string }[]> {
+  const runOne = async (modelName: string): Promise<{ model: string; response: string | null; error?: string }> => {
+    try {
+      const raw = await callOllamaModel(prompt, 400, modelName);
+      return { model: modelName, response: raw.trim() };
+    } catch (err: any) {
+      return { model: modelName, response: null, error: err.message };
+    }
+  };
+  return Promise.all([runOne(modelA), runOne(modelB)]);
+}
+
 async function isServiceHealthy(url: string, timeoutMs = 2000): Promise<boolean> {
   try {
     const controller = new AbortController();
@@ -1906,6 +1988,67 @@ app.get('/api/hud-metrics', async (_, res) => {
   });
 });
 
+// API: real, live GPU stats for the system panel's hardware section —
+// same getGpuStats() the chat-based "what's my GPU" intent uses, just as a
+// plain REST endpoint the frontend can poll on panel-open without needing
+// to phrase a chat message.
+app.get('/api/hardware', (_, res) => {
+  res.json({ gpu: getGpuStats() });
+});
+
+// API: the system panel's model-recommendation section — real pulled-model
+// data (buildModelRecommendationData, shared with the chat intent) plus a
+// short LLM-generated pros/cons blurb for each candidate versus CHAT_MODEL
+// (the model actually used for a plain chat turn). The pros/cons layer is
+// enrichment, not core data: if the LLM call fails or returns unparseable
+// JSON, `analysis` comes back null and the frontend still renders the real
+// model list with fit badges — matching this file's established "never
+// fail hard over an optional layer" convention (e.g. listPulledModels()
+// returning [] rather than throwing).
+// MUST be registered before /api/models/:id below — Express matches routes
+// in registration order, and :id matches any literal segment (including
+// "overview"), so the wildcard route would otherwise swallow this one.
+app.get('/api/models/overview', async (_, res) => {
+  const gpu = getGpuStats();
+  const pulled = await listPulledModels();
+  const recommendation = buildModelRecommendationData(pulled, gpu);
+
+  // Deliberately excludes `suggestions` — confirmed live that including
+  // both pulled models and the full suggestion table (17 candidates total
+  // on a typical setup) produced consistently truncated/malformed JSON
+  // within a reasonable num_predict budget. Pros/cons for models you'd
+  // actually compare against (already pulled) is the higher-value case
+  // anyway; suggestions still show in the list, just without this layer.
+  const candidates = recommendation.pulled
+    .filter(m => m.name !== CHAT_MODEL)
+    .map(m => ({ name: m.name, detail: `${m.sizeGB.toFixed(1)}GB, already pulled, ${m.fits === false ? "exceeds your VRAM" : "fits your VRAM"}` }));
+
+  let analysis: { model: string; pros: string[]; cons: string[] }[] | null = null;
+  if (candidates.length > 0) {
+    const analysisPrompt = `Noah's default day-to-day chat model is "${CHAT_MODEL}". For each of the following candidate models, give 1-3 short pros and 1-3 short cons versus ${CHAT_MODEL} specifically (quality, speed, size/VRAM cost, use-case fit). Candidates:\n${candidates.map(c => `- ${c.name} (${c.detail})`).join("\n")}\n\nReply with ONLY a JSON array, no other text, in exactly this shape: [{"model": "name", "pros": ["..."], "cons": ["..."]}, ...] — one entry per candidate listed above, using its exact name.`;
+    // Non-deterministic output (temperature 0.3) occasionally comes back as
+    // near-valid-but-malformed JSON (confirmed live: a missing closing
+    // bracket on the last "cons" array) — one retry is cheap and usually
+    // produces a parseable result on the second attempt; if both fail,
+    // `analysis` stays null and the model cards render without pros/cons,
+    // per the established "enrichment, not core data" fallback.
+    for (let attempt = 0; attempt < 2 && analysis === null; attempt++) {
+      try {
+        const raw = await callOllamaModel(analysisPrompt, 600, CHAT_MODEL, 45000);
+        const jsonMatch = raw.match(/\[[\s\S]*\]/);
+        if (jsonMatch) {
+          const parsed = JSON.parse(jsonMatch[0]);
+          if (Array.isArray(parsed)) analysis = parsed;
+        }
+      } catch (err: any) {
+        console.warn(`Model overview pros/cons generation failed on attempt ${attempt + 1} (non-fatal):`, err.message);
+      }
+    }
+  }
+
+  res.json({ currentModel: CHAT_MODEL, hardware: gpu, ...recommendation, analysis });
+});
+
 // API: returns a model's current info by id — used by the frontend instead
 // of trusting a URL baked into a chat message's button at creation time,
 // since /save below can rename the file out from under that URL later.
@@ -1963,6 +2106,29 @@ app.delete('/api/models/:id', (req, res) => {
   });
   saveModelsIndex(entries.filter(e => e.id !== req.params.id));
   res.json({ success: true });
+});
+
+// API: the system panel's live comparison section — same runModelComparison
+// the chat-based "compare X and Y on: ..." intent uses, but with the model
+// names and prompt supplied directly by the UI instead of extracted from a
+// natural-language message. No auto-pull, matching the chat feature's
+// behavior — a model not already on disk is a clean rejection, not a
+// multi-GB/multi-minute pull blocking the request.
+app.post('/api/models/compare', async (req, res) => {
+  const { modelA, modelB, prompt } = req.body as { modelA?: string; modelB?: string; prompt?: string };
+  if (!modelA || !modelB || !prompt) {
+    return res.status(400).json({ error: "modelA, modelB, and prompt are all required." });
+  }
+
+  const pulled = await listPulledModels();
+  const pulledNames = new Set(pulled.map(m => m.name));
+  const missing = [modelA, modelB].filter(m => !pulledNames.has(m));
+  if (missing.length > 0) {
+    return res.status(400).json({ error: `Not pulled: ${missing.join(", ")}`, available: pulled.map(m => m.name) });
+  }
+
+  const comparison = await runModelComparison(modelA, modelB, prompt);
+  res.json({ comparison });
 });
 
 // API: extracts, chunks, and embeds an attached document, storing it in
@@ -2644,16 +2810,7 @@ app.post('/api/chat', async (req, res) => {
       const comparePrompt = rawComparePrompt.replace(/["'\n]+/g, " ").trim() || message;
       console.log("EXTRACTED COMPARISON PROMPT:", comparePrompt);
 
-      const runOne = async (modelName: string): Promise<{ model: string; response: string | null; error?: string }> => {
-        try {
-          const raw = await callOllama(comparePrompt, 400, false, undefined, modelName);
-          return { model: modelName, response: raw.trim() };
-        } catch (err: any) {
-          return { model: modelName, response: null, error: err.message };
-        }
-      };
-
-      const comparison = await Promise.all([runOne(modelA), runOne(modelB)]);
+      const comparison = await runModelComparison(modelA, modelB, comparePrompt);
       const compareReplyText = `Here's how ${modelA} and ${modelB} answered "${comparePrompt}"${ignoredModelNote}:`;
 
       conversationHistory.push(`Assistant: ${compareReplyText}`);
@@ -3349,37 +3506,33 @@ Now generate code for this request: "${message}"`;
       console.log("FETCHING MODEL RECOMMENDATION DATA");
       const gpu = getGpuStats();
       const pulled = await listPulledModels();
-      const pulledNames = new Set(pulled.map(m => m.name));
+      const recommendation = buildModelRecommendationData(pulled, gpu);
 
-      // Computed before pulledSummary (not after, as originally written) so
-      // each pulled model can be labeled fits/exceeds directly in the data
-      // instead of leaving that arithmetic to the LLM — confirmed live that
-      // leaving it implicit let the model recommend a 23.9GB model as its
-      // "top pick" on a 15.9GB card, backed by a fabricated "it's probably
-      // quantized or offloaded" excuse with no real data behind it. The
-      // measured size already reflects whatever quantization that model was
-      // pulled in — there's nothing more to offload it into.
-      const totalVramGB = gpu ? gpu.vramTotalMB / 1024 : null;
-
-      const pulledSummary = pulled.length > 0
-        ? pulled.map(m => {
-            const sizeGB = m.sizeBytes / 1e9;
-            const fitNote = totalVramGB !== null
-              ? (sizeGB <= totalVramGB ? "fits your VRAM" : "EXCEEDS your VRAM — do not recommend this as a primary pick, it will run slow or fail to load fully on the GPU")
-              : "VRAM fit unknown, no GPU detected";
-            return `- ${m.name} (already pulled, ${sizeGB.toFixed(1)}GB on disk — this is real, measured — ${fitNote})`;
+      // Each pulled model is labeled fits/exceeds directly in the data
+      // (by buildModelRecommendationData) instead of leaving that arithmetic
+      // to the LLM — confirmed live that leaving it implicit let the model
+      // recommend a 23.9GB model as its "top pick" on a 15.9GB card, backed
+      // by a fabricated "it's probably quantized or offloaded" excuse with
+      // no real data behind it. The measured size already reflects whatever
+      // quantization that model was pulled in — there's nothing more to
+      // offload it into.
+      const pulledSummary = recommendation.pulled.length > 0
+        ? recommendation.pulled.map(m => {
+            const fitNote = m.fits === null
+              ? "VRAM fit unknown, no GPU detected"
+              : m.fits
+                ? "fits your VRAM"
+                : "EXCEEDS your VRAM — do not recommend this as a primary pick, it will run slow or fail to load fully on the GPU";
+            return `- ${m.name} (already pulled, ${m.sizeGB.toFixed(1)}GB on disk — this is real, measured — ${fitNote})`;
           }).join("\n")
         : "(no models currently pulled)";
 
-      const suggestions = totalVramGB !== null
-        ? OLLAMA_MODEL_VRAM_TABLE.filter(m => !pulledNames.has(m.name) && m.approxVramGB <= totalVramGB * 0.85)
-        : [];
-      const suggestionSummary = suggestions.length > 0
-        ? suggestions.map(m => `- ${m.name} (approx. ${m.approxVramGB}GB — NOT pulled, NOT measured, a rough estimate only)`).join("\n")
+      const suggestionSummary = recommendation.suggestions.length > 0
+        ? recommendation.suggestions.map(m => `- ${m.name} (approx. ${m.approxVramGB}GB — NOT pulled, NOT measured, a rough estimate only)`).join("\n")
         : "(no additional suggestions — either no GPU was detected, or nothing in the reference list clearly fits)";
 
-      const hardwareLine = totalVramGB !== null
-        ? `Total VRAM detected: ${totalVramGB.toFixed(1)}GB.`
+      const hardwareLine = recommendation.totalVramGB !== null
+        ? `Total VRAM detected: ${recommendation.totalVramGB.toFixed(1)}GB.`
         : "No NVIDIA GPU was detected — recommend conservative, CPU-friendly models (small parameter counts) rather than reasoning about VRAM fit at all.";
 
       recallContext = `--- MODEL RECOMMENDATION DATA ---\n${hardwareLine}\n\nAlready pulled locally (real, measured sizes):\n${pulledSummary}\n\nOther models that would likely fit, if you wanted to pull one (APPROXIMATE — not measured, a rough guide only, manually curated and may be out of date for newer model releases):\n${suggestionSummary}\n--- END MODEL RECOMMENDATION DATA ---\n` +

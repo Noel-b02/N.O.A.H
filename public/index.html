@@ -127,10 +127,14 @@
       </div>
     </div>
 
-    <!-- Active Protocol Diagnostics -->
-    <div class="text-right font-mono text-xs hidden sm:block">
-      <span class="text-slate-600">PROTOCOL:</span>
-      <span class="text-cyan-400 font-bold tracking-widest ml-1">COGNITIVE_EVOLVE_INIT</span>
+    <div class="flex items-center space-x-6">
+      <button id="open-models-panel-btn" onclick="openModelsPanel()" class="bg-cyan-950/40 hover:bg-cyan-500/15 border border-cyan-500/40 text-cyan-400 font-bold tracking-widest text-[10px] px-4 py-2 rounded uppercase transition duration-300">SYSTEM</button>
+
+      <!-- Active Protocol Diagnostics -->
+      <div class="text-right font-mono text-xs hidden sm:block">
+        <span class="text-slate-600">PROTOCOL:</span>
+        <span class="text-cyan-400 font-bold tracking-widest ml-1">COGNITIVE_EVOLVE_INIT</span>
+      </div>
     </div>
   </header>
 
@@ -356,6 +360,49 @@
         </button>
       </div>
     </section>
+
+    <section id="models-panel" class="w-[500px] xl:w-[650px] bg-slate-950/95 border-l border-cyan-500/20 flex flex-col hidden relative z-20">
+      <div class="absolute top-0 right-0 w-4 h-4 border-t-2 border-r-2 border-cyan-400/30"></div>
+
+      <div class="p-6 border-b border-cyan-500/20 bg-cyan-950/5 flex items-center justify-between">
+        <div>
+          <h2 class="text-xs font-black text-cyan-400 tracking-widest uppercase">SYSTEM PANEL</h2>
+          <p class="text-[9px] text-slate-500 mt-1 uppercase tracking-widest font-mono">Hardware · Models · Comparison</p>
+        </div>
+        <button onclick="closeModelsPanel()" class="text-slate-500 hover:text-cyan-400 text-xs font-mono">✕</button>
+      </div>
+
+      <div class="flex-1 overflow-y-auto p-6 space-y-6">
+        <div>
+          <p class="text-[9px] font-mono tracking-widest text-cyan-400 font-extrabold mb-2 uppercase">Hardware</p>
+          <div id="hw-panel-content" class="text-xs text-slate-400 font-mono">Scanning...</div>
+        </div>
+
+        <div>
+          <p class="text-[9px] font-mono tracking-widest text-cyan-400 font-extrabold mb-2 uppercase">Models</p>
+          <div id="model-recs-content" class="space-y-3 text-xs text-slate-400">Loading...</div>
+        </div>
+
+        <div>
+          <p class="text-[9px] font-mono tracking-widest text-cyan-400 font-extrabold mb-2 uppercase">Compare</p>
+          <div class="space-y-2">
+            <div class="flex gap-2">
+              <select id="compare-model-a" class="flex-1 bg-slate-950 border border-cyan-500/30 text-slate-300 font-mono text-xs rounded px-2 py-2"></select>
+              <select id="compare-model-b" class="flex-1 bg-slate-950 border border-cyan-500/30 text-slate-300 font-mono text-xs rounded px-2 py-2"></select>
+            </div>
+            <textarea id="compare-prompt" rows="2" placeholder="Prompt to run against both models..." class="w-full bg-slate-950 border border-cyan-500/30 text-slate-300 font-mono text-xs rounded px-3 py-2 resize-none placeholder:text-slate-600"></textarea>
+            <button
+              onclick="runComparisonFromPanel()"
+              id="run-comparison-btn"
+              class="w-full bg-cyan-950/40 hover:bg-cyan-500/15 border border-cyan-500/40 text-cyan-400 font-bold tracking-widest text-[10px] py-3 rounded uppercase transition duration-300"
+            >
+              Run Comparison
+            </button>
+            <div id="compare-results"></div>
+          </div>
+        </div>
+      </div>
+    </section>
   </main>
 
   <!-- Control Scripts & Visual Interactions -->
@@ -375,6 +422,7 @@
     const modelViewerEl = document.getElementById('model-viewer-el');
     const modelViewerSubjectEl = document.getElementById('model-viewer-subject');
     const modelSaveBtn = document.getElementById('model-save-btn');
+    const modelsPanel = document.getElementById('models-panel');
 
     // Tracks whichever model is currently open in the preview panel, so
     // saveCurrentModel()/discardCurrentModel() know which id to act on.
@@ -387,6 +435,7 @@
       modelSaveBtn.disabled = saved;
       modelSaveBtn.textContent = saved ? 'SAVED' : 'SAVE';
       diffPanel.classList.add('hidden');
+      modelsPanel.classList.add('hidden');
       modelViewerPanel.classList.remove('hidden');
     }
 
@@ -415,6 +464,147 @@
       modelViewerPanel.classList.add('hidden');
       modelViewerEl.removeAttribute('src');
       currentModelId = null;
+    }
+
+    // System panel: hardware stats, model recommendations (real pulled-model
+    // data + LLM-generated pros/cons vs the current default model), and a
+    // live two-model comparison — the button/panel equivalent of the
+    // "what's my GPU" / "what models can I run" / "compare X and Y" chat
+    // intents, for when typing a specific phrase isn't what you want.
+    async function openModelsPanel() {
+      diffPanel.classList.add('hidden');
+      modelViewerPanel.classList.add('hidden');
+      modelsPanel.classList.remove('hidden');
+
+      const hwEl = document.getElementById('hw-panel-content');
+      const recsEl = document.getElementById('model-recs-content');
+      hwEl.textContent = 'Scanning...';
+      recsEl.textContent = 'Loading...';
+
+      try {
+        const [hwRes, overviewRes] = await Promise.all([
+          fetch('/api/hardware'),
+          fetch('/api/models/overview')
+        ]);
+        const hwData = await hwRes.json();
+        const overview = await overviewRes.json();
+
+        renderHardwarePanel(hwData.gpu);
+        renderModelRecsPanel(overview);
+        populateCompareSelects(overview.pulled, overview.currentModel);
+      } catch (err) {
+        console.error('Failed to load system panel data:', err);
+        hwEl.textContent = 'Failed to load hardware data.';
+        recsEl.textContent = 'Failed to load model data.';
+      }
+    }
+
+    function closeModelsPanel() {
+      modelsPanel.classList.add('hidden');
+    }
+
+    function renderHardwarePanel(gpu) {
+      const el = document.getElementById('hw-panel-content');
+      el.innerHTML = gpu
+        ? `
+          <div class="grid grid-cols-2 gap-2">
+            <div>VRAM: <span class="text-cyan-400 font-bold">${gpu.vramUsedMB}MB / ${gpu.vramTotalMB}MB</span></div>
+            <div>Utilization: <span class="text-cyan-400 font-bold">${gpu.utilizationPercent}%</span></div>
+            <div>Temperature: <span class="text-cyan-400 font-bold">${gpu.temperatureC}°C</span></div>
+          </div>
+        `
+        : `<p class="text-rose-400">No NVIDIA GPU detected (or nvidia-smi isn't on PATH).</p>`;
+    }
+
+    // `analysis` (pros/cons vs the current default model) is optional
+    // enrichment from an LLM call the backend makes best-effort — a null or
+    // missing entry just means that model's card renders without it, never
+    // an error shown to the user (see GET /api/models/overview's comment).
+    function renderModelRecsPanel(overview) {
+      const el = document.getElementById('model-recs-content');
+      const analysisByModel = {};
+      (overview.analysis || []).forEach(a => { analysisByModel[a.model] = a; });
+
+      const prosConsHtml = (analysis) => !analysis ? '' : `
+        ${analysis.pros && analysis.pros.length ? `<p class="text-[10px] text-emerald-400 mb-1">+ ${analysis.pros.map(escapeHtml).join(' · ')}</p>` : ''}
+        ${analysis.cons && analysis.cons.length ? `<p class="text-[10px] text-rose-400">- ${analysis.cons.map(escapeHtml).join(' · ')}</p>` : ''}
+      `;
+
+      const pulledCards = overview.pulled.map(m => {
+        const isCurrent = m.name === overview.currentModel;
+        const fitBadge = m.fits === null
+          ? `<span class="text-[9px] font-mono text-slate-500 border border-slate-600 rounded px-1.5 py-0.5 uppercase">Unknown</span>`
+          : m.fits
+            ? `<span class="text-[9px] font-mono text-emerald-400 border border-emerald-500/40 rounded px-1.5 py-0.5 uppercase">Fits</span>`
+            : `<span class="text-[9px] font-mono text-rose-400 border border-rose-500/40 rounded px-1.5 py-0.5 uppercase">Exceeds VRAM</span>`;
+        return `
+          <div class="border border-cyan-500/20 rounded p-3 bg-black/20">
+            <div class="flex items-center justify-between mb-1">
+              <p class="text-xs font-mono text-slate-200 font-bold">${escapeHtml(m.name)}${isCurrent ? ' <span class="text-cyan-400">(current)</span>' : ''}</p>
+              ${fitBadge}
+            </div>
+            <p class="text-[10px] text-slate-500 font-mono mb-2">${m.sizeGB.toFixed(1)}GB on disk — measured</p>
+            ${prosConsHtml(analysisByModel[m.name])}
+          </div>
+        `;
+      }).join('');
+
+      const suggestionCards = overview.suggestions.map(m => `
+        <div class="border border-slate-700/40 rounded p-3 bg-black/10">
+          <p class="text-xs font-mono text-slate-400 font-bold mb-1">${escapeHtml(m.name)} <span class="text-[9px] text-slate-600 uppercase">(not pulled, ~${m.approxVramGB}GB est.)</span></p>
+          ${prosConsHtml(analysisByModel[m.name])}
+        </div>
+      `).join('');
+
+      el.innerHTML = (pulledCards || '<p class="text-slate-500">No models pulled.</p>') + suggestionCards;
+    }
+
+    function populateCompareSelects(pulledModels, currentModel) {
+      const selectA = document.getElementById('compare-model-a');
+      const selectB = document.getElementById('compare-model-b');
+      const options = pulledModels.map(m => `<option value="${escapeHtml(m.name)}">${escapeHtml(m.name)}</option>`).join('');
+      selectA.innerHTML = options;
+      selectB.innerHTML = options;
+      if (pulledModels.some(m => m.name === currentModel)) selectA.value = currentModel;
+      const otherModel = pulledModels.find(m => m.name !== currentModel);
+      if (otherModel) selectB.value = otherModel.name;
+    }
+
+    async function runComparisonFromPanel() {
+      const modelA = document.getElementById('compare-model-a').value;
+      const modelB = document.getElementById('compare-model-b').value;
+      const prompt = document.getElementById('compare-prompt').value.trim();
+      const resultsEl = document.getElementById('compare-results');
+      const btn = document.getElementById('run-comparison-btn');
+
+      if (!modelA || !modelB || !prompt) {
+        resultsEl.innerHTML = `<p class="text-rose-400 text-xs mt-2">Pick both models and enter a prompt.</p>`;
+        return;
+      }
+
+      btn.disabled = true;
+      btn.textContent = 'Running...';
+      resultsEl.innerHTML = '';
+
+      try {
+        const res = await fetch('/api/models/compare', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ modelA, modelB, prompt })
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          resultsEl.innerHTML = `<p class="text-rose-400 text-xs mt-2">${escapeHtml(data.error || 'Comparison failed.')}</p>`;
+          return;
+        }
+        resultsEl.innerHTML = `<div class="mt-3">${renderComparisonGrid(data.comparison)}</div>`;
+      } catch (err) {
+        console.error('Comparison request failed:', err);
+        resultsEl.innerHTML = `<p class="text-rose-400 text-xs mt-2">Request dropped.</p>`;
+      } finally {
+        btn.disabled = false;
+        btn.textContent = 'Run Comparison';
+      }
     }
 
     async function saveCurrentModel() {
@@ -1288,6 +1478,22 @@
     // the preview panel. Wired via addEventListener rather than an inline
     // onclick attribute so subject (arbitrary user-influenced text) never
     // has to be safely embedded inside an HTML attribute string.
+    // Shared by appendMessage's inline chat comparison rendering and the
+    // system panel's live comparison section, so both stay in sync instead
+    // of drifting as two copies of the same markup.
+    function renderComparisonGrid(comparison) {
+      return `
+        <div class="grid grid-cols-2 gap-3">
+          ${comparison.map(c => `
+            <div class="border border-cyan-500/20 rounded p-3 bg-black/20">
+              <p class="text-[9px] font-mono tracking-widest text-cyan-400 font-extrabold mb-2">${escapeHtml(c.model)}</p>
+              <p class="text-xs text-slate-300 leading-relaxed">${c.response !== null ? linkify(c.response).replace(/\n/g, '<br>') : `<span class="text-rose-400">(no response — error: ${escapeHtml(c.error || 'unknown')})</span>`}</p>
+            </div>
+          `).join('')}
+        </div>
+      `;
+    }
+
     function appendMessage(sender, text, model = null, comparison = null) {
       const msgId = 'msg-' + (++messageIdCounter);
       const div = document.createElement('div');
@@ -1308,16 +1514,7 @@
           <p class="text-[9px] font-mono tracking-widest text-cyan-400 font-extrabold mb-2">NOAH CORE OUTPUT</p>
           <p class="text-sm text-slate-300 leading-relaxed">${linkify(text).replace(/\n/g, '<br>')}</p>
           ${model ? `<button class="view-model-btn mt-3 text-[9px] font-mono tracking-widest text-cyan-400 border border-cyan-500/30 px-3 py-1.5 rounded hover:bg-cyan-500/10 uppercase transition duration-300">VIEW MODEL: ${escapeHtml(model.subject)}</button>` : ''}
-          ${comparison ? `
-            <div class="mt-3 grid grid-cols-2 gap-3">
-              ${comparison.map(c => `
-                <div class="border border-cyan-500/20 rounded p-3 bg-black/20">
-                  <p class="text-[9px] font-mono tracking-widest text-cyan-400 font-extrabold mb-2">${escapeHtml(c.model)}</p>
-                  <p class="text-xs text-slate-300 leading-relaxed">${c.response !== null ? linkify(c.response).replace(/\n/g, '<br>') : `<span class="text-rose-400">(no response — error: ${escapeHtml(c.error || 'unknown')})</span>`}</p>
-                </div>
-              `).join('')}
-            </div>
-          ` : ''}
+          ${comparison ? `<div class="mt-3">${renderComparisonGrid(comparison)}</div>` : ''}
         `;
       } else {
         div.className += " bg-rose-950/10 border-rose-500/20 max-w-xl text-rose-300";
@@ -1349,6 +1546,8 @@
 
     function showDiff(diffString, commit) {
       diffContainer.innerHTML = '';
+      modelViewerPanel.classList.add('hidden');
+      modelsPanel.classList.add('hidden');
       diffPanel.classList.remove('hidden');
 
       if (commit && commit.title) {
