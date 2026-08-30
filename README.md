@@ -56,6 +56,12 @@ to a third-party API by default.
   exposure — and it can call their tools mid-conversation (e.g. reading local
   files). Nothing's configured by default; this is the on-ramp for
   eventually connecting a smart-home MCP server. See `MCP_SETUP.md`.
+- **Agent mode**: give Noah a goal via the header's "AGENT" button and it
+  plans a rough approach, then — once you run it — works through multiple
+  steps on its own (web search, any connected MCP tools), adapting based on
+  what it actually finds, until it has an answer or hits its step limit.
+  Runs to completion unsupervised once started (this app has no way to
+  interrupt a request mid-flight), so review the preview first.
 
 ## Architecture
 
@@ -89,6 +95,9 @@ speech/            local Whisper (STT) + Kokoro (TTS) service
 vision/            local camera + facial recognition service (off by default)
 telegram.ts        Telegram bot bridge — long-polling, no public exposure
 mcp.ts             MCP client — connects to configured tool servers (optional)
+agent.ts           Agent mode — adaptive multi-step goal execution
+ollama.ts          Standalone Ollama caller shared by agent.ts and server.ts
+search.ts          Standalone web search (SearXNG) shared by agent.ts and server.ts
 fusion-bridge/      Fusion 360 add-in (NoahFusionBridge) — executes CAD code
 image23d/          Hunyuan3D-2, vendored, for image-to-3D generation; also
                    mesh repair (repair_mesh.py) ahead of Fusion import/print

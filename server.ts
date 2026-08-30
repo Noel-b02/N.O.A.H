@@ -6,6 +6,9 @@ import dotenv from 'dotenv';
 import { randomUUID } from 'crypto';
 import { startTelegramBot } from './telegram';
 import { startMcpServers, stopMcpServers, getMcpToolsDescription, callMcpTool, hasMcpTools } from './mcp';
+import { webSearch, WebSearchResult } from './search';
+import { callOllamaModel } from './ollama';
+import { previewAgentPlan, runAgent, getAgentProgress } from './agent';
 
 dotenv.config();
 
@@ -278,47 +281,6 @@ function loadArchive(filePath: string): ArchivedSession | null {
   }
 }
 
-interface WebSearchResult {
-  title: string;
-  description: string;
-  url: string;
-}
-
-// Some upstream engines SearXNG aggregates put highlight markup in their
-// snippets — strip it so the model prompt gets plain text.
-function stripHtmlTags(text: string): string {
-  return text.replace(/<\/?[^>]+>/g, "");
-}
-
-async function webSearch(
-  query: string,
-  options: { categories?: string; timeRange?: string } = {}
-): Promise<WebSearchResult[]> {
-  try {
-    let url = `${SEARXNG_URL}/search?q=${encodeURIComponent(query)}&format=json`;
-    if (options.categories) url += `&categories=${encodeURIComponent(options.categories)}`;
-    if (options.timeRange) url += `&time_range=${encodeURIComponent(options.timeRange)}`;
-
-    const res = await fetch(url);
-
-    if (!res.ok) {
-      console.error("SearXNG search failed:", res.status, await res.text().catch(() => ""));
-      return [];
-    }
-
-    const data = await res.json() as { results?: any[] };
-    const results = data.results ?? [];
-
-    return results.slice(0, 5).map((r: any) => ({
-      title: stripHtmlTags(r.title ?? ""),
-      description: stripHtmlTags(r.content ?? ""),
-      url: r.url ?? ""
-    }));
-  } catch (err) {
-    console.error("Web search error (is SearXNG running at " + SEARXNG_URL + "?):", err);
-    return [];
-  }
-}
 
 function extractXmlTag(block: string, tag: string): string {
   const match = block.match(new RegExp(`<${tag}[^>]*>([\\s\\S]*?)<\\/${tag}>`, "i"));
@@ -918,39 +880,6 @@ function buildModelRecommendationData(pulled: PulledModel[], gpu: GpuStats | nul
   return { totalVramGB, pulled: pulledData, suggestions };
 }
 
-// Standalone Ollama call usable outside the /api/chat request cycle — the
-// cascade's own callOllama() is a closure nested inside that handler
-// (captures a request-scoped AbortController/selectedModel), so it can't be
-// called from an independent REST route. Used by runModelComparison below
-// and GET /api/models/overview's pros/cons generation.
-async function callOllamaModel(prompt: string, numPredict: number, model: string, timeoutMs = 60000): Promise<string> {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    const res = await fetch(OLLAMA_URL, {
-      method: "POST",
-      signal: controller.signal,
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        model,
-        prompt,
-        stream: false,
-        // Without this, some models (confirmed live: qwen3.5:4b) default to
-        // "thinking" mode and put their real answer in a separate
-        // `thinking` field, leaving `response` empty until num_predict runs
-        // out mid-thought — matching the nested callOllama() in /api/chat,
-        // which passes this explicitly for the same reason.
-        think: false,
-        options: { num_predict: numPredict, num_ctx: 16384, temperature: 0.3 }
-      })
-    });
-    if (!res.ok) throw new Error(`Ollama connection failed: HTTP ${res.status} ${await res.text().catch(() => "")}`.trim());
-    const data = await res.json() as { response: string };
-    return data.response;
-  } finally {
-    clearTimeout(timeout);
-  }
-}
 
 // Shared by the chat-based "compare X and Y on: ..." intent and
 // POST /api/models/compare — runs the same prompt against two models in
@@ -1992,8 +1921,47 @@ app.get('/api/hud-metrics', async (_, res) => {
     services,
     printer: { installed: isBambuConnectInstalled() },
     gpu: getGpuStats(),
-    proactiveGreeting
+    proactiveGreeting,
+    agentProgress: getAgentProgress()
   });
+});
+
+// API: agent mode's plan preview — a rough, human-readable approach for the
+// user to review before committing to an unsupervised run (see agent.ts's
+// file header for why oversight has to happen here, before a run starts,
+// rather than mid-run). No lock needed: a single quick LLM call with no
+// side effects, same reasoning as /api/models/overview not needing
+// requestInFlight either.
+app.post('/api/agent/plan', async (req, res) => {
+  const { goal } = req.body as { goal?: string };
+  if (!goal) return res.status(400).json({ error: "goal is required." });
+  const plan = await previewAgentPlan(goal);
+  res.json({ plan });
+});
+
+// API: agent mode's real, adaptive execution — runs to completion
+// unsupervised once called. Shares requestInFlight with /api/chat: it's
+// long-running and calls the same Ollama instance, so a concurrent chat
+// message and an agent run stepping on each other is exactly the kind of
+// collision that lock already exists to prevent (same as mesh generation
+// already blocking /api/chat under it for up to 45 minutes).
+app.post('/api/agent/run', async (req, res) => {
+  const { goal } = req.body as { goal?: string };
+  if (!goal) return res.status(400).json({ error: "goal is required." });
+
+  if (requestInFlight) {
+    return res.status(429).json({ error: "Still processing the previous message — please wait." });
+  }
+  requestInFlight = true;
+
+  try {
+    const result = await runAgent(goal);
+    res.json(result);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message });
+  } finally {
+    requestInFlight = false;
+  }
 });
 
 // API: real, live GPU stats for the system panel's hardware section —
