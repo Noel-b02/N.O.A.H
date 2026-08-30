@@ -82,6 +82,11 @@ to a third-party API by default.
   reuses Noah's real chat handler, so it can do everything the web UI can.
   Uses long-polling, so no public internet exposure is needed. See
   `TELEGRAM_SETUP.md`.
+- **MCP tool support** (optional): connect Noah to MCP (Model Context
+  Protocol) servers — spawned as local child processes, no accounts or public
+  exposure — and it can call their tools mid-conversation (e.g. reading local
+  files). Nothing's configured by default; this is the on-ramp for
+  eventually connecting a smart-home MCP server. See `MCP_SETUP.md`.
 
 ## Architecture
 
@@ -119,6 +124,7 @@ server.ts          main server — routing, Ollama calls, all the pipelines
 speech/            local Whisper (STT) + Kokoro (TTS) service
 vision/            local camera + facial recognition service (off by default)
 telegram.ts        Telegram bot bridge — long-polling, no public exposure
+mcp.ts             MCP client — connects to configured tool servers (optional)
 fusion-bridge/      Fusion 360 add-in (NoahFusionBridge) — executes CAD code
 image23d/          Hunyuan3D-2, vendored, for image-to-3D generation; also
                    mesh repair (repair_mesh.py) ahead of Fusion import/print
@@ -141,6 +147,7 @@ has its own detailed one-time setup doc:
 5. [`PRINTER_SETUP.md`](PRINTER_SETUP.md) — slicing + printing on a Bambu Lab printer
 6. [`VISION_SETUP.md`](VISION_SETUP.md) — camera-based facial recognition (off by default — read its Privacy section first)
 7. [`TELEGRAM_SETUP.md`](TELEGRAM_SETUP.md) — text/voice-note chat with Noah from anywhere
+8. [`MCP_SETUP.md`](MCP_SETUP.md) — connect MCP servers for tool use (optional)
 
 `npm run dev` uses `tsx watch` and auto-reloads on file changes — what you
 want day to day. `npm start` runs the compiled build (`npm run build`

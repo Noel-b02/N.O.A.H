@@ -1,6 +1,7 @@
 .venv/
 .vscode/
 .env
+mcp-servers.json
 memories/history/*
 !memories/history/active.example.json
 memories/memory.json

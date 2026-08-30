@@ -5,6 +5,7 @@ import path from 'path';
 import dotenv from 'dotenv';
 import { randomUUID } from 'crypto';
 import { startTelegramBot } from './telegram';
+import { startMcpServers, stopMcpServers, getMcpToolsDescription, callMcpTool, hasMcpTools } from './mcp';
 
 dotenv.config();
 
@@ -806,6 +807,7 @@ async function withGpuExclusive<T>(fn: () => Promise<T>): Promise<T> {
 startSpeechService();
 startVisionService();
 startTelegramBot();
+startMcpServers();
 
 // --- Bambu Connect (official print handoff) ---
 // See PRINTER_SETUP.md. Bambu Lab's own desktop relay app — chosen over a
@@ -3185,7 +3187,15 @@ app.post('/api/chat', async (req, res) => {
   const looksLikeDocumentQuestion = hasActiveDocument && !wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeStatusQuery && !looksLikeVisionStatusQuery && !looksLikeHardwareQuery && !looksLikeModelRecommendQuery && !looksLikeHeadlinesQuery && !looksLikeSearchQuery && !isStickySearchFollowup && !looksLikeFusionRequest && !looksLikeImageGenRequest;
   console.log("LOOKS LIKE DOCUMENT QUESTION:", looksLikeDocumentQuestion);
 
-  const isComplex = wantsModification || isRecallQuery || isStickyRecallFollowup || looksLikeStatusQuery || looksLikeVisionStatusQuery || looksLikeHardwareQuery || looksLikeModelRecommendQuery || looksLikeHeadlinesQuery || looksLikeSearchQuery || isStickySearchFollowup || looksLikeFusionRequest || looksLikeMeshEditRequest || looksLikeImageGenRequest || looksLikeImageEditRequest || looksLikeDocumentQuestion || (
+  // hasMcpTools() forces every turn to the bigger model whenever any MCP
+  // server is connected, not just ones that end up actually calling a tool
+  // — confirmed live that the small default chat model narrated an
+  // intention to use a tool but never emitted the real [MCP_TOOL: ...] tag,
+  // while the bigger model got it right first try on the identical prompt.
+  // Same "needs reliable structured output" reasoning wantsModification
+  // already gets regardless of message length. Only matters at all once MCP
+  // is configured, so this has zero effect on Noah's default behavior.
+  const isComplex = wantsModification || isRecallQuery || isStickyRecallFollowup || looksLikeStatusQuery || looksLikeVisionStatusQuery || looksLikeHardwareQuery || looksLikeModelRecommendQuery || looksLikeHeadlinesQuery || looksLikeSearchQuery || isStickySearchFollowup || looksLikeFusionRequest || looksLikeMeshEditRequest || looksLikeImageGenRequest || looksLikeImageEditRequest || looksLikeDocumentQuestion || hasMcpTools() || (
     wordCount > 5 && /(typescript|javascript|debug|refactor|git|branch)/i.test(message)
   );
 
@@ -3309,19 +3319,43 @@ app.post('/api/chat', async (req, res) => {
   // surrounding prose gets discarded once we detect it (see below).
   const SEARCH_TAG_PATTERN = /\[SEARCH:\s*([^\]]+)\]/i;
 
+  // Same "not anchored, tolerate surrounding prose" reasoning as
+  // SEARCH_TAG_PATTERN above. The JSON argument blob is matched separately
+  // (greedy first-{-to-last-} over the whole response, same technique used
+  // for the self-modification JSON block and the system panel's pros/cons
+  // JSON) rather than folded into this regex, since a non-greedy match here
+  // would break on any tool whose arguments schema itself contains a nested
+  // object.
+  const MCP_TOOL_TAG_PATTERN = /\[MCP_TOOL:\s*([^\]]+)\]/i;
+
   // Recall queries already have their own dedicated context (archived
   // conversations) and their "I have no record of that day" replies would
   // otherwise false-positive as uncertainty below — the search fallback only
   // makes sense for genuine open-ended chat turns, not those paths.
   const isPlainChatTurn = !wantsModification && !isRecallQuery && !isStickyRecallFollowup && !looksLikeStatusQuery && !looksLikeVisionStatusQuery && !looksLikeHardwareQuery && !looksLikeModelRecommendQuery && !looksLikeHeadlinesQuery && !looksLikeSearchQuery && !isStickySearchFollowup && !looksLikeFusionRequest && !looksLikeImageGenRequest && !looksLikeImageEditRequest;
 
+  // The explicit "not local files/tools" carve-out was added after live
+  // testing: with MCP tools also available, the model twice defaulted to
+  // [SEARCH: ...] for a question about a local file's contents (even
+  // running a real, useless web search for it) instead of the correct
+  // [MCP_TOOL: ...] — the two conventions need to be told apart explicitly,
+  // not left for the model to infer from context alone.
   const searchInstructions = isPlainChatTurn ? `
   If answering requires current or real-world information you don't already know — release dates, sports results, news, prices, "when does X come out", "who won Y" — do not guess or make something up. Instead, respond with EXACTLY this and nothing else, no other words:
 
   [SEARCH: concise web search query]
 
-  Only use this when you genuinely need up-to-date or factual information you're not confident about. Do not use it for questions about past conversations, your own personality/settings, or anything you already know.
+  Only use this when you genuinely need up-to-date or factual information you're not confident about. Do not use it for questions about past conversations, your own personality/settings, or anything you already know.${hasMcpTools() ? " Never use this for local files or anything covered by the tools listed below — a web search cannot read local files or reach local tools; use [MCP_TOOL: ...] for those instead." : ""}
   ` : "";
+
+  // Empty when no MCP servers are configured/connected (getMcpToolsDescription
+  // returns "" in that case) — no prompt bloat for the common case where MCP
+  // isn't set up at all. Same tag-based convention as searchInstructions
+  // above rather than Ollama's native tool-calling API, which only exists on
+  // /api/chat — this whole file is built around /api/generate's single
+  // flattened prompt string, so a hand-rolled, model-agnostic tag is the
+  // consistent choice here, not a workaround.
+  const mcpInstructions = isPlainChatTurn ? getMcpToolsDescription() : "";
 
   const metaSystemInstruction = (
 
@@ -3337,7 +3371,8 @@ app.post('/api/chat', async (req, res) => {
     `The information in CURRENT MEMORY contains persistent facts and should be treated as true unless the user explicitly corrects them.\n\n` +
 
     modificationInstructions +
-    searchInstructions
+    searchInstructions +
+    mcpInstructions
 
   );
 
@@ -4490,8 +4525,55 @@ Now generate code for this request: "${message}"`;
 
     const UNCERTAINTY_PATTERN = /\b(i don'?t know|i do not know|i'?m not (sure|aware|certain)|i am not (sure|aware|certain)|i (can'?t|cannot) (verify|confirm|access)|as of my (last|knowledge)|i (don'?t|do not) have (\w+\s+){0,3}(access|information|real-time|up-to-date|current|internet|any (record|knowledge)|the (latest|current))|beyond my (knowledge|training)|no (real-time|live) (access|data)|i'?m unable to (access|verify|confirm)|i am unable to (access|verify|confirm))\b/i;
 
-    const searchMatch = aiResponse.match(SEARCH_TAG_PATTERN);
-    const soundsUncertain = isPlainChatTurn && !searchMatch && UNCERTAINTY_PATTERN.test(aiResponse);
+    // Checked before the search tag — a turn only takes one action, and an
+    // MCP tool call is a more deliberate, specific signal than the
+    // uncertainty fallback below. If no MCP tag is present this is a no-op
+    // (mcpToolMatch stays null, everything below behaves exactly as before).
+    const mcpToolMatch = aiResponse.match(MCP_TOOL_TAG_PATTERN);
+
+    if (mcpToolMatch) {
+      const qualifiedName = mcpToolMatch[1].trim();
+      console.log("MCP TOOL CALL REQUESTED:", qualifiedName);
+
+      // Greedy first-{-to-last-} match, same technique already used for the
+      // self-modification JSON block and the system panel's pros/cons JSON
+      // — reliable here specifically because the model is instructed to
+      // respond with nothing but the tag and the JSON, so there's only one
+      // JSON object in the whole response to find.
+      const jsonMatch = aiResponse.match(/\{[\s\S]*\}/);
+      let toolArgs: Record<string, unknown> = {};
+      if (jsonMatch) {
+        try {
+          toolArgs = JSON.parse(jsonMatch[0]);
+        } catch {
+          console.warn("MCP TOOL CALL: couldn't parse arguments JSON, calling with no arguments:", jsonMatch[0]);
+        }
+      }
+
+      let mcpContext: string;
+      try {
+        const toolResult = await callMcpTool(qualifiedName, toolArgs);
+        // Confirmed live: without the blunt "the call already happened,
+        // you already have the answer" framing, the model would parrot
+        // "I don't have access to that file" out of habit from its own
+        // earlier system instructions, in the same breath as correctly
+        // quoting the real tool result that contradicts it.
+        mcpContext = `--- TOOL RESULT FROM "${qualifiedName}" ---\n${toolResult}\n--- END TOOL RESULT ---\n` +
+          `The tool call above has ALREADY happened and succeeded — this is real, current data, not a hypothetical. Answer the user's original question directly using it. Do not say you don't have access, do not ask for a file path or for permission, and do not invent details beyond what's shown above — you already have everything you need.\n\n`;
+      } catch (err: any) {
+        console.warn("MCP TOOL CALL FAILED:", err.message);
+        mcpContext = `--- NOTE: The tool "${qualifiedName}" failed: ${err.message}. Tell the user honestly that the tool call failed rather than guessing an answer. ---\n\n`;
+      }
+
+      const followUpPrompt = `System Instruction:\n${metaSystemInstruction}\n\n` + mcpContext + `Conversation History:\n${recentHistory}\n\n` + `User Request:\n${message}`;
+      aiResponse = await callOllama(followUpPrompt, isComplex ? 3000 : 400, wantsDeeperThinking);
+
+      console.log("FINAL AI RESPONSE AFTER MCP TOOL CALL:");
+      console.log(aiResponse);
+    }
+
+    const searchMatch = !mcpToolMatch ? aiResponse.match(SEARCH_TAG_PATTERN) : null;
+    const soundsUncertain = !mcpToolMatch && isPlainChatTurn && !searchMatch && UNCERTAINTY_PATTERN.test(aiResponse);
 
     if (searchMatch || soundsUncertain) {
       let searchQuery: string;
@@ -4854,6 +4936,7 @@ function shutdown(signal: string) {
   archiveSession("manual");
   stopSpeechService();
   stopVisionService();
+  stopMcpServers();
   process.exit(0);
 }
 
@@ -4871,4 +4954,5 @@ process.on("SIGHUP", () => shutdown("SIGHUP"));
 process.on("exit", () => {
   stopSpeechService();
   stopVisionService();
+  stopMcpServers();
 });
