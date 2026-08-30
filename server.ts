@@ -998,7 +998,13 @@ async function callOllamaModel(prompt: string, numPredict: number, model: string
 async function runModelComparison(modelA: string, modelB: string, prompt: string): Promise<{ model: string; response: string | null; error?: string }[]> {
   const runOne = async (modelName: string): Promise<{ model: string; response: string | null; error?: string }> => {
     try {
-      const raw = await callOllamaModel(prompt, 400, modelName);
+      // 400 (the original limit) cut real answers off mid-sentence for
+      // anything beyond a short conversational reply — confirmed live with
+      // a "write a function, with comments" prompt, where both models were
+      // still mid-explanation when they hit it. Comparison is already a
+      // deliberate, wait-for-it user action, so a generous budget (and a
+      // matching longer timeout below) is worth it over truncated answers.
+      const raw = await callOllamaModel(prompt, 1500, modelName, 120000);
       return { model: modelName, response: raw.trim() };
     } catch (err: any) {
       return { model: modelName, response: null, error: err.message };
