@@ -1045,6 +1045,19 @@
           document.getElementById('telemetry-temp').textContent = 'N/A';
         }
 
+        // A proactive greeting from the vision service (someone just showed
+        // up on camera) rides this same 3-second poll rather than a
+        // dedicated push channel — this app has no WebSocket/SSE anywhere,
+        // and hud-metrics already fires every 3s regardless. Bypasses
+        // /api/chat entirely since this isn't a reply to a user message;
+        // already logged into conversationHistory server-side. Backend
+        // already computed and sent this — it was just never read here,
+        // a pre-existing gap unrelated to agent mode, fixed in passing.
+        if (data.proactiveGreeting) {
+          appendMessage('assistant', data.proactiveGreeting);
+          speakReply(data.proactiveGreeting);
+        }
+
         // Agent mode's live status rides this same poll — no dedicated push
         // channel exists, and this fires every 3s regardless of whether a
         // run is active.
